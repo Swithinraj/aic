@@ -16,4 +16,9 @@ setup(
     maintainer_email="team@example.com",
     description="Planner-first team policy package for the AI for Industry Challenge",
     license="Apache-2.0",
+    entry_points={
+        "console_scripts": [
+            "rviz_click_to_move = team_policy.planner.rviz_click_to_move:main",
+        ],
+    },
 )

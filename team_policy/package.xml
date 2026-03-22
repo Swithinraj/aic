@@ -12,10 +12,13 @@
   <depend>aic_model_interfaces</depend>
   <depend>aic_task_interfaces</depend>
   <depend>geometry_msgs</depend>
+  <depend>interactive_markers</depend>
+  <depend>nav_msgs</depend>
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>std_srvs</depend>
   <depend>trajectory_msgs</depend>
+  <depend>visualization_msgs</depend>
 
   <export>
     <build_type>ament_python</build_type>

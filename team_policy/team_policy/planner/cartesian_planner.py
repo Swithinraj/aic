@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from typing import List
 
-from aic_model_interfaces.msg import Observation
 from geometry_msgs.msg import Pose
 
 from team_policy.planner.search_backend import run_search
@@ -22,8 +21,7 @@ class CartesianPlanner:
     def __init__(self, config: PlannerConfig | None = None):
         self.config = config or PlannerConfig()
 
-    def plan(self, target_pose: Pose, observation: Observation) -> List[Pose]:
-        current_pose = observation.controller_state.tcp_pose
+    def plan_from_current_pose(self, current_pose: Pose, target_pose: Pose) -> List[Pose]:
         return run_search(
             start_pose=current_pose,
             goal_pose=target_pose,
