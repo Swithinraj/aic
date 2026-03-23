@@ -7,7 +7,7 @@ from rclpy.node import Node
 
 from aic_control_interfaces.msg import ControllerState, MotionUpdate, TargetMode, TrajectoryGenerationMode
 from aic_control_interfaces.srv import ChangeTargetMode
-from geometry_msgs.msg import Pose, PoseStamped, Quaternion
+from geometry_msgs.msg import Pose, PoseStamped, Quaternion, Twist, Vector3, Wrench
 from interactive_markers.interactive_marker_server import InteractiveMarkerServer
 from nav_msgs.msg import Path
 from std_msgs.msg import ColorRGBA
@@ -27,23 +27,40 @@ class RvizClickToMove(Node):
         super().__init__("rviz_click_to_move")
 
         self.declare_parameter("command_frame", "base_link")
-        self.declare_parameter("position_tolerance", 0.01)
+        self.declare_parameter("position_tolerance", 0.012)
         self.declare_parameter("publish_rate_hz", 20.0)
         self.declare_parameter("target_marker_scale", 0.10)
+        self.declare_parameter("linear_kp", 1.0)
+        self.declare_parameter("max_linear_speed", 0.05)
+        self.declare_parameter("min_linear_speed", 0.015)
+        self.declare_parameter("trans_stiffness", 90.0)
+        self.declare_parameter("rot_stiffness", 50.0)
+        self.declare_parameter("trans_damping", 50.0)
+        self.declare_parameter("rot_damping", 20.0)
 
         self.command_frame = str(self.get_parameter("command_frame").value)
         self.position_tolerance = float(self.get_parameter("position_tolerance").value)
         publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
         self.target_marker_scale = float(self.get_parameter("target_marker_scale").value)
+        self.linear_kp = float(self.get_parameter("linear_kp").value)
+        self.max_linear_speed = float(self.get_parameter("max_linear_speed").value)
+        self.min_linear_speed = float(self.get_parameter("min_linear_speed").value)
+        self.trans_stiffness = float(self.get_parameter("trans_stiffness").value)
+        self.rot_stiffness = float(self.get_parameter("rot_stiffness").value)
+        self.trans_damping = float(self.get_parameter("trans_damping").value)
+        self.rot_damping = float(self.get_parameter("rot_damping").value)
 
         self.planner = CartesianPlanner()
+        self.current_state: Optional[ControllerState] = None
         self.current_tcp_pose: Optional[Pose] = None
         self.current_target_pose: Optional[Pose] = None
+        self.last_planned_target_pose: Optional[Pose] = None
         self.active_waypoints: List[Pose] = []
         self.active_waypoint_index = 0
         self.execution_active = False
         self.mode_request_sent = False
         self.marker_initialized = False
+        self.zero_sent = False
 
         self.controller_state_sub = self.create_subscription(
             ControllerState,
@@ -52,11 +69,7 @@ class RvizClickToMove(Node):
             10,
         )
 
-        self.pose_command_pub = self.create_publisher(
-            MotionUpdate,
-            "/aic_controller/pose_commands",
-            10,
-        )
+        self.pose_command_pub = self.create_publisher(MotionUpdate, "/aic_controller/pose_commands", 10)
         self.target_marker_pub = self.create_publisher(Marker, "/planner/target_marker", 10)
         self.waypoint_markers_pub = self.create_publisher(MarkerArray, "/planner/waypoint_markers", 10)
         self.path_pub = self.create_publisher(Path, "/planner/waypoint_path", 10)
@@ -67,10 +80,11 @@ class RvizClickToMove(Node):
         self.timer = self.create_timer(1.0 / publish_rate_hz, self._on_timer)
 
         self.get_logger().info("rviz_click_to_move started with a 3D interactive target marker.")
+        self.get_logger().info("This version executes waypoints with Cartesian velocity servo, not absolute pose jumps.")
         self.get_logger().info("Set RViz Fixed Frame to base_link and add an InteractiveMarkers display for '/planner_target/update'.")
-        self.get_logger().info("Drag the target marker in 3D space and release the mouse to plan and execute.")
 
     def _on_controller_state(self, msg: ControllerState) -> None:
+        self.current_state = msg
         self.current_tcp_pose = msg.tcp_pose
         if not self.mode_request_sent:
             self._request_cartesian_mode()
@@ -80,7 +94,6 @@ class RvizClickToMove(Node):
     def _request_cartesian_mode(self) -> None:
         if not self.change_mode_client.wait_for_service(timeout_sec=0.1):
             return
-
         request = ChangeTargetMode.Request()
         request.target_mode.mode = TargetMode.MODE_CARTESIAN
         self.change_mode_client.call_async(request)
@@ -91,7 +104,7 @@ class RvizClickToMove(Node):
         target_pose = Pose()
         target_pose.position.x = tcp_pose.position.x
         target_pose.position.y = tcp_pose.position.y
-        target_pose.position.z = tcp_pose.position.z + 0.05
+        target_pose.position.z = min(tcp_pose.position.z + 0.05, 0.55)
         target_pose.orientation = tcp_pose.orientation
 
         self.current_target_pose = target_pose
@@ -99,8 +112,7 @@ class RvizClickToMove(Node):
         self._publish_target_marker(target_pose)
         self.marker_initialized = True
         self.get_logger().info(
-            f"Interactive target initialized at ({target_pose.position.x:.3f}, "
-            f"{target_pose.position.y:.3f}, {target_pose.position.z:.3f})."
+            f"Interactive target initialized at ({target_pose.position.x:.3f}, {target_pose.position.y:.3f}, {target_pose.position.z:.3f})."
         )
 
     def _make_interactive_marker(self, pose: Pose) -> None:
@@ -147,10 +159,14 @@ class RvizClickToMove(Node):
         self.current_target_pose = feedback.pose
         self._publish_target_marker(feedback.pose)
 
-        if feedback.event_type == InteractiveMarkerFeedback.MOUSE_UP:
-            self._plan_and_start(feedback.pose)
-        elif feedback.event_type == InteractiveMarkerFeedback.BUTTON_CLICK:
-            self._plan_and_start(feedback.pose)
+        if feedback.event_type != InteractiveMarkerFeedback.MOUSE_UP:
+            return
+
+        if self.last_planned_target_pose is not None:
+            if self._position_distance(feedback.pose, self.last_planned_target_pose) < 0.003:
+                return
+
+        self._plan_and_start(feedback.pose)
 
     def _plan_and_start(self, target_pose: Pose) -> None:
         if self.current_tcp_pose is None:
@@ -169,6 +185,8 @@ class RvizClickToMove(Node):
         )
         self.active_waypoint_index = 0
         self.execution_active = len(self.active_waypoints) > 0
+        self.zero_sent = False
+        self.last_planned_target_pose = plan_target
 
         self._publish_waypoint_visuals(self.active_waypoints)
         self._publish_target_marker(plan_target)
@@ -179,19 +197,24 @@ class RvizClickToMove(Node):
         )
 
     def _on_timer(self) -> None:
-        if not self.execution_active:
-            return
         if self.current_tcp_pose is None:
             return
+
+        if not self.execution_active:
+            if not self.zero_sent:
+                self._publish_twist_command(Twist())
+                self.zero_sent = True
+            return
+
         if self.active_waypoint_index >= len(self.active_waypoints):
             self.execution_active = False
+            self.zero_sent = False
             self.get_logger().info("Waypoint execution complete.")
             return
 
         waypoint = self.active_waypoints[self.active_waypoint_index]
-        self._publish_motion_command(waypoint)
-
-        if self._position_distance(self.current_tcp_pose, waypoint) <= self.position_tolerance:
+        distance = self._position_distance(self.current_tcp_pose, waypoint)
+        if distance <= self.position_tolerance:
             self.active_waypoint_index += 1
             if self.active_waypoint_index < len(self.active_waypoints):
                 self.get_logger().info(
@@ -199,14 +222,66 @@ class RvizClickToMove(Node):
                 )
             else:
                 self.execution_active = False
+                self.zero_sent = False
                 self.get_logger().info("Final waypoint reached.")
+            return
 
-    def _publish_motion_command(self, pose: Pose) -> None:
+        twist = self._compute_twist_to_waypoint(self.current_tcp_pose, waypoint)
+        self._publish_twist_command(twist)
+        self.zero_sent = False
+
+    def _compute_twist_to_waypoint(self, current_pose: Pose, waypoint: Pose) -> Twist:
+        dx = waypoint.position.x - current_pose.position.x
+        dy = waypoint.position.y - current_pose.position.y
+        dz = waypoint.position.z - current_pose.position.z
+        distance = (dx * dx + dy * dy + dz * dz) ** 0.5
+
+        twist = Twist()
+        if distance < 1e-6:
+            return twist
+
+        commanded_speed = self.linear_kp * distance
+        if commanded_speed > self.max_linear_speed:
+            commanded_speed = self.max_linear_speed
+        elif commanded_speed < self.min_linear_speed:
+            commanded_speed = self.min_linear_speed
+
+        scale = commanded_speed / distance
+        twist.linear.x = dx * scale
+        twist.linear.y = dy * scale
+        twist.linear.z = dz * scale
+        twist.angular.x = 0.0
+        twist.angular.y = 0.0
+        twist.angular.z = 0.0
+        return twist
+
+    def _publish_twist_command(self, twist: Twist) -> None:
         msg = MotionUpdate()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.command_frame
-        msg.pose = pose
-        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_POSITION
+        msg.velocity = twist
+        msg.target_stiffness = [
+            self.trans_stiffness, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, self.trans_stiffness, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, self.trans_stiffness, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, self.rot_stiffness, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, self.rot_stiffness, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, self.rot_stiffness,
+        ]
+        msg.target_damping = [
+            self.trans_damping, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, self.trans_damping, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, self.trans_damping, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, self.rot_damping, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, self.rot_damping, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, self.rot_damping,
+        ]
+        msg.feedforward_wrench_at_tip = Wrench(
+            force=Vector3(x=0.0, y=0.0, z=0.0),
+            torque=Vector3(x=0.0, y=0.0, z=0.0),
+        )
+        msg.wrench_feedback_gains_at_tip = [0.5, 0.5, 0.5, 0.0, 0.0, 0.0]
+        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_VELOCITY
         self.pose_command_pub.publish(msg)
 
     def _publish_target_marker(self, pose: Pose) -> None:
@@ -226,7 +301,6 @@ class RvizClickToMove(Node):
 
     def _publish_waypoint_visuals(self, waypoints: List[Pose]) -> None:
         marker_array = MarkerArray()
-
         delete_marker = Marker()
         delete_marker.action = Marker.DELETEALL
         marker_array.markers.append(delete_marker)
