@@ -19,6 +19,7 @@ setup(
     entry_points={
         "console_scripts": [
             "rviz_click_to_move = team_policy.planner.rviz_click_to_move:main",
+            "test_stereo_center_depth = team_policy.Depth.test_depth_publisher:main",
         ],
     },
 )

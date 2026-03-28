@@ -8,15 +8,21 @@ channels = [
 ]
 
 [package.host-dependencies]
-ros-kilted-interactive-markers = "*"
 ros-kilted-aic-control-interfaces = { path = "../aic_interfaces/aic_control_interfaces" }
 ros-kilted-aic-model = { path = "../aic_model" }
 ros-kilted-aic-model-interfaces = { path = "../aic_interfaces/aic_model_interfaces" }
 ros-kilted-aic-task-interfaces = { path = "../aic_interfaces/aic_task_interfaces" }
+ros-kilted-cv-bridge = "*"
+ros-kilted-interactive-markers = "*"
+ros-kilted-message-filters = "*"
+ros-kilted-tf2-ros = "*"
 
 [package.build-dependencies]
-ros-kilted-interactive-markers = "*"
 ros-kilted-aic-control-interfaces = { path = "../aic_interfaces/aic_control_interfaces" }
 ros-kilted-aic-model = { path = "../aic_model" }
 ros-kilted-aic-model-interfaces = { path = "../aic_interfaces/aic_model_interfaces" }
 ros-kilted-aic-task-interfaces = { path = "../aic_interfaces/aic_task_interfaces" }
+ros-kilted-cv-bridge = "*"
+ros-kilted-interactive-markers = "*"
+ros-kilted-message-filters = "*"
+ros-kilted-tf2-ros = "*"

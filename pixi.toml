@@ -44,6 +44,34 @@ lerobot_teleoperator_devices = { git = "https://github.com/koonpeng/lerobot-ros"
 mujoco = "==3.5.0"
 pynput = ">=1.7.6,<2"
 pyspacemouse = ">=2.0.0, <3"
+transformers = ">=4.49"
+pillow = "*"
+safetensors = "*"
 
 [activation]
 scripts = ["pixi_env_setup.sh"]
+
+[tasks.download_model]
+description = "Downloads the Depth-Anything-V2 model locally if it doesn't exist"
+cmd = """
+python -c '
+import os
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+out_dir = "team_policy/models/depth_anything_v2_small"
+if not os.path.exists(out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    print("Downloading model...")
+    model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+    AutoImageProcessor.from_pretrained(model_id).save_pretrained(out_dir)
+    AutoModelForDepthEstimation.from_pretrained(model_id).save_pretrained(out_dir)
+    print("Model saved to " + out_dir)
+else:
+    print("Model already exists at " + out_dir)
+'
+"""
+
+[tasks.test_depth]
+description = "Runs the stereo depth node with Depth-Anything-V2 environment variables"
+depends-on = ["download_model"]
+cmd = "unset DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB && export DEPTH_ANYTHING_V2_MODEL_ID_OR_PATH=$PWD/team_policy/models/depth_anything_v2_small && export DEPTH_ANYTHING_V2_LOCAL_ONLY=1 && export DEPTH_ANYTHING_V2_DEVICE=auto && export DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB=2 && export DEPTH_ANYTHING_V2_MAX_SIDE_CPU=448 && export DEPTH_ANYTHING_V2_MAX_SIDE_GPU=700 && export DEPTH_ANYTHING_V2_MAX_INFERENCE_HZ=2.0 && export DEPTH_ANYTHING_V2_USE_FP16=1 && ros2 run team_policy test_stereo_center_depth"
