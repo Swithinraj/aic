@@ -1,0 +1,1 @@
+from .yolov12_detector import YoloV12MultiCameraDetector

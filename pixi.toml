@@ -47,6 +47,8 @@ pyspacemouse = ">=2.0.0, <3"
 transformers = ">=4.49"
 pillow = "*"
 safetensors = "*"
+trimesh = "*"
+ultralytics = "*"
 
 [activation]
 scripts = ["pixi_env_setup.sh"]
@@ -74,4 +76,4 @@ else:
 [tasks.test_depth]
 description = "Runs the stereo depth node with Depth-Anything-V2 environment variables"
 depends-on = ["download_model"]
-cmd = "unset DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB && export DEPTH_ANYTHING_V2_MODEL_ID_OR_PATH=$PWD/team_policy/models/depth_anything_v2_small && export DEPTH_ANYTHING_V2_LOCAL_ONLY=1 && export DEPTH_ANYTHING_V2_DEVICE=auto && export DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB=2 && export DEPTH_ANYTHING_V2_MAX_SIDE_CPU=448 && export DEPTH_ANYTHING_V2_MAX_SIDE_GPU=700 && export DEPTH_ANYTHING_V2_MAX_INFERENCE_HZ=2.0 && export DEPTH_ANYTHING_V2_USE_FP16=1 && ros2 run team_policy test_stereo_center_depth"
+cmd = "unset DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB && export DEPTH_ANYTHING_V2_MODEL_ID_OR_PATH=$PWD/team_policy/models/depth_anything_v2_small && export DEPTH_ANYTHING_V2_LOCAL_ONLY=1 && export DEPTH_ANYTHING_V2_DEVICE=auto && export DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB=2 && export DEPTH_ANYTHING_V2_MAX_SIDE_CPU=448 && export DEPTH_ANYTHING_V2_MAX_SIDE_GPU=700 && export DEPTH_ANYTHING_V2_MAX_INFERENCE_HZ=2.0 && export DEPTH_ANYTHING_V2_USE_FP16=1 && ros2 run team_policy test_stereo_center_depth && export YOLOV12_MODEL_PATH=$PWD/team_policy/models/yolov12.pt && export YOLOV12_DEVICE=auto && export YOLOV12_CONF=0.25 && export YOLOV12_IOU=0.45 && export YOLOV12_IMGSZ=640 && export YOLOV12_MAX_HZ=5.0"

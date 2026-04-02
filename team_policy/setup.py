@@ -1,3 +1,4 @@
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = "team_policy"
@@ -9,7 +10,14 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name + "/models", glob("models/*.pt")),
     ],
+    include_package_data=True,
+    package_data={
+        'team_policy': [
+            'models/*.pt',
+        ],
+    },
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="Team",
@@ -20,6 +28,8 @@ setup(
         "console_scripts": [
             "rviz_click_to_move = team_policy.planner.rviz_click_to_move:main",
             "test_stereo_center_depth = team_policy.Depth.test_depth_publisher:main",
+            "test_depth_axis_estimator = team_policy.planner.depth_angle_estimator:main",
+            "test_yolov12_perception = team_policy.perception.yolov12_detector:main",
         ],
     },
 )
