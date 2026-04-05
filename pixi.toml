@@ -49,6 +49,10 @@ pillow = "*"
 safetensors = "*"
 trimesh = "*"
 ultralytics = "*"
+pyrender = "*"
+pyglet = "*"
+PyOpenGL= "*"
+
 
 [activation]
 scripts = ["pixi_env_setup.sh"]

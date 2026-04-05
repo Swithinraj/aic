@@ -16,6 +16,8 @@ setup(
     package_data={
         'team_policy': [
             'models/*.pt',
+            'perception/*.png',
+            'perception/*.json',
         ],
     },
     install_requires=["setuptools"],
