@@ -360,20 +360,38 @@ class StereoCenterDepth:
             self._torch.cuda.empty_cache()
 
     def _select_device(self, torch):
+        def _cuda_supported() -> bool:
+            """Return True only if the current GPU's compute capability is
+            actually in the list of capabilities this PyTorch build supports."""
+            if not torch.cuda.is_available():
+                return False
+            major, minor = torch.cuda.get_device_capability(0)
+            gpu_sm = f"sm_{major}{minor}"
+            arch_list = torch.cuda.get_arch_list() if hasattr(torch.cuda, "get_arch_list") else [gpu_sm]
+            return gpu_sm in arch_list
+
+        cuda_ok = _cuda_supported()
         pref = self._device_pref
+
         if pref == "cpu":
             return torch.device("cpu")
         if pref == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError("DEPTH_ANYTHING_V2_DEVICE=cuda but CUDA is not available")
+            if not cuda_ok:
+                raise RuntimeError("DEPTH_ANYTHING_V2_DEVICE=cuda but CUDA compute capability is not supported or CUDA is not available")
             return torch.device("cuda")
-        if torch.cuda.is_available():
+
+        if cuda_ok:
             total_bytes = torch.cuda.get_device_properties(0).total_memory
             total_gb = float(total_bytes) / float(1024 ** 3)
             if total_gb >= self._gpu_min_vram_gb:
                 return torch.device("cuda")
             self._node.get_logger().warn(
                 f"CUDA VRAM {total_gb:.2f} GB is below DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB={self._gpu_min_vram_gb:.2f}; using CPU"
+            )
+        elif torch.cuda.is_available() and not cuda_ok:
+            self._node.get_logger().warn(
+                "GPU detected but its compute capability is not supported by this PyTorch build. "
+                "Falling back to CPU."
             )
         return torch.device("cpu")
 

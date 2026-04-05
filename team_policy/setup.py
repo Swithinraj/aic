@@ -32,6 +32,7 @@ setup(
             "test_stereo_center_depth = team_policy.Depth.test_depth_publisher:main",
             "test_depth_axis_estimator = team_policy.planner.depth_angle_estimator:main",
             "test_yolov12_perception = team_policy.perception.yolov12_detector:main",
+            "test_pose_estimator = team_policy.perception.pose_estimator:main",
         ],
     },
 )

@@ -190,16 +190,39 @@ class YoloV12MultiCameraDetector(Node):
         return str(name).strip().lower().replace("-", "_").replace(" ", "_")
 
     def _resolve_device(self, requested: str) -> str:
+        def _cuda_supported() -> bool:
+            """Return True only if the current GPU's compute capability is
+            actually in the list of capabilities this PyTorch build supports."""
+            if not torch.cuda.is_available():
+                return False
+            major, minor = torch.cuda.get_device_capability(0)
+            gpu_sm = f"sm_{major}{minor}"
+            supported = getattr(torch.cuda, "_get_device_properties", None)
+            # torch.cuda.get_arch_list() lists supported arch strings like
+            # ['sm_50', 'sm_60', ...].  Fall back to always-allow if the API
+            # is not present (very old torch versions).
+            arch_list = torch.cuda.get_arch_list() if hasattr(torch.cuda, "get_arch_list") else [gpu_sm]
+            return gpu_sm in arch_list
+
+        cuda_ok = _cuda_supported()
+
         if requested in {"", "auto"}:
-            if torch.cuda.is_available():
+            if cuda_ok:
                 return "cuda:0"
-            if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-                return "mps"
+            if not torch.cuda.is_available():
+                # Only try MPS when CUDA isn't present at all
+                if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                    return "mps"
+            if not cuda_ok and torch.cuda.is_available():
+                self.get_logger().warn(
+                    "GPU detected but its compute capability is not supported by this PyTorch build. "
+                    "Falling back to CPU."
+                )
             return "cpu"
         if requested == "cuda":
-            return "cuda:0" if torch.cuda.is_available() else "cpu"
+            return "cuda:0" if cuda_ok else "cpu"
         if requested.startswith("cuda"):
-            return requested if torch.cuda.is_available() else "cpu"
+            return requested if cuda_ok else "cpu"
         if requested == "mps":
             return "mps" if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available() else "cpu"
         return "cpu"
