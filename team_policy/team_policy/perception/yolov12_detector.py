@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import threading
 import time
@@ -13,11 +12,9 @@ import torch
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.time import Time
-from geometry_msgs.msg import Pose, PoseArray, Quaternion, TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
-from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
-from visualization_msgs.msg import Marker, MarkerArray
+from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
 
 
@@ -54,7 +51,7 @@ class YoloV12MultiCameraDetector(Node):
             os.environ.get("YOLOV12_FIX_CLASSES", "fix")
         )
         self._sc_classes = self._parse_name_set(
-            os.environ.get("YOLOV12_SC_CLASSES", "sc_port,sc port,sc_port_0,sc_port_1")
+            os.environ.get("YOLOV12_SC_CLASSES", "sc_port,sc port,sc_port_0,sc_port_1,sc_port_2,sc_port_3,sc_port_4")
         )
         self._nic_classes = self._parse_name_set(
             os.environ.get("YOLOV12_NIC_CLASSES", "nic_card,nic card,nic,nic_card_0,nic_card_1,nic_card_2,nic_card_3,nic_card_4")
@@ -83,15 +80,6 @@ class YoloV12MultiCameraDetector(Node):
         self._rail_memory = {"SC_PORT": {"label": None, "streak": 0}, "NIC_CARD": {"label": None, "streak": 0}}
         self._rail_switch_frames = int(os.environ.get("YOLOV12_RAIL_SWITCH_FRAMES", "2"))
         self._rail_margin_thresh = float(os.environ.get("YOLOV12_RAIL_MARGIN_THRESH", "0.18"))
-        self._target_frame = os.environ.get("YOLOV12_TARGET_FRAME", "base_link").strip() or "base_link"
-        self._target_frame_topic_suffix = self._sanitize_topic_token(self._target_frame)
-        self._board_width_m = float(os.environ.get("YOLOV12_BOARD_WIDTH_M", "0.300"))
-        self._board_height_m = float(os.environ.get("YOLOV12_BOARD_HEIGHT_M", "0.425"))
-        self._default_pose_surface_offset_m = float(os.environ.get("YOLOV12_DEFAULT_SURFACE_OFFSET_M", "0.0"))
-        self._default_pose_marker_scale_m = float(os.environ.get("YOLOV12_POSE_MARKER_SCALE_M", "0.02"))
-        self._broadcast_pose_tf = os.environ.get("YOLOV12_BROADCAST_POSE_TF", "1") != "0"
-        self._pose_specs = self._build_pose_specs()
-        self._tf_broadcaster = TransformBroadcaster(self)
 
         if not os.path.isfile(self._model_path):
             raise FileNotFoundError(f"YOLO model not found: {self._model_path}")
@@ -210,21 +198,6 @@ class YoloV12MultiCameraDetector(Node):
             "center": self.create_publisher(String, "/center_camera/yolo/mask_status", 10),
             "right": self.create_publisher(String, "/right_camera/yolo/mask_status", 10),
         }
-        self._pose_camera_pubs = {
-            "left": self.create_publisher(PoseArray, "/left_camera/yolo/poses_camera", 10),
-            "center": self.create_publisher(PoseArray, "/center_camera/yolo/poses_camera", 10),
-            "right": self.create_publisher(PoseArray, "/right_camera/yolo/poses_camera", 10),
-        }
-        self._pose_target_pubs = {
-            "left": self.create_publisher(PoseArray, f"/left_camera/yolo/poses_{self._target_frame_topic_suffix}", 10),
-            "center": self.create_publisher(PoseArray, f"/center_camera/yolo/poses_{self._target_frame_topic_suffix}", 10),
-            "right": self.create_publisher(PoseArray, f"/right_camera/yolo/poses_{self._target_frame_topic_suffix}", 10),
-        }
-        self._pose_markers_pubs = {
-            "left": self.create_publisher(MarkerArray, "/left_camera/yolo/pose_markers", 10),
-            "center": self.create_publisher(MarkerArray, "/center_camera/yolo/pose_markers", 10),
-            "right": self.create_publisher(MarkerArray, "/right_camera/yolo/pose_markers", 10),
-        }
 
         self._timer = self.create_timer(0.02, self._tick)
 
@@ -235,7 +208,6 @@ class YoloV12MultiCameraDetector(Node):
         self.get_logger().info(f"Device request: {self._device_request}")
         self.get_logger().info(f"Resolved device: {self._device}")
         self.get_logger().info(f"Inference rate limit per camera: {self._max_hz:.2f} Hz")
-        self.get_logger().info(f"Pose target frame: {self._target_frame}")
 
     def _parse_name_set(self, text: str) -> set:
         return {self._norm_name(x) for x in text.split(",") if x.strip()}
@@ -257,35 +229,6 @@ class YoloV12MultiCameraDetector(Node):
         if requested == "mps":
             return "mps" if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available() else "cpu"
         return "cpu"
-
-
-    def _sanitize_topic_token(self, value: str) -> str:
-        text = str(value).strip().lower().replace("/", "_")
-        while "__" in text:
-            text = text.replace("__", "_")
-        return text.strip("_") or "frame"
-
-    def _sanitize_frame_token(self, value: str) -> str:
-        out = []
-        for ch in str(value).strip().lower():
-            if ch.isalnum() or ch == "_":
-                out.append(ch)
-            else:
-                out.append("_")
-        text = "".join(out)
-        while "__" in text:
-            text = text.replace("__", "_")
-        return text.strip("_") or "object"
-
-    def _build_pose_specs(self) -> Dict[str, Dict]:
-        sc_offset = self._euler_to_matrix(math.pi * 0.5, math.pi, 0.0)
-        nic_offset = self._euler_to_matrix(-math.pi * 0.5, 0.0, 0.0)
-        return {
-            "taskboard": {"aliases": set(self._taskboard_classes), "z_offset": 0.0, "R_offset": np.eye(3, dtype=np.float32), "use_board_origin": True},
-            "fix": {"aliases": set(self._fix_classes), "z_offset": 0.0, "R_offset": np.eye(3, dtype=np.float32), "use_board_origin": False},
-            "sc_port": {"aliases": set(self._sc_classes), "z_offset": 0.0, "R_offset": sc_offset.astype(np.float32), "use_board_origin": False},
-            "nic_card": {"aliases": set(self._nic_classes), "z_offset": 0.0899, "R_offset": nic_offset.astype(np.float32), "use_board_origin": False},
-        }
 
     def _compute_mask_board_quad(self) -> np.ndarray:
         edge1 = self._feature_boxes_norm.get("edge_1")
@@ -358,7 +301,7 @@ class YoloV12MultiCameraDetector(Node):
             if now - self._last_infer_time[camera_name] < self._min_period:
                 continue
             try:
-                annotated, detections, classes, mask_overlay, mask_binary, mask_status, pose_camera_msg, pose_target_msg, pose_markers_msg, pose_transforms = self._run_inference(camera_name, msg)
+                annotated, detections, classes, mask_overlay, mask_binary, mask_status = self._run_inference(camera_name, msg)
             except Exception as exc:
                 self.get_logger().error(f"{camera_name} inference failed: {exc}")
                 continue
@@ -387,11 +330,6 @@ class YoloV12MultiCameraDetector(Node):
             status_msg = String()
             status_msg.data = mask_status
             self._mask_status_pubs[camera_name].publish(status_msg)
-            self._pose_camera_pubs[camera_name].publish(pose_camera_msg)
-            self._pose_target_pubs[camera_name].publish(pose_target_msg)
-            self._pose_markers_pubs[camera_name].publish(pose_markers_msg)
-            if self._broadcast_pose_tf and len(pose_transforms) > 0:
-                self._tf_broadcaster.sendTransform(pose_transforms)
 
     def _run_inference(self, camera_name: str, msg: Image):
         frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -405,7 +343,6 @@ class YoloV12MultiCameraDetector(Node):
             verbose=False,
         )
         result = results[0]
-        annotated = result.plot()
         detections: List[Dict] = []
         classes: List[str] = []
         names = result.names if hasattr(result, "names") else self._model.names
@@ -422,14 +359,14 @@ class YoloV12MultiCameraDetector(Node):
                     "confidence": float(conf),
                     "bbox_xyxy": [float(v) for v in box.tolist()],
                 })
-        detections = self._keep_highest_conf_per_class(detections, key_name="class_name")
+        detections = self._filter_target_detections(detections)
         mask_overlay, mask_binary, mask_status, projected_rails, fused_targets = self._fit_rails(camera_name, frame, detections, msg)
         detections = self._assign_detection_instance_names(detections, projected_rails, fused_targets, camera_name)
-        detections = self._keep_highest_conf_per_class(detections, key_name="class_name")
-        detections, pose_camera_msg, pose_target_msg, pose_markers_msg, pose_transforms = self._attach_and_publish_pose_data(camera_name, detections, msg)
+        detections = self._sort_output_detections(detections)
         classes = [str(det["class_name"]) for det in detections]
+        annotated = self._draw_filtered_detections(frame, detections)
         annotated = self._draw_instance_labels(annotated, detections)
-        return annotated, detections, classes, mask_overlay, mask_binary, mask_status, pose_camera_msg, pose_target_msg, pose_markers_msg, pose_transforms
+        return annotated, detections, classes, mask_overlay, mask_binary, mask_status
 
     def _keep_highest_conf_per_class(self, detections: List[Dict], key_name: str = "class_name"):
         best = {}
@@ -440,6 +377,96 @@ class YoloV12MultiCameraDetector(Node):
             if prev is None or conf > float(prev.get("confidence", 0.0)):
                 best[key] = det
         return list(best.values())
+
+    def _class_in_family(self, class_name: str, allowed_names: set) -> bool:
+        name = self._norm_name(class_name)
+        if name in allowed_names:
+            return True
+        for allowed in allowed_names:
+            if name.startswith(f"{allowed}_"):
+                return True
+        return False
+
+    def _detection_family_name(self, det: Dict) -> Optional[str]:
+        name = det.get("base_class_name", det.get("class_name", ""))
+        if self._class_in_family(name, self._taskboard_classes):
+            return "taskboard"
+        if self._class_in_family(name, self._fix_classes):
+            return "fix"
+        if self._class_in_family(name, self._nic_classes):
+            return "nic"
+        if self._class_in_family(name, self._sc_classes):
+            return "sc"
+        return None
+
+    def _top_k_family_detections(self, detections: List[Dict], allowed_names: set, k: int) -> List[Dict]:
+        family = [det for det in detections if self._class_in_family(det.get("class_name", ""), allowed_names)]
+        family.sort(key=lambda det: float(det.get("confidence", 0.0)), reverse=True)
+        return family[: max(0, int(k))]
+
+    def _filter_target_detections(self, detections: List[Dict]) -> List[Dict]:
+        filtered = []
+        seen = set()
+
+        def add_family(items: List[Dict]):
+            for det in items:
+                key = (
+                    int(det.get("class_id", -1)),
+                    tuple(round(float(v), 3) for v in det.get("bbox_xyxy", [])),
+                    round(float(det.get("confidence", 0.0)), 6),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                filtered.append(det)
+
+        add_family(self._top_k_family_detections(detections, self._taskboard_classes, 1))
+        add_family(self._top_k_family_detections(detections, self._fix_classes, 1))
+        add_family(self._top_k_family_detections(detections, self._nic_classes, max(1, len(self._base_nic_rail_quads))))
+        add_family(self._top_k_family_detections(detections, self._sc_classes, 5))
+        return filtered
+
+    def _instance_index_from_name(self, class_name: str) -> int:
+        parts = self._norm_name(class_name).split("_")
+        try:
+            return int(parts[-1])
+        except Exception:
+            return 10 ** 6
+
+    def _sort_output_detections(self, detections: List[Dict]) -> List[Dict]:
+        family_order = {"taskboard": 0, "fix": 1, "nic": 2, "sc": 3, None: 4}
+        return sorted(
+            detections,
+            key=lambda det: (
+                family_order.get(self._detection_family_name(det), 4),
+                self._instance_index_from_name(det.get("class_name", "")),
+                -float(det.get("confidence", 0.0)),
+            ),
+        )
+
+    def _draw_filtered_detections(self, image: np.ndarray, detections: List[Dict]) -> np.ndarray:
+        out = image.copy()
+        colors = {
+            "taskboard": (255, 0, 0),
+            "fix": (255, 0, 255),
+            "nic": (0, 255, 255),
+            "sc": (255, 255, 0),
+            None: (0, 255, 0),
+        }
+        for det in detections:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in det.get("bbox_xyxy", [0, 0, 0, 0])]
+            family = self._detection_family_name(det)
+            color = colors.get(family, (0, 255, 0))
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            display_name = str(det.get("base_class_name", det.get("class_name", "")))
+            conf = float(det.get("confidence", 0.0))
+            text = f"{display_name} {conf:.2f}"
+            (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            tx = max(0, x1)
+            ty = max(th + 6, y1 + th + 4)
+            cv2.rectangle(out, (tx, ty - th - 6), (tx + tw + 8, ty + baseline - 2), color, -1, cv2.LINE_AA)
+            cv2.putText(out, text, (tx + 4, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+        return out
 
     def _stamp_to_sec(self, stamp) -> float:
         return float(getattr(stamp, "sec", 0)) + 1e-9 * float(getattr(stamp, "nanosec", 0))
@@ -663,29 +690,15 @@ class YoloV12MultiCameraDetector(Node):
 
         projected_sc = [(label, self._transform_quad_affine(M, rail_quad)) for label, rail_quad in state["sc_rails"]]
         projected_nic = [(label, self._transform_quad_affine(M, rail_quad)) for label, rail_quad in state["nic_rails"]]
-        board_quad_image = self._transform_quad_affine(M, state["board_quad"])
-        board_pose_camera = None
-        board_pose_target = None
-        image_to_board_h = None
-        with self._lock:
-            info = self._latest_infos.get(camera_name)
-        if info is not None:
-            board_pose_camera = self._estimate_board_pose_from_quad(info, board_quad_image)
-            if board_pose_camera is not None:
-                board_pose_target = self._transform_pose_dict(board_pose_camera, str(info.header.frame_id), self._target_frame)
-            image_to_board_h = self._compute_image_to_board_homography(board_quad_image)
+        projected_board_quad = self._transform_quad_affine(M, state["board_quad"])
         with self._lock:
             self._assignment_context[camera_name] = {
                 "M": M.astype(np.float32),
                 "state": state,
                 "projected_sc": projected_sc,
                 "projected_nic": projected_nic,
+                "projected_board_quad": projected_board_quad,
                 "fused_targets": fused_targets,
-                "board_quad_image": board_quad_image,
-                "board_pose_camera": board_pose_camera,
-                "board_pose_target": board_pose_target,
-                "image_to_board_h": image_to_board_h,
-                "camera_frame": str(info.header.frame_id) if info is not None else image_msg.header.frame_id,
             }
 
         overlay_rgba, binary = self._render_transformed_rails(state, M, (h, w))
@@ -725,12 +738,37 @@ class YoloV12MultiCameraDetector(Node):
             det2["base_class_name"] = str(det["class_name"])
             detections_out.append(det2)
 
-        self._assign_family_to_rails(detections_out, self._sc_classes, "SC_PORT", fused_targets.get("sc") if camera_name == "center" else None, camera_name)
-        self._assign_family_to_rails(detections_out, self._nic_classes, "NIC_CARD", fused_targets.get("nic") if camera_name == "center" else None, camera_name)
+        self._assign_family_to_rails(
+            detections_out,
+            self._sc_classes,
+            "SC_PORT",
+            fused_targets.get("sc") if camera_name == "center" else None,
+            camera_name,
+            allow_multiple_per_rail=True,
+            sequential_by_rail=True,
+        )
+        self._assign_family_to_rails(
+            detections_out,
+            self._nic_classes,
+            "NIC_CARD",
+            fused_targets.get("nic") if camera_name == "center" else None,
+            camera_name,
+            allow_multiple_per_rail=False,
+            sequential_by_rail=False,
+        )
         return detections_out
 
-    def _assign_family_to_rails(self, detections: List[Dict], allowed_names: set, output_prefix: str, fused_center: Optional[np.ndarray], camera_name: str):
-        family = [det for det in detections if self._norm_name(det.get("base_class_name", det["class_name"])) in allowed_names]
+    def _assign_family_to_rails(
+        self,
+        detections: List[Dict],
+        allowed_names: set,
+        output_prefix: str,
+        fused_center: Optional[np.ndarray],
+        camera_name: str,
+        allow_multiple_per_rail: bool,
+        sequential_by_rail: bool,
+    ):
+        family = [det for det in detections if self._class_in_family(det.get("base_class_name", det["class_name"]), allowed_names)]
         if len(family) == 0:
             return
         with self._lock:
@@ -744,48 +782,111 @@ class YoloV12MultiCameraDetector(Node):
         family.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
         remaining = list(range(len(rails)))
         invM = self._invert_affine(ctx["M"])
+        use_fused_center = fused_center is not None and len(family) == 1
+        assigned = []
 
         for det in family:
-            anchor_img = fused_center.astype(np.float32) if fused_center is not None else self._detection_anchor_point(det, output_prefix)
+            anchor_img = fused_center.astype(np.float32) if use_fused_center else self._detection_anchor_point(det, output_prefix)
             anchor_board = self._apply_affine(invM, anchor_img)
+            candidate_indices = list(range(len(rails))) if allow_multiple_per_rail else remaining[:]
             results = []
-            for rail_idx in remaining:
+            for rail_idx in candidate_indices:
                 rail_label, rail_quad = rails[rail_idx]
                 rail_score = self._rail_match_score_board(anchor_board, rail_quad)
                 results.append((rail_score, rail_idx, rail_label, rail_quad))
             if not results:
+                det["class_name"] = f"{output_prefix}_UNCERTAIN"
+                det["instance_name"] = det["class_name"]
                 continue
             results.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_idx, rail_label, rail_quad = results[0]
+            best_score, best_idx, rail_label, _ = results[0]
             second_score = results[1][0] if len(results) > 1 else -1e9
             margin = float(best_score - second_score)
             chosen_label = str(rail_label).upper()
-            chosen_label = self._stabilize_rail_label(output_prefix, chosen_label, margin)
-            if chosen_label is None:
-                det["class_name"] = f"{output_prefix}_UNCERTAIN"
-                det["instance_name"] = det["class_name"]
-                det["assignment_score"] = float(best_score)
-                det["assignment_margin"] = margin
-                det["anchor_xy"] = [float(anchor_img[0]), float(anchor_img[1])]
-                det["anchor_board_xy"] = [float(anchor_board[0]), float(anchor_board[1])]
-                continue
             rail_id = self._feature_sort_key(self._norm_name(chosen_label))
-            instance_name = f"{output_prefix}_{rail_id}"
-            det["class_name"] = instance_name
-            det["instance_name"] = instance_name
             det["rail_name"] = chosen_label
             det["rail_id"] = int(rail_id)
             det["assignment_score"] = float(best_score)
             det["assignment_margin"] = margin
             det["anchor_xy"] = [float(anchor_img[0]), float(anchor_img[1])]
             det["anchor_board_xy"] = [float(anchor_board[0]), float(anchor_board[1])]
-            if fused_center is not None:
+            if use_fused_center:
                 det["fused_center_xy"] = [float(anchor_img[0]), float(anchor_img[1])]
-            chosen_idx = next((i for i in remaining if str(rails[i][0]).upper() == chosen_label), None)
-            if chosen_idx is None:
-                chosen_idx = best_idx
-            if chosen_idx in remaining:
-                remaining.remove(chosen_idx)
+            assigned.append(det)
+            if not allow_multiple_per_rail and best_idx in remaining:
+                remaining.remove(best_idx)
+
+        if sequential_by_rail:
+            self._assign_sc_port_sequence_names(assigned, detections, ctx)
+            return
+
+        for det in assigned:
+            instance_name = f"{output_prefix}_{int(det.get('rail_id', 0))}"
+            det["class_name"] = instance_name
+            det["instance_name"] = instance_name
+
+    def _assign_sc_port_sequence_names(self, family: List[Dict], all_detections: List[Dict], ctx: Dict):
+        if len(family) == 0:
+            return
+        board_bbox = self._taskboard_bbox_for_ordering(all_detections, ctx)
+        projected_sc = {str(label).upper(): np.asarray(quad, dtype=np.float32) for label, quad in ctx.get("projected_sc", [])}
+        ordered = []
+        for rail_id in sorted({int(det.get("rail_id", 0)) for det in family}):
+            rail_group = [det for det in family if int(det.get("rail_id", -1)) == rail_id]
+            if len(rail_group) == 0:
+                continue
+            rail_name = str(rail_group[0].get("rail_name", f"SC_RAIL_{rail_id}")).upper()
+            rail_quad = projected_sc.get(rail_name)
+            rail_group.sort(key=lambda det: self._sc_port_sort_key(det, rail_quad, board_bbox))
+            for local_idx, det in enumerate(rail_group):
+                det["sc_order_in_rail"] = int(local_idx)
+            ordered.extend(rail_group)
+        for global_idx, det in enumerate(ordered):
+            instance_name = f"SC_PORT_{global_idx}"
+            det["class_name"] = instance_name
+            det["instance_name"] = instance_name
+            det["sc_sequence_id"] = int(global_idx)
+
+    def _taskboard_bbox_for_ordering(self, detections: List[Dict], ctx: Dict) -> Optional[np.ndarray]:
+        board_candidates = [det for det in detections if self._detection_family_name(det) == "taskboard"]
+        if len(board_candidates) > 0:
+            best = max(board_candidates, key=lambda det: float(det.get("confidence", 0.0)))
+            return np.asarray(best.get("bbox_xyxy", []), dtype=np.float32)
+        board_quad = ctx.get("projected_board_quad")
+        if board_quad is None:
+            return None
+        return np.asarray(self._quad_to_bbox(np.asarray(board_quad, dtype=np.float32)), dtype=np.float32)
+
+    def _point_to_bbox_edge_distance(self, point_xy: np.ndarray, bbox_xyxy: Optional[np.ndarray]) -> float:
+        if bbox_xyxy is None or len(bbox_xyxy) != 4:
+            return 0.0
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+        px, py = [float(v) for v in np.asarray(point_xy, dtype=np.float32).reshape(2)]
+        return float(min(abs(px - x1), abs(px - x2), abs(py - y1), abs(py - y2)))
+
+    def _sc_port_sort_key(self, det: Dict, rail_quad: Optional[np.ndarray], board_bbox: Optional[np.ndarray]):
+        if "anchor_xy" in det:
+            anchor = np.asarray(det["anchor_xy"], dtype=np.float32)
+        else:
+            anchor = self._detection_anchor_point(det, "SC_PORT")
+        edge_distance = self._point_to_bbox_edge_distance(anchor, board_bbox)
+        if rail_quad is None:
+            return (edge_distance, float(anchor[0]), float(anchor[1]))
+        a, b, _ = self._rail_centerline_from_quad(np.asarray(rail_quad, dtype=np.float32))
+        start = a
+        end = b
+        if board_bbox is not None:
+            da = self._point_to_bbox_edge_distance(a, board_bbox)
+            db = self._point_to_bbox_edge_distance(b, board_bbox)
+            if db < da:
+                start = b
+                end = a
+        direction = end - start
+        length = max(1e-6, float(np.linalg.norm(direction)))
+        unit = direction / length
+        s = float(np.dot(anchor - start, unit))
+        lateral = float(np.linalg.norm(anchor - (start + np.clip(s, 0.0, length) * unit)))
+        return (s, edge_distance, lateral, float(anchor[0]), float(anchor[1]))
 
     def _stabilize_rail_label(self, family_key: str, candidate_label: str, margin: float) -> Optional[str]:
         mem = self._rail_memory[family_key]
@@ -851,322 +952,6 @@ class YoloV12MultiCameraDetector(Node):
         along_ok = 1.0 if -0.15 * L <= s <= 1.15 * L else -1.0
         gap_penalty = max(0.0, lateral - 0.75 * max(1.0, half_width))
         return 2.5 * along_ok - 2.0 * (lateral / max(2.0, half_width)) - 1.5 * gap_penalty / max(2.0, half_width)
-
-    def _attach_and_publish_pose_data(self, camera_name: str, detections: List[Dict], image_msg: Image):
-        with self._lock:
-            ctx = self._assignment_context.get(camera_name)
-        pose_camera_msg = PoseArray()
-        pose_camera_msg.header = image_msg.header
-        pose_target_msg = PoseArray()
-        pose_target_msg.header = image_msg.header
-        pose_target_msg.header.frame_id = self._target_frame
-        markers_msg = MarkerArray()
-        pose_transforms: List[TransformStamped] = []
-        markers_msg.markers = [self._make_marker_delete_all(image_msg.header)]
-        if ctx is None:
-            return detections, pose_camera_msg, pose_target_msg, markers_msg, pose_transforms
-        board_pose_camera = ctx.get("board_pose_camera")
-        board_pose_target = ctx.get("board_pose_target")
-        image_to_board_h = ctx.get("image_to_board_h")
-        camera_frame = str(ctx.get("camera_frame", image_msg.header.frame_id))
-        pose_camera_msg.header.frame_id = camera_frame
-        if board_pose_camera is None or board_pose_target is None or image_to_board_h is None:
-            return detections, pose_camera_msg, pose_target_msg, markers_msg, pose_transforms
-
-        enriched = []
-        for index, det in enumerate(detections):
-            det_out = dict(det)
-            pose_payload = self._estimate_detection_pose(det_out, image_to_board_h, board_pose_camera, board_pose_target)
-            if pose_payload is None:
-                det_out["pose_valid"] = False
-                enriched.append(det_out)
-                continue
-            det_out["pose_valid"] = True
-            det_out["pose_source"] = "board_plane_pnp"
-            det_out["pose_camera_frame"] = camera_frame
-            det_out[f"pose_{self._target_frame_topic_suffix}_frame"] = self._target_frame
-            det_out["pose_camera"] = pose_payload["camera_serializable"]
-            det_out[f"pose_{self._target_frame_topic_suffix}"] = pose_payload["target_serializable"]
-            det_out["board_xy_m"] = [float(pose_payload["board_point"][0]), float(pose_payload["board_point"][1])]
-            det_out["surface_offset_m"] = float(pose_payload["surface_offset_m"])
-            pose_camera_msg.poses.append(pose_payload["camera_pose_msg"])
-            pose_target_msg.poses.append(pose_payload["target_pose_msg"])
-            markers_msg.markers.extend(self._make_detection_markers(camera_name, det_out, pose_payload["target_pose_msg"], image_msg.header, index))
-            tf_msg = self._make_detection_transform(camera_name, det_out, pose_payload["target_pose_msg"], image_msg.header, index)
-            if tf_msg is not None:
-                pose_transforms.append(tf_msg)
-            enriched.append(det_out)
-        data_markers = [m for m in markers_msg.markers if m.action != Marker.DELETEALL]
-        markers_msg.markers = [self._make_marker_delete_all(image_msg.header)] + data_markers
-        return enriched, pose_camera_msg, pose_target_msg, markers_msg, pose_transforms
-
-    def _estimate_detection_pose(self, det: Dict, image_to_board_h: np.ndarray, board_pose_camera: Dict, board_pose_target: Dict):
-        spec = self._resolve_pose_spec(det)
-        if spec is None:
-            return None
-        if bool(spec.get("use_board_origin", False)):
-            board_xy = np.array([0.0, 0.0], dtype=np.float32)
-        else:
-            anchor_img = self._detection_pose_anchor(det)
-            if anchor_img is None:
-                return None
-            board_xy = self._image_point_to_board_xy(image_to_board_h, anchor_img)
-            if board_xy is None:
-                return None
-        local_point = np.array([float(board_xy[0]), float(board_xy[1]), float(spec.get("z_offset", self._default_pose_surface_offset_m))], dtype=np.float32)
-        pose_camera = self._compose_local_pose(board_pose_camera, local_point, spec["R_offset"])
-        pose_target = self._compose_local_pose(board_pose_target, local_point, spec["R_offset"])
-        if pose_camera is None or pose_target is None:
-            return None
-        return {
-            "board_point": local_point,
-            "surface_offset_m": float(local_point[2]),
-            "camera_pose_msg": self._pose_dict_to_msg(pose_camera),
-            "target_pose_msg": self._pose_dict_to_msg(pose_target),
-            "camera_serializable": self._pose_dict_to_jsonable(pose_camera),
-            "target_serializable": self._pose_dict_to_jsonable(pose_target),
-        }
-
-    def _resolve_pose_spec(self, det: Dict) -> Optional[Dict]:
-        base_name = self._norm_name(det.get("base_class_name", det.get("class_name", "")))
-        current_name = self._norm_name(det.get("class_name", ""))
-        for key, spec in self._pose_specs.items():
-            aliases = spec["aliases"]
-            if base_name in aliases or current_name in aliases or any(current_name.startswith(alias + "_") for alias in aliases):
-                return spec
-        return None
-
-    def _detection_pose_anchor(self, det: Dict) -> Optional[np.ndarray]:
-        for key in ("fused_center_xy", "anchor_xy"):
-            value = det.get(key)
-            if isinstance(value, (list, tuple)) and len(value) == 2:
-                return np.array([float(value[0]), float(value[1])], dtype=np.float32)
-        if "bbox_xyxy" in det:
-            base_name = self._norm_name(det.get("base_class_name", det.get("class_name", "")))
-            if base_name in self._sc_classes:
-                return self._detection_anchor_point(det, "SC_PORT")
-            if base_name in self._nic_classes:
-                return self._detection_anchor_point(det, "NIC_CARD")
-            return self._bbox_center(det["bbox_xyxy"])
-        return None
-
-    def _board_corner_points_xy(self) -> np.ndarray:
-        half_w = 0.5 * float(self._board_width_m)
-        half_h = 0.5 * float(self._board_height_m)
-        return np.array([
-            [-half_w, half_h],
-            [half_w, half_h],
-            [half_w, -half_h],
-            [-half_w, -half_h],
-        ], dtype=np.float32)
-
-    def _board_corner_points_xyz(self) -> np.ndarray:
-        xy = self._board_corner_points_xy()
-        return np.column_stack([xy, np.zeros((4, 1), dtype=np.float32)]).astype(np.float32)
-
-    def _camera_matrix_from_info(self, info: CameraInfo) -> np.ndarray:
-        return np.array([
-            [float(info.k[0]), 0.0, float(info.k[2])],
-            [0.0, float(info.k[4]), float(info.k[5])],
-            [0.0, 0.0, 1.0],
-        ], dtype=np.float32)
-
-    def _dist_coeffs_from_info(self, info: CameraInfo) -> np.ndarray:
-        if getattr(info, "d", None) is None or len(info.d) == 0:
-            return np.zeros((5, 1), dtype=np.float32)
-        return np.asarray(info.d, dtype=np.float32).reshape(-1, 1)
-
-    def _estimate_board_pose_from_quad(self, info: CameraInfo, board_quad_image: np.ndarray) -> Optional[Dict]:
-        image_points = np.asarray(board_quad_image, dtype=np.float32).reshape(4, 2)
-        object_points = self._board_corner_points_xyz()
-        K = self._camera_matrix_from_info(info)
-        dist = self._dist_coeffs_from_info(info)
-        solve_flags = getattr(cv2, "SOLVEPNP_IPPE", cv2.SOLVEPNP_ITERATIVE)
-        ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, dist, flags=solve_flags)
-        if not ok:
-            ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-        if not ok:
-            return None
-        R, _ = cv2.Rodrigues(rvec)
-        t = np.asarray(tvec, dtype=np.float32).reshape(3)
-        R = np.asarray(R, dtype=np.float32).reshape(3, 3)
-        return {"R": R, "t": t, "q": self._matrix_to_quaternion(R)}
-
-    def _compute_image_to_board_homography(self, board_quad_image: np.ndarray) -> Optional[np.ndarray]:
-        try:
-            H = cv2.getPerspectiveTransform(np.asarray(board_quad_image, dtype=np.float32).reshape(4, 2), self._board_corner_points_xy())
-            return np.asarray(H, dtype=np.float32)
-        except Exception:
-            return None
-
-    def _image_point_to_board_xy(self, H: np.ndarray, point_xy: np.ndarray) -> Optional[np.ndarray]:
-        if H is None:
-            return None
-        pts = np.asarray(point_xy, dtype=np.float32).reshape(1, 1, 2)
-        out = cv2.perspectiveTransform(pts, H)
-        if out is None:
-            return None
-        return np.asarray(out, dtype=np.float32).reshape(2)
-
-    def _compose_local_pose(self, board_pose: Dict, local_point: np.ndarray, R_offset: np.ndarray) -> Optional[Dict]:
-        if board_pose is None:
-            return None
-        R_board = np.asarray(board_pose["R"], dtype=np.float32).reshape(3, 3)
-        t_board = np.asarray(board_pose["t"], dtype=np.float32).reshape(3)
-        local_point = np.asarray(local_point, dtype=np.float32).reshape(3)
-        R_offset = np.asarray(R_offset, dtype=np.float32).reshape(3, 3)
-        R = R_board @ R_offset
-        t = R_board @ local_point + t_board
-        return {"R": R.astype(np.float32), "t": t.astype(np.float32), "q": self._matrix_to_quaternion(R)}
-
-    def _transform_pose_dict(self, pose: Optional[Dict], source_frame: str, target_frame: str) -> Optional[Dict]:
-        if pose is None:
-            return None
-        if source_frame == target_frame:
-            return {
-                "R": np.asarray(pose["R"], dtype=np.float32).copy(),
-                "t": np.asarray(pose["t"], dtype=np.float32).copy(),
-                "q": np.asarray(pose["q"], dtype=np.float32).copy(),
-            }
-        try:
-            R_tf, t_tf = self._lookup_transform(target_frame, source_frame)
-        except Exception:
-            return None
-        R_src = np.asarray(pose["R"], dtype=np.float32).reshape(3, 3)
-        t_src = np.asarray(pose["t"], dtype=np.float32).reshape(3)
-        R_tgt = np.asarray(R_tf, dtype=np.float32) @ R_src
-        t_tgt = np.asarray(R_tf, dtype=np.float32) @ t_src + np.asarray(t_tf, dtype=np.float32)
-        return {"R": R_tgt.astype(np.float32), "t": t_tgt.astype(np.float32), "q": self._matrix_to_quaternion(R_tgt)}
-
-    def _pose_dict_to_msg(self, pose: Dict) -> Pose:
-        msg = Pose()
-        msg.position.x = float(pose["t"][0])
-        msg.position.y = float(pose["t"][1])
-        msg.position.z = float(pose["t"][2])
-        msg.orientation = self._quaternion_msg_from_array(pose["q"])
-        return msg
-
-    def _pose_dict_to_jsonable(self, pose: Dict) -> Dict:
-        q = np.asarray(pose["q"], dtype=np.float32).reshape(4)
-        t = np.asarray(pose["t"], dtype=np.float32).reshape(3)
-        return {
-            "position": {"x": float(t[0]), "y": float(t[1]), "z": float(t[2])},
-            "orientation": {"x": float(q[0]), "y": float(q[1]), "z": float(q[2]), "w": float(q[3])},
-        }
-
-    def _quaternion_msg_from_array(self, q: np.ndarray) -> Quaternion:
-        q = np.asarray(q, dtype=np.float32).reshape(4)
-        msg = Quaternion()
-        msg.x = float(q[0])
-        msg.y = float(q[1])
-        msg.z = float(q[2])
-        msg.w = float(q[3])
-        return msg
-
-    def _matrix_to_quaternion(self, R: np.ndarray) -> np.ndarray:
-        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
-        trace = float(np.trace(R))
-        if trace > 0.0:
-            s = 0.5 / np.sqrt(trace + 1.0)
-            w = 0.25 / s
-            x = (R[2, 1] - R[1, 2]) * s
-            y = (R[0, 2] - R[2, 0]) * s
-            z = (R[1, 0] - R[0, 1]) * s
-        else:
-            if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-                s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[0, 0] - R[1, 1] - R[2, 2]))
-                w = (R[2, 1] - R[1, 2]) / s
-                x = 0.25 * s
-                y = (R[0, 1] + R[1, 0]) / s
-                z = (R[0, 2] + R[2, 0]) / s
-            elif R[1, 1] > R[2, 2]:
-                s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[1, 1] - R[0, 0] - R[2, 2]))
-                w = (R[0, 2] - R[2, 0]) / s
-                x = (R[0, 1] + R[1, 0]) / s
-                y = 0.25 * s
-                z = (R[1, 2] + R[2, 1]) / s
-            else:
-                s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[2, 2] - R[0, 0] - R[1, 1]))
-                w = (R[1, 0] - R[0, 1]) / s
-                x = (R[0, 2] + R[2, 0]) / s
-                y = (R[1, 2] + R[2, 1]) / s
-                z = 0.25 * s
-        q = np.array([x, y, z, w], dtype=np.float64)
-        qn = np.linalg.norm(q)
-        if qn < 1e-12:
-            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-        q = q / qn
-        if q[3] < 0.0:
-            q = -q
-        return q.astype(np.float32)
-
-    def _euler_to_matrix(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
-        cr = math.cos(roll)
-        sr = math.sin(roll)
-        cp = math.cos(pitch)
-        sp = math.sin(pitch)
-        cy = math.cos(yaw)
-        sy = math.sin(yaw)
-        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float32)
-        Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float32)
-        Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-        return (Rz @ Ry @ Rx).astype(np.float32)
-
-    def _make_marker_delete_all(self, header) -> Marker:
-        msg = Marker()
-        msg.header = header
-        msg.header.frame_id = self._target_frame
-        msg.action = Marker.DELETEALL
-        return msg
-
-    def _make_detection_markers(self, camera_name: str, det: Dict, pose_msg: Pose, header, index: int) -> List[Marker]:
-        ns_token = self._sanitize_frame_token(det.get("instance_name", det.get("class_name", f"det_{index}")))
-        stem_id = abs(hash((camera_name, ns_token))) % 1000000
-        arrow = Marker()
-        arrow.header = header
-        arrow.header.frame_id = self._target_frame
-        arrow.ns = f"{camera_name}_pose"
-        arrow.id = stem_id
-        arrow.type = Marker.ARROW
-        arrow.action = Marker.ADD
-        arrow.pose = pose_msg
-        arrow.scale.x = max(0.01, 2.4 * self._default_pose_marker_scale_m)
-        arrow.scale.y = max(0.0025, 0.45 * self._default_pose_marker_scale_m)
-        arrow.scale.z = max(0.0025, 0.45 * self._default_pose_marker_scale_m)
-        arrow.color.a = 0.95
-        arrow.color.r = 0.15
-        arrow.color.g = 0.85
-        arrow.color.b = 0.25
-
-        text = Marker()
-        text.header = header
-        text.header.frame_id = self._target_frame
-        text.ns = f"{camera_name}_pose_text"
-        text.id = stem_id + 1
-        text.type = Marker.TEXT_VIEW_FACING
-        text.action = Marker.ADD
-        text.pose = pose_msg
-        text.pose.position.z += max(0.02, 1.8 * self._default_pose_marker_scale_m)
-        text.scale.z = max(0.02, 1.4 * self._default_pose_marker_scale_m)
-        text.color.a = 1.0
-        text.color.r = 1.0
-        text.color.g = 1.0
-        text.color.b = 1.0
-        text.text = str(det.get("instance_name", det.get("class_name", f"det_{index}")))
-        return [arrow, text]
-
-    def _make_detection_transform(self, camera_name: str, det: Dict, pose_msg: Pose, header, index: int) -> Optional[TransformStamped]:
-        name = str(det.get("instance_name", det.get("class_name", f"det_{index}")))
-        child = f"yolo_{camera_name}_{self._sanitize_frame_token(name)}"
-        tf_msg = TransformStamped()
-        tf_msg.header = header
-        tf_msg.header.frame_id = self._target_frame
-        tf_msg.child_frame_id = child
-        tf_msg.transform.translation.x = float(pose_msg.position.x)
-        tf_msg.transform.translation.y = float(pose_msg.position.y)
-        tf_msg.transform.translation.z = float(pose_msg.position.z)
-        tf_msg.transform.rotation = pose_msg.orientation
-        return tf_msg
 
     def _draw_instance_labels(self, image: np.ndarray, detections: List[Dict]):
         out = image.copy()
