@@ -11,8 +11,10 @@ import rclpy
 import torch
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
+from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
 
 
@@ -48,6 +50,12 @@ class YoloV12MultiCameraDetector(Node):
         self._fix_classes = self._parse_name_set(
             os.environ.get("YOLOV12_FIX_CLASSES", "fix")
         )
+        self._sc_classes = self._parse_name_set(
+            os.environ.get("YOLOV12_SC_CLASSES", "sc_port,sc port,sc_port_0,sc_port_1")
+        )
+        self._nic_classes = self._parse_name_set(
+            os.environ.get("YOLOV12_NIC_CLASSES", "nic_card,nic card,nic,nic_card_0,nic_card_1,nic_card_2,nic_card_3,nic_card_4")
+        )
 
         self._pink_h1_min = int(os.environ.get("YOLOV12_PINK_H1_MIN", "145"))
         self._pink_h1_max = int(os.environ.get("YOLOV12_PINK_H1_MAX", "160"))
@@ -59,6 +67,26 @@ class YoloV12MultiCameraDetector(Node):
 
         self._last_infer_time = {"left": 0.0, "center": 0.0, "right": 0.0}
         self._latest_frames: Dict[str, Optional[Image]] = {"left": None, "center": None, "right": None}
+        self._latest_infos: Dict[str, Optional[CameraInfo]] = {"left": None, "center": None, "right": None}
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=True)
+        self._board_width_m = float(os.environ.get("YOLOV12_BOARD_WIDTH_M", "0.300"))
+        self._board_height_m = float(os.environ.get("YOLOV12_BOARD_HEIGHT_M", "0.425"))
+        self._sc_plane_z_m = float(os.environ.get("YOLOV12_SC_Z_M", "0.0165"))
+        self._nic_plane_z_m = float(os.environ.get("YOLOV12_NIC_Z_M", "0.0120"))
+        self._latest_infos: Dict[str, Optional[CameraInfo]] = {"left": None, "center": None, "right": None}
+        self._latest_observations: Dict[str, Optional[Dict]] = {"left": None, "center": None, "right": None}
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=True)
+        self._fusion_max_age_s = float(os.environ.get("YOLOV12_FUSION_MAX_AGE", "0.40"))
+        self._min_triangulation_views = int(os.environ.get("YOLOV12_MIN_TRIANGULATION_VIEWS", "2"))
+        self._fix_kf_state = None
+        self._fix_kf_cov = None
+        self._fix_kf_time = None
+        self._assignment_context = {"left": None, "center": None, "right": None}
+        self._rail_memory = {"SC_PORT": {"label": None, "streak": 0}, "NIC_CARD": {"label": None, "streak": 0}}
+        self._rail_switch_frames = int(os.environ.get("YOLOV12_RAIL_SWITCH_FRAMES", "2"))
+        self._rail_margin_thresh = float(os.environ.get("YOLOV12_RAIL_MARGIN_THRESH", "0.18"))
 
         if not os.path.isfile(self._model_path):
             raise FileNotFoundError(f"YOLO model not found: {self._model_path}")
@@ -140,6 +168,11 @@ class YoloV12MultiCameraDetector(Node):
             "left": self.create_subscription(Image, "/left_camera/image", lambda msg: self._image_cb("left", msg), 10),
             "center": self.create_subscription(Image, "/center_camera/image", lambda msg: self._image_cb("center", msg), 10),
             "right": self.create_subscription(Image, "/right_camera/image", lambda msg: self._image_cb("right", msg), 10),
+        }
+        self._info_subs = {
+            "left": self.create_subscription(CameraInfo, "/left_camera/camera_info", lambda msg: self._info_cb("left", msg), 10),
+            "center": self.create_subscription(CameraInfo, "/center_camera/camera_info", lambda msg: self._info_cb("center", msg), 10),
+            "right": self.create_subscription(CameraInfo, "/right_camera/camera_info", lambda msg: self._info_cb("right", msg), 10),
         }
 
         self._annotated_pubs = {
@@ -267,9 +300,26 @@ class YoloV12MultiCameraDetector(Node):
         except Exception:
             return 0
 
+    def _keep_highest_conf_per_class(self, detections: List[Dict], class_field: str = "class_name"):
+        best = {}
+        order = []
+        for det in detections:
+            key = str(det.get(class_field, det.get("class_name", "")))
+            conf = float(det.get("confidence", 0.0))
+            if key not in best:
+                best[key] = dict(det)
+                order.append(key)
+            elif conf > float(best[key].get("confidence", 0.0)):
+                best[key] = dict(det)
+        return [best[key] for key in order if key in best]
+
     def _image_cb(self, camera_name: str, msg: Image) -> None:
         with self._lock:
             self._latest_frames[camera_name] = msg
+
+    def _info_cb(self, camera_name: str, msg: CameraInfo) -> None:
+        with self._lock:
+            self._latest_infos[camera_name] = msg
 
     def _tick(self) -> None:
         now = time.monotonic()
@@ -281,7 +331,7 @@ class YoloV12MultiCameraDetector(Node):
             if now - self._last_infer_time[camera_name] < self._min_period:
                 continue
             try:
-                annotated, detections, classes, mask_overlay, mask_binary, mask_status = self._run_inference(msg)
+                annotated, detections, classes, mask_overlay, mask_binary, mask_status = self._run_inference(camera_name, msg)
             except Exception as exc:
                 self.get_logger().error(f"{camera_name} inference failed: {exc}")
                 continue
@@ -311,8 +361,24 @@ class YoloV12MultiCameraDetector(Node):
             status_msg.data = mask_status
             self._mask_status_pubs[camera_name].publish(status_msg)
 
-    def _run_inference(self, msg: Image):
+            poses_cam_msg = PoseArray()
+            poses_cam_msg.header = msg.header
+            poses_cam_msg.poses = poses_camera
+            self._pose_camera_pubs[camera_name].publish(poses_cam_msg)
+
+            poses_base_msg = PoseArray()
+            poses_base_msg.header.stamp = msg.header.stamp
+            poses_base_msg.header.frame_id = "base_link"
+            poses_base_msg.poses = poses_base
+            self._pose_base_pubs[camera_name].publish(poses_base_msg)
+
+            pose_json_msg = String()
+            pose_json_msg.data = json.dumps(poses_json, separators=(",", ":"))
+            self._pose_json_pubs[camera_name].publish(pose_json_msg)
+
+    def _run_inference(self, camera_name: str, msg: Image):
         frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+
         results = self._model.predict(
             source=frame,
             device=self._device,
@@ -339,21 +405,255 @@ class YoloV12MultiCameraDetector(Node):
                     "confidence": float(conf),
                     "bbox_xyxy": [float(v) for v in box.tolist()],
                 })
-                classes.append(cls_name)
-        mask_overlay, mask_binary, mask_status = self._fit_rails(frame, detections)
+        detections = self._keep_highest_conf_per_class(detections, key_name="class_name")
+        mask_overlay, mask_binary, mask_status, projected_rails, fused_targets = self._fit_rails(camera_name, frame, detections, msg)
+        detections = self._assign_detection_instance_names(detections, projected_rails, fused_targets, camera_name)
+        detections = self._keep_highest_conf_per_class(detections, key_name="class_name")
+        classes = [str(det["class_name"]) for det in detections]
+        annotated = self._draw_instance_labels(annotated, detections)
         return annotated, detections, classes, mask_overlay, mask_binary, mask_status
 
-    def _fit_rails(self, frame: np.ndarray, detections: List[Dict]):
+    def _keep_highest_conf_per_class(self, detections: List[Dict], key_name: str = "class_name"):
+        best = {}
+        for det in detections:
+            key = str(det.get(key_name, ""))
+            conf = float(det.get("confidence", 0.0))
+            prev = best.get(key)
+            if prev is None or conf > float(prev.get("confidence", 0.0)):
+                best[key] = det
+        return list(best.values())
+
+    def _stamp_to_sec(self, stamp) -> float:
+        return float(getattr(stamp, "sec", 0)) + 1e-9 * float(getattr(stamp, "nanosec", 0))
+
+    def _lookup_transform(self, target_frame: str, source_frame: str):
+        if target_frame == source_frame:
+            return np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
+        try:
+            tf = self._tf_buffer.lookup_transform(target_frame, source_frame, Time())
+        except TransformException:
+            tf = self._tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time())
+        q = tf.transform.rotation
+        x, y, z, w = float(q.x), float(q.y), float(q.z), float(q.w)
+        R = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ], dtype=np.float32)
+        t = np.array([float(tf.transform.translation.x), float(tf.transform.translation.y), float(tf.transform.translation.z)], dtype=np.float32)
+        return R, t
+
+    def _camera_ray_from_pixel(self, info: CameraInfo, uv: np.ndarray) -> np.ndarray:
+        fx = float(info.k[0])
+        fy = float(info.k[4])
+        cx = float(info.k[2])
+        cy = float(info.k[5])
+        x = (float(uv[0]) - cx) / max(1e-6, fx)
+        y = (float(uv[1]) - cy) / max(1e-6, fy)
+        ray = np.array([x, y, 1.0], dtype=np.float32)
+        ray /= max(1e-9, float(np.linalg.norm(ray)))
+        return ray
+
+    def _project_point_to_camera(self, info: CameraInfo, p_cam: np.ndarray) -> Optional[np.ndarray]:
+        z = float(p_cam[2])
+        if z <= 1e-6:
+            return None
+        fx = float(info.k[0])
+        fy = float(info.k[4])
+        cx = float(info.k[2])
+        cy = float(info.k[5])
+        u = fx * float(p_cam[0]) / z + cx
+        v = fy * float(p_cam[1]) / z + cy
+        return np.array([u, v], dtype=np.float32)
+
+    def _project_center_point_to_camera(self, p_center: np.ndarray, camera_frame: str) -> Optional[np.ndarray]:
+        with self._lock:
+            info = self._latest_infos.get("center") if camera_frame == (self._latest_infos.get("center").header.frame_id if self._latest_infos.get("center") else camera_frame) else None
+            all_infos = dict(self._latest_infos)
+        chosen_info = None
+        for info_msg in all_infos.values():
+            if info_msg is not None and info_msg.header.frame_id == camera_frame:
+                chosen_info = info_msg
+                break
+        if chosen_info is None:
+            return None
+        try:
+            R, t = self._lookup_transform(camera_frame, self._get_center_frame())
+            p_cam = R @ np.asarray(p_center, dtype=np.float32).reshape(3) + t
+            return self._project_point_to_camera(chosen_info, p_cam)
+        except Exception:
+            return None
+
+    def _get_center_frame(self) -> Optional[str]:
+        with self._lock:
+            info = self._latest_infos.get("center")
+        if info is None:
+            return None
+        return str(info.header.frame_id)
+
+    def _update_latest_observation(self, camera_name: str, detections: List[Dict], observed, image_msg: Image):
+        with self._lock:
+            info = self._latest_infos.get(camera_name)
+        if info is None:
+            return
+        obs = {
+            "time": self._stamp_to_sec(image_msg.header.stamp),
+            "frame_id": str(info.header.frame_id),
+            "info": info,
+            "fix_center": None,
+            "fix_quad": None,
+            "sc_center": None,
+            "nic_center": None,
+        }
+        if observed is not None:
+            obs["fix_quad"] = np.asarray(observed["quad"], dtype=np.float32)
+            fix_center = self._mask_centroid(observed["mask"])
+            if fix_center is None:
+                fix_center = obs["fix_quad"].mean(axis=0).astype(np.float32)
+            obs["fix_center"] = fix_center.astype(np.float32)
+        sc_det = self._find_best_detection(detections, self._sc_classes)
+        nic_det = self._find_best_detection(detections, self._nic_classes)
+        if sc_det is not None:
+            obs["sc_center"] = self._detection_anchor_point(sc_det, "SC_PORT")
+        if nic_det is not None:
+            obs["nic_center"] = self._detection_anchor_point(nic_det, "NIC_CARD")
+        with self._lock:
+            self._latest_observations[camera_name] = obs
+
+    def _collect_family_observations(self, family: str, stamp_sec: float):
+        with self._lock:
+            latest = dict(self._latest_observations)
+        out = []
+        key = f"{family}_center"
+        for camera_name in ("center", "left", "right"):
+            obs = latest.get(camera_name)
+            if obs is None:
+                continue
+            if stamp_sec - float(obs.get("time", 0.0)) > self._fusion_max_age_s:
+                continue
+            pt = obs.get(key)
+            if pt is None:
+                continue
+            out.append(obs)
+        return out
+
+    def _triangulate_family_to_center(self, family: str, current_frame: str, stamp):
+        center_frame = self._get_center_frame()
+        if center_frame is None:
+            return None
+        stamp_sec = self._stamp_to_sec(stamp)
+        obs_list = self._collect_family_observations(family, stamp_sec)
+        if len(obs_list) < self._min_triangulation_views:
+            return None
+        A = np.zeros((3, 3), dtype=np.float64)
+        b = np.zeros(3, dtype=np.float64)
+        used = 0
+        for obs in obs_list:
+            info = obs["info"]
+            uv = np.asarray(obs[f"{family}_center"], dtype=np.float32)
+            ray_cam = self._camera_ray_from_pixel(info, uv)
+            try:
+                R, t = self._lookup_transform(center_frame, str(obs["frame_id"]))
+            except Exception:
+                continue
+            o = np.asarray(t, dtype=np.float64).reshape(3)
+            d = (np.asarray(R, dtype=np.float64) @ np.asarray(ray_cam, dtype=np.float64).reshape(3))
+            dn = np.linalg.norm(d)
+            if dn < 1e-9:
+                continue
+            d = d / dn
+            M = np.eye(3, dtype=np.float64) - np.outer(d, d)
+            A += M
+            b += M @ o
+            used += 1
+        if used < self._min_triangulation_views:
+            return None
+        try:
+            X = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return None
+        return X.astype(np.float32)
+
+    def _update_fix_kalman(self, meas_center: np.ndarray, t_sec: float) -> np.ndarray:
+        z = np.asarray(meas_center, dtype=np.float32).reshape(3)
+        if self._fix_kf_state is None:
+            self._fix_kf_state = np.zeros((6, 1), dtype=np.float32)
+            self._fix_kf_state[:3, 0] = z
+            self._fix_kf_cov = np.eye(6, dtype=np.float32) * 0.05
+            self._fix_kf_time = float(t_sec)
+            return z.copy()
+        dt = max(1e-3, float(t_sec - self._fix_kf_time))
+        F = np.eye(6, dtype=np.float32)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
+        H = np.zeros((3, 6), dtype=np.float32)
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 2] = 1.0
+        Q = np.eye(6, dtype=np.float32) * 0.002
+        Rm = np.eye(3, dtype=np.float32) * 0.0008
+        x = F @ self._fix_kf_state
+        P = F @ self._fix_kf_cov @ F.T + Q
+        y = z.reshape(3, 1) - H @ x
+        S = H @ P @ H.T + Rm
+        K = P @ H.T @ np.linalg.inv(S)
+        x = x + K @ y
+        P = (np.eye(6, dtype=np.float32) - K @ H) @ P
+        self._fix_kf_state = x.astype(np.float32)
+        self._fix_kf_cov = P.astype(np.float32)
+        self._fix_kf_time = float(t_sec)
+        return self._fix_kf_state[:3, 0].copy()
+
+    def _fit_rails(self, camera_name: str, frame: np.ndarray, detections: List[Dict], image_msg: Image):
         h, w = frame.shape[:2]
         observed = self._detect_observed_fix_component(frame, detections)
+        self._update_latest_observation(camera_name, detections, observed, image_msg)
         if observed is None:
-            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "missing_fix_hsv"
+            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "missing_fix_hsv", {"sc": [], "nic": []}, {"sc": None, "nic": None, "fix": None}
 
         best = self._estimate_fix_only_transform(frame, observed)
         if best is None:
-            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "rails_alignment_failed"
+            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "rails_alignment_failed", {"sc": [], "nic": []}, {"sc": None, "nic": None, "fix": None}
 
         state, M, rotation_name, score = best
+        fused_targets = {"sc": None, "nic": None, "fix": None}
+
+        if camera_name == "center":
+            fused_fix = self._triangulate_family_to_center("fix", image_msg.header.frame_id, image_msg.header.stamp)
+            if fused_fix is not None:
+                filtered_fix = self._update_fix_kalman(fused_fix, self._stamp_to_sec(image_msg.header.stamp))
+                proj_fix = self._project_center_point_to_camera(filtered_fix, image_msg.header.frame_id)
+                if proj_fix is not None:
+                    fused_targets["fix"] = proj_fix.astype(np.float32)
+                    local_center = self._mask_centroid(observed["mask"])
+                    if local_center is None:
+                        local_center = observed["quad"].mean(axis=0).astype(np.float32)
+                    delta = proj_fix.astype(np.float32) - local_center.astype(np.float32)
+                    M = M.copy().astype(np.float32)
+                    M[:, 2] += delta
+            fused_sc = self._triangulate_family_to_center("sc", image_msg.header.frame_id, image_msg.header.stamp)
+            if fused_sc is not None:
+                proj_sc = self._project_center_point_to_camera(fused_sc, image_msg.header.frame_id)
+                if proj_sc is not None:
+                    fused_targets["sc"] = proj_sc.astype(np.float32)
+            fused_nic = self._triangulate_family_to_center("nic", image_msg.header.frame_id, image_msg.header.stamp)
+            if fused_nic is not None:
+                proj_nic = self._project_center_point_to_camera(fused_nic, image_msg.header.frame_id)
+                if proj_nic is not None:
+                    fused_targets["nic"] = proj_nic.astype(np.float32)
+
+        projected_sc = [(label, self._transform_quad_affine(M, rail_quad)) for label, rail_quad in state["sc_rails"]]
+        projected_nic = [(label, self._transform_quad_affine(M, rail_quad)) for label, rail_quad in state["nic_rails"]]
+        with self._lock:
+            self._assignment_context[camera_name] = {
+                "M": M.astype(np.float32),
+                "state": state,
+                "projected_sc": projected_sc,
+                "projected_nic": projected_nic,
+                "fused_targets": fused_targets,
+            }
+
         overlay_rgba, binary = self._render_transformed_rails(state, M, (h, w))
         overlay = self._compose_overlay(frame, overlay_rgba)
 
@@ -369,15 +669,291 @@ class YoloV12MultiCameraDetector(Node):
         proj_center = self._mask_centroid(cv2.warpAffine(state["fix_mask"], M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0))
         if proj_center is not None:
             cv2.circle(overlay, tuple(np.round(proj_center).astype(int)), 5, (0, 255, 0), -1, cv2.LINE_AA)
+        if fused_targets["fix"] is not None:
+            cv2.circle(overlay, tuple(np.round(fused_targets["fix"]).astype(int)), 6, (0, 165, 255), -1, cv2.LINE_AA)
 
-        for _, rail_quad in state["sc_rails"]:
-            q = self._transform_quad_affine(M, rail_quad)
+        for label, q in projected_sc:
             cv2.polylines(overlay, [np.round(q).astype(np.int32)], True, (255, 0, 255), 2, cv2.LINE_AA)
-        for _, rail_quad in state["nic_rails"]:
-            q = self._transform_quad_affine(M, rail_quad)
+            self._draw_quad_name(overlay, q, label.upper())
+        for label, q in projected_nic:
             cv2.polylines(overlay, [np.round(q).astype(np.int32)], True, (0, 255, 255), 2, cv2.LINE_AA)
+            self._draw_quad_name(overlay, q, label.upper())
 
-        return overlay, binary, f"rails_from_fix_only_{rotation_name}_{score:.4f}"
+        status = f"rails_pose_fused_{rotation_name}_{score:.4f}"
+        if camera_name == "center" and fused_targets["fix"] is not None:
+            status += "_triangulated"
+        return overlay, binary, status, {"sc": projected_sc, "nic": projected_nic}, fused_targets
+
+    def _assign_detection_instance_names(self, detections: List[Dict], projected_rails: Dict[str, List[Tuple[str, np.ndarray]]], fused_targets: Dict[str, Optional[np.ndarray]], camera_name: str):
+        detections_out = []
+        for det in detections:
+            det2 = dict(det)
+            det2["base_class_name"] = str(det["class_name"])
+            detections_out.append(det2)
+
+        self._assign_family_to_rails(detections_out, self._sc_classes, "SC_PORT", fused_targets.get("sc") if camera_name == "center" else None, camera_name)
+        self._assign_family_to_rails(detections_out, self._nic_classes, "NIC_CARD", fused_targets.get("nic") if camera_name == "center" else None, camera_name)
+        return detections_out
+
+    def _assign_family_to_rails(self, detections: List[Dict], allowed_names: set, output_prefix: str, fused_center: Optional[np.ndarray], camera_name: str):
+        family = [det for det in detections if self._norm_name(det.get("base_class_name", det["class_name"])) in allowed_names]
+        if len(family) == 0:
+            return
+        with self._lock:
+            ctx = self._assignment_context.get(camera_name)
+        if ctx is None:
+            return
+        rails = ctx["state"]["sc_rails"] if output_prefix == "SC_PORT" else ctx["state"]["nic_rails"]
+        if len(rails) == 0:
+            return
+
+        family.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+        remaining = list(range(len(rails)))
+        invM = self._invert_affine(ctx["M"])
+
+        for det in family:
+            anchor_img = fused_center.astype(np.float32) if fused_center is not None else self._detection_anchor_point(det, output_prefix)
+            anchor_board = self._apply_affine(invM, anchor_img)
+            results = []
+            for rail_idx in remaining:
+                rail_label, rail_quad = rails[rail_idx]
+                rail_score = self._rail_match_score_board(anchor_board, rail_quad)
+                results.append((rail_score, rail_idx, rail_label, rail_quad))
+            if not results:
+                continue
+            results.sort(key=lambda x: x[0], reverse=True)
+            best_score, best_idx, rail_label, rail_quad = results[0]
+            second_score = results[1][0] if len(results) > 1 else -1e9
+            margin = float(best_score - second_score)
+            chosen_label = str(rail_label).upper()
+            chosen_label = self._stabilize_rail_label(output_prefix, chosen_label, margin)
+            if chosen_label is None:
+                det["class_name"] = f"{output_prefix}_UNCERTAIN"
+                det["instance_name"] = det["class_name"]
+                det["assignment_score"] = float(best_score)
+                det["assignment_margin"] = margin
+                det["anchor_xy"] = [float(anchor_img[0]), float(anchor_img[1])]
+                det["anchor_board_xy"] = [float(anchor_board[0]), float(anchor_board[1])]
+                continue
+            rail_id = self._feature_sort_key(self._norm_name(chosen_label))
+            instance_name = f"{output_prefix}_{rail_id}"
+            det["class_name"] = instance_name
+            det["instance_name"] = instance_name
+            det["rail_name"] = chosen_label
+            det["rail_id"] = int(rail_id)
+            det["assignment_score"] = float(best_score)
+            det["assignment_margin"] = margin
+            det["anchor_xy"] = [float(anchor_img[0]), float(anchor_img[1])]
+            det["anchor_board_xy"] = [float(anchor_board[0]), float(anchor_board[1])]
+            if fused_center is not None:
+                det["fused_center_xy"] = [float(anchor_img[0]), float(anchor_img[1])]
+            chosen_idx = next((i for i in remaining if str(rails[i][0]).upper() == chosen_label), None)
+            if chosen_idx is None:
+                chosen_idx = best_idx
+            if chosen_idx in remaining:
+                remaining.remove(chosen_idx)
+
+    def _stabilize_rail_label(self, family_key: str, candidate_label: str, margin: float) -> Optional[str]:
+        mem = self._rail_memory[family_key]
+        current = mem["label"]
+        if current is None:
+            mem["label"] = candidate_label
+            mem["streak"] = 1
+            return candidate_label
+        if candidate_label == current:
+            mem["streak"] = min(mem["streak"] + 1, self._rail_switch_frames + 2)
+            return current
+        if margin < self._rail_margin_thresh:
+            mem["streak"] = 0
+            return current
+        mem["streak"] += 1
+        if mem["streak"] >= self._rail_switch_frames:
+            mem["label"] = candidate_label
+            mem["streak"] = 1
+            return candidate_label
+        return current
+
+    def _detection_anchor_point(self, det: Dict, family_key: str) -> np.ndarray:
+        x1, y1, x2, y2 = [float(v) for v in det["bbox_xyxy"]]
+        if family_key == "SC_PORT":
+            return np.array([(x1 + x2) * 0.5, y2], dtype=np.float32)
+        if family_key == "NIC_CARD":
+            return np.array([(x1 + x2) * 0.5, y1 + 0.72 * (y2 - y1)], dtype=np.float32)
+        return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+
+    def _invert_affine(self, M: np.ndarray) -> np.ndarray:
+        A = np.vstack([np.asarray(M, dtype=np.float32), np.array([0.0, 0.0, 1.0], dtype=np.float32)])
+        Ai = np.linalg.inv(A)
+        return Ai[:2, :].astype(np.float32)
+
+    def _apply_affine(self, M: np.ndarray, p: np.ndarray) -> np.ndarray:
+        p = np.asarray(p, dtype=np.float32).reshape(2)
+        return (M[:, :2] @ p.reshape(2, 1) + M[:, 2:3]).reshape(2).astype(np.float32)
+
+    def _rail_centerline_from_quad(self, rail_quad: np.ndarray):
+        q = np.asarray(rail_quad, dtype=np.float32).reshape(4, 2)
+        e01 = np.linalg.norm(q[1] - q[0])
+        e12 = np.linalg.norm(q[2] - q[1])
+        if e01 >= e12:
+            a = 0.5 * (q[0] + q[3])
+            b = 0.5 * (q[1] + q[2])
+            half_width = 0.5 * e12
+        else:
+            a = 0.5 * (q[0] + q[1])
+            b = 0.5 * (q[3] + q[2])
+            half_width = 0.5 * e01
+        return a.astype(np.float32), b.astype(np.float32), float(half_width)
+
+    def _rail_match_score_board(self, anchor_board: np.ndarray, rail_quad: np.ndarray) -> float:
+        a, b, half_width = self._rail_centerline_from_quad(rail_quad)
+        p = np.asarray(anchor_board, dtype=np.float32)
+        ab = b - a
+        L = max(1e-6, float(np.linalg.norm(ab)))
+        u = ab / L
+        ap = p - a
+        s = float(np.dot(ap, u))
+        closest = a + np.clip(s, 0.0, L) * u
+        lateral = float(np.linalg.norm(p - closest))
+        along_ok = 1.0 if -0.15 * L <= s <= 1.15 * L else -1.0
+        gap_penalty = max(0.0, lateral - 0.75 * max(1.0, half_width))
+        return 2.5 * along_ok - 2.0 * (lateral / max(2.0, half_width)) - 1.5 * gap_penalty / max(2.0, half_width)
+
+    def _camera_info_for(self, camera_name: str) -> Optional[CameraInfo]:
+        with self._lock:
+            return self._latest_infos.get(camera_name)
+
+    def _camera_matrix_from_info(self, info: CameraInfo) -> np.ndarray:
+        return np.array([[float(info.k[0]), 0.0, float(info.k[2])], [0.0, float(info.k[4]), float(info.k[5])], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    def _board_object_points(self) -> np.ndarray:
+        w = 0.5 * self._board_width_m
+        h = 0.5 * self._board_height_m
+        return np.array([[-w, -h, 0.0], [w, -h, 0.0], [w, h, 0.0], [-w, h, 0.0]], dtype=np.float32)
+
+    def _mask_xy_to_board_xy(self, p_mask: np.ndarray) -> np.ndarray:
+        quad = self._base_mask_board_quad.astype(np.float32)
+        min_x = float(np.min(quad[:, 0])); max_x = float(np.max(quad[:, 0]))
+        min_y = float(np.min(quad[:, 1])); max_y = float(np.max(quad[:, 1]))
+        u = (float(p_mask[0]) - min_x) / max(1e-6, max_x - min_x)
+        v = (float(p_mask[1]) - min_y) / max(1e-6, max_y - min_y)
+        return np.array([(u - 0.5) * self._board_width_m, (v - 0.5) * self._board_height_m], dtype=np.float32)
+
+    def _rail_pose_in_board(self, rail_box: List[int], z_m: float):
+        seg = self._rail_centerline_from_box(rail_box)
+        p0 = self._mask_xy_to_board_xy(seg[0])
+        p1 = self._mask_xy_to_board_xy(seg[1])
+        center = 0.5 * (p0 + p1)
+        x_axis = np.array([p1[0] - p0[0], p1[1] - p0[1], 0.0], dtype=np.float32)
+        n = float(np.linalg.norm(x_axis))
+        x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32) if n < 1e-9 else x_axis / n
+        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        y_axis = np.cross(z_axis, x_axis)
+        yn = float(np.linalg.norm(y_axis))
+        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32) if yn < 1e-9 else y_axis / yn
+        return np.column_stack([x_axis, y_axis, z_axis]).astype(np.float32), np.array([center[0], center[1], z_m], dtype=np.float32)
+
+    def _quat_from_rotmat(self, R: np.ndarray) -> Quaternion:
+        m = np.asarray(R, dtype=np.float64)
+        tr = float(np.trace(m))
+        if tr > 0.0:
+            s = math.sqrt(tr + 1.0) * 2.0
+            qw = 0.25 * s; qx = (m[2,1] - m[1,2]) / s; qy = (m[0,2] - m[2,0]) / s; qz = (m[1,0] - m[0,1]) / s
+        elif m[0,0] > m[1,1] and m[0,0] > m[2,2]:
+            s = math.sqrt(1.0 + m[0,0] - m[1,1] - m[2,2]) * 2.0
+            qw = (m[2,1] - m[1,2]) / s; qx = 0.25 * s; qy = (m[0,1] + m[1,0]) / s; qz = (m[0,2] + m[2,0]) / s
+        elif m[1,1] > m[2,2]:
+            s = math.sqrt(1.0 + m[1,1] - m[0,0] - m[2,2]) * 2.0
+            qw = (m[0,2] - m[2,0]) / s; qx = (m[0,1] + m[1,0]) / s; qy = 0.25 * s; qz = (m[1,2] + m[2,1]) / s
+        else:
+            s = math.sqrt(1.0 + m[2,2] - m[0,0] - m[1,1]) * 2.0
+            qw = (m[1,0] - m[0,1]) / s; qx = (m[0,2] + m[2,0]) / s; qy = (m[1,2] + m[2,1]) / s; qz = 0.25 * s
+        q = Quaternion(); q.x=float(qx); q.y=float(qy); q.z=float(qz); q.w=float(qw); return q
+
+    def _quat_multiply_np(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        ax, ay, az, aw = a; bx, by, bz, bw = b
+        return np.array([aw*bx + ax*bw + ay*bz - az*by, aw*by - ax*bz + ay*bw + az*bx, aw*bz + ax*by - ay*bx + az*bw, aw*bw - ax*bx - ay*by - az*bz], dtype=np.float32)
+
+    def _transform_pose_camera_to_base(self, camera_frame: str, pose_cam: Pose) -> Optional[Pose]:
+        try:
+            tf_msg = self._tf_buffer.lookup_transform("base_link", camera_frame, rclpy.time.Time())
+        except Exception:
+            return None
+        t = tf_msg.transform.translation; q = tf_msg.transform.rotation
+        q_tf = np.array([q.x, q.y, q.z, q.w], dtype=np.float32)
+        x, y, z, w = [float(v) for v in q_tf]
+        R = np.array([[1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)], [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)], [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)]], dtype=np.float32)
+        p_cam = np.array([pose_cam.position.x, pose_cam.position.y, pose_cam.position.z], dtype=np.float32)
+        p_base = R @ p_cam + np.array([t.x, t.y, t.z], dtype=np.float32)
+        q_cam = np.array([pose_cam.orientation.x, pose_cam.orientation.y, pose_cam.orientation.z, pose_cam.orientation.w], dtype=np.float32)
+        q_base = self._quat_multiply_np(q_tf, q_cam)
+        pose = Pose(); pose.position.x=float(p_base[0]); pose.position.y=float(p_base[1]); pose.position.z=float(p_base[2]); pose.orientation=Quaternion(x=float(q_base[0]), y=float(q_base[1]), z=float(q_base[2]), w=float(q_base[3])); return pose
+
+    def _pose_to_dict(self, label: str, frame_id: str, pose: Pose) -> Dict:
+        return {"label": label, "frame_id": frame_id, "position": {"x": float(pose.position.x), "y": float(pose.position.y), "z": float(pose.position.z)}, "orientation": {"x": float(pose.orientation.x), "y": float(pose.orientation.y), "z": float(pose.orientation.z), "w": float(pose.orientation.w)}}
+
+    def _estimate_and_build_poses(self, camera_name: str, image_msg: Image, board_quad: np.ndarray, mask_sc_rails, mask_nic_rails, sc_corr, nic_corr):
+        info = self._camera_info_for(camera_name)
+        if info is None:
+            return [], [], []
+        K = self._camera_matrix_from_info(info)
+        ok, rvec, tvec = cv2.solvePnP(self._board_object_points(), board_quad.astype(np.float32), K, np.zeros((4,1), dtype=np.float32), flags=cv2.SOLVEPNP_ITERATIVE)
+        if not ok:
+            return [], [], []
+        R_board, _ = cv2.Rodrigues(rvec)
+        t_board = tvec.reshape(3).astype(np.float32)
+        poses_camera = []
+        poses_base = []
+        poses_json = []
+        frame_id = info.header.frame_id if info.header.frame_id else image_msg.header.frame_id
+        task_pose = Pose(); task_pose.position.x=float(t_board[0]); task_pose.position.y=float(t_board[1]); task_pose.position.z=float(t_board[2]); task_pose.orientation=self._quat_from_rotmat(R_board)
+        poses_camera.append(task_pose); poses_json.append(self._pose_to_dict("TASKBOARD", frame_id, task_pose))
+        pb = self._transform_pose_camera_to_base(frame_id, task_pose)
+        if pb is not None: poses_base.append(pb); poses_json.append(self._pose_to_dict("TASKBOARD", "base_link", pb))
+        def add_feature(label, rail_label, rail_group, z_m):
+            rail_box = None
+            for lbl, box in rail_group:
+                if lbl == rail_label:
+                    rail_box = box; break
+            if rail_box is None:
+                return
+            R_local, t_local = self._rail_pose_in_board(rail_box, z_m)
+            R_obj = R_board @ R_local
+            p_obj = (R_board @ t_local.reshape(3,1) + t_board.reshape(3,1)).reshape(3)
+            pose = Pose(); pose.position.x=float(p_obj[0]); pose.position.y=float(p_obj[1]); pose.position.z=float(p_obj[2]); pose.orientation=self._quat_from_rotmat(R_obj)
+            poses_camera.append(pose); poses_json.append(self._pose_to_dict(label, frame_id, pose))
+            pb = self._transform_pose_camera_to_base(frame_id, pose)
+            if pb is not None: poses_base.append(pb); poses_json.append(self._pose_to_dict(label, "base_link", pb))
+        if sc_corr is not None:
+            rail_label = str(sc_corr[2]); rail_id = int(str(rail_label).split("_")[-1]) if str(rail_label).split("_")[-1].isdigit() else 0
+            add_feature(f"SC_PORT_{rail_id}", rail_label, mask_sc_rails, self._sc_plane_z_m)
+        if nic_corr is not None:
+            rail_label = str(nic_corr[2]); rail_id = int(str(rail_label).split("_")[-1]) if str(rail_label).split("_")[-1].isdigit() else 0
+            add_feature(f"NIC_CARD_{rail_id}", rail_label, mask_nic_rails, self._nic_plane_z_m)
+        return poses_camera, poses_base, poses_json
+
+    def _draw_instance_labels(self, image: np.ndarray, detections: List[Dict]):
+        out = image.copy()
+        for det in detections:
+            label = det.get("instance_name")
+            if not label:
+                continue
+            x1, y1, x2, y2 = [int(round(float(v))) for v in det["bbox_xyxy"]]
+            text = str(label)
+            (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            tx = max(0, x1)
+            ty = max(th + 6, y1 - 6)
+            cv2.rectangle(out, (tx, ty - th - 6), (tx + tw + 8, ty + baseline - 2), (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.putText(out, text, (tx + 4, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        return out
+
+    def _draw_quad_name(self, image: np.ndarray, quad: np.ndarray, text: str):
+        center = np.asarray(quad, dtype=np.float32).reshape(-1, 2).mean(axis=0)
+        x = int(round(float(center[0])))
+        y = int(round(float(center[1])))
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(image, (x - tw // 2 - 3, y - th - 6), (x + tw // 2 + 3, y + baseline - 6), (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.putText(image, text, (x - tw // 2, y - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
     def _render_transformed_rails(self, state, M: np.ndarray, shape_hw: Tuple[int, int]):
         h, w = shape_hw
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -902,6 +1478,10 @@ class YoloV12MultiCameraDetector(Node):
     def _quad_to_bbox(self, quad: np.ndarray):
         quad = np.asarray(quad, dtype=np.float32).reshape(-1, 2)
         return [float(np.min(quad[:, 0])), float(np.min(quad[:, 1])), float(np.max(quad[:, 0])), float(np.max(quad[:, 1]))]
+
+    def _bbox_center(self, box):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
 
     def _bbox_iou_xyxy(self, a, b) -> float:
         if a is None or b is None:
