@@ -56,6 +56,15 @@ class YoloV12MultiCameraDetector(Node):
         self._nic_classes = self._parse_name_set(
             os.environ.get("YOLOV12_NIC_CLASSES", "nic_card,nic card,nic,nic_card_0,nic_card_1,nic_card_2,nic_card_3,nic_card_4")
         )
+        self._sfp_port_classes = self._parse_name_set(
+            os.environ.get("YOLOV12_SFP_PORT_CLASSES", "sfp_port,sfp port,sfp_tip,sfp_plug,sfp_connector")
+        )
+        self._sfp_module_classes = self._parse_name_set(
+            os.environ.get("YOLOV12_SFP_MODULE_CLASSES", "sfp_module,sfp module,transceiver")
+        )
+        self._gripper_classes = self._parse_name_set(
+            os.environ.get("YOLOV12_GRIPPER_CLASSES", "gripper,gripper_tip,gripper_tcp")
+        )
 
         self._pink_h1_min = int(os.environ.get("YOLOV12_PINK_H1_MIN", "145"))
         self._pink_h1_max = int(os.environ.get("YOLOV12_PINK_H1_MAX", "160"))
@@ -64,6 +73,9 @@ class YoloV12MultiCameraDetector(Node):
         self._fix_h_tol = int(os.environ.get("YOLOV12_FIX_H_TOL", "10"))
         self._fix_s_tol = int(os.environ.get("YOLOV12_FIX_S_TOL", "110"))
         self._fix_v_tol = int(os.environ.get("YOLOV12_FIX_V_TOL", "110"))
+        self._fix_ready_iou = float(os.environ.get("YOLOV12_FIX_READY_IOU", "0.55"))
+        self._fix_ready_det_cover = float(os.environ.get("YOLOV12_FIX_READY_DET_COVER", "0.75"))
+        self._fix_ready_comp_cover = float(os.environ.get("YOLOV12_FIX_READY_COMP_COVER", "0.75"))
 
         self._last_infer_time = {"left": 0.0, "center": 0.0, "right": 0.0}
         self._latest_frames: Dict[str, Optional[Image]] = {"left": None, "center": None, "right": None}
@@ -378,17 +390,39 @@ class YoloV12MultiCameraDetector(Node):
                 best[key] = det
         return list(best.values())
 
+    def _strip_numeric_suffix(self, name: str) -> str:
+        parts = self._norm_name(name).split("_")
+        if len(parts) >= 2 and parts[-1].isdigit():
+            return "_".join(parts[:-1])
+        return self._norm_name(name)
+
     def _class_in_family(self, class_name: str, allowed_names: set) -> bool:
         name = self._norm_name(class_name)
-        if name in allowed_names:
+        base = self._strip_numeric_suffix(name)
+        if name in allowed_names or base in allowed_names:
             return True
-        for allowed in allowed_names:
-            if name.startswith(f"{allowed}_"):
-                return True
         return False
 
+    def _canonical_output_name(self, class_name: str) -> str:
+        name = self._norm_name(class_name)
+        if self._class_in_family(name, self._taskboard_classes):
+            return "taskboard"
+        if self._class_in_family(name, self._fix_classes):
+            return "fix"
+        if self._class_in_family(name, self._nic_classes):
+            return "nic_card"
+        if self._class_in_family(name, self._sc_classes):
+            return "sc_port"
+        if self._class_in_family(name, self._sfp_port_classes):
+            return "sfp_port"
+        if self._class_in_family(name, self._sfp_module_classes):
+            return "sfp_module"
+        if self._class_in_family(name, self._gripper_classes):
+            return "gripper"
+        return name
+
     def _detection_family_name(self, det: Dict) -> Optional[str]:
-        name = det.get("base_class_name", det.get("class_name", ""))
+        name = det.get("raw_class_name", det.get("base_class_name", det.get("class_name", "")))
         if self._class_in_family(name, self._taskboard_classes):
             return "taskboard"
         if self._class_in_family(name, self._fix_classes):
@@ -397,6 +431,12 @@ class YoloV12MultiCameraDetector(Node):
             return "nic"
         if self._class_in_family(name, self._sc_classes):
             return "sc"
+        if self._class_in_family(name, self._sfp_port_classes):
+            return "sfp_port"
+        if self._class_in_family(name, self._sfp_module_classes):
+            return "sfp_module"
+        if self._class_in_family(name, self._gripper_classes):
+            return "gripper"
         return None
 
     def _top_k_family_detections(self, detections: List[Dict], allowed_names: set, k: int) -> List[Dict]:
@@ -424,6 +464,9 @@ class YoloV12MultiCameraDetector(Node):
         add_family(self._top_k_family_detections(detections, self._fix_classes, 1))
         add_family(self._top_k_family_detections(detections, self._nic_classes, max(1, len(self._base_nic_rail_quads))))
         add_family(self._top_k_family_detections(detections, self._sc_classes, 5))
+        add_family(self._top_k_family_detections(detections, self._sfp_port_classes, 1))
+        add_family(self._top_k_family_detections(detections, self._sfp_module_classes, 1))
+        add_family(self._top_k_family_detections(detections, self._gripper_classes, 1))
         return filtered
 
     def _instance_index_from_name(self, class_name: str) -> int:
@@ -434,7 +477,7 @@ class YoloV12MultiCameraDetector(Node):
             return 10 ** 6
 
     def _sort_output_detections(self, detections: List[Dict]) -> List[Dict]:
-        family_order = {"taskboard": 0, "fix": 1, "nic": 2, "sc": 3, None: 4}
+        family_order = {"taskboard": 0, "fix": 1, "nic": 2, "sc": 3, "sfp_port": 4, "sfp_module": 5, "gripper": 6, None: 7}
         return sorted(
             detections,
             key=lambda det: (
@@ -451,6 +494,9 @@ class YoloV12MultiCameraDetector(Node):
             "fix": (255, 0, 255),
             "nic": (0, 255, 255),
             "sc": (255, 255, 0),
+            "sfp_port": (0, 165, 255),
+            "sfp_module": (180, 180, 180),
+            "gripper": (0, 128, 255),
             None: (0, 255, 0),
         }
         for det in detections:
@@ -458,7 +504,7 @@ class YoloV12MultiCameraDetector(Node):
             family = self._detection_family_name(det)
             color = colors.get(family, (0, 255, 0))
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-            display_name = str(det.get("base_class_name", det.get("class_name", "")))
+            display_name = str(det.get("instance_name", det.get("class_name", det.get("raw_class_name", ""))))
             conf = float(det.get("confidence", 0.0))
             text = f"{display_name} {conf:.2f}"
             (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
@@ -650,19 +696,83 @@ class YoloV12MultiCameraDetector(Node):
         self._fix_kf_time = float(t_sec)
         return self._fix_kf_state[:3, 0].copy()
 
+    def _estimate_board_quad_without_fix(self, frame: np.ndarray, detections: List[Dict]) -> Optional[np.ndarray]:
+        board_det = self._find_best_detection(detections, self._taskboard_classes)
+        if board_det is None:
+            return None
+        board_box = self._clip_box(board_det["bbox_xyxy"], frame.shape[1], frame.shape[0])
+        if board_box is None:
+            return None
+        board_quad = self._detect_taskboard_plane_quad(frame, board_box)
+        if board_quad is None:
+            board_quad = self._order_points(self._box_to_quad(board_box))
+        return np.asarray(board_quad, dtype=np.float32).reshape(4, 2)
+
+    def _is_fix_fully_locked(self, detections: List[Dict], observed) -> bool:
+        if observed is None:
+            return False
+        fix_det = self._find_best_detection(detections, self._fix_classes)
+        if fix_det is None:
+            return False
+        fix_box = observed.get("bbox")
+        det_box = self._clip_box(fix_det.get("bbox_xyxy", []), 10 ** 9, 10 ** 9)
+        if fix_box is None or det_box is None:
+            return False
+        iou = self._bbox_iou_xyxy(fix_box, det_box)
+        det_cover = self._bbox_intersection_fraction(det_box, fix_box)
+        comp_cover = self._bbox_intersection_fraction(fix_box, det_box)
+        return iou >= self._fix_ready_iou and det_cover >= self._fix_ready_det_cover and comp_cover >= self._fix_ready_comp_cover
+
     def _fit_rails(self, camera_name: str, frame: np.ndarray, detections: List[Dict], image_msg: Image):
         h, w = frame.shape[:2]
         observed = self._detect_observed_fix_component(frame, detections)
         self._update_latest_observation(camera_name, detections, observed, image_msg)
-        if observed is None:
-            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "missing_fix_hsv", {"sc": [], "nic": []}, {"sc": None, "nic": None, "fix": None}
+
+        fallback_board_quad = self._estimate_board_quad_without_fix(frame, detections)
+        fused_targets = {"sc": None, "nic": None, "fix": None}
+
+        if fallback_board_quad is None:
+            with self._lock:
+                self._assignment_context[camera_name] = {
+                    "M": None,
+                    "state": None,
+                    "projected_sc": [],
+                    "projected_nic": [],
+                    "projected_board_quad": None,
+                    "fused_targets": fused_targets,
+                    "fix_locked": False,
+                }
+            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "missing_taskboard", {"sc": [], "nic": []}, fused_targets
+
+        fix_locked = self._is_fix_fully_locked(detections, observed)
+        if not fix_locked:
+            with self._lock:
+                self._assignment_context[camera_name] = {
+                    "M": None,
+                    "state": None,
+                    "projected_sc": [],
+                    "projected_nic": [],
+                    "projected_board_quad": fallback_board_quad.astype(np.float32),
+                    "fused_targets": fused_targets,
+                    "fix_locked": False,
+                }
+            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "board_pose_only_fix_not_locked", {"sc": [], "nic": []}, fused_targets
 
         best = self._estimate_fix_only_transform(frame, observed)
         if best is None:
-            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "rails_alignment_failed", {"sc": [], "nic": []}, {"sc": None, "nic": None, "fix": None}
+            with self._lock:
+                self._assignment_context[camera_name] = {
+                    "M": None,
+                    "state": None,
+                    "projected_sc": [],
+                    "projected_nic": [],
+                    "projected_board_quad": fallback_board_quad.astype(np.float32),
+                    "fused_targets": fused_targets,
+                    "fix_locked": False,
+                }
+            return frame.copy(), np.zeros((h, w), dtype=np.uint8), "board_pose_only_fix_alignment_failed", {"sc": [], "nic": []}, fused_targets
 
         state, M, rotation_name, score = best
-        fused_targets = {"sc": None, "nic": None, "fix": None}
 
         if camera_name == "center":
             fused_fix = self._triangulate_family_to_center("fix", image_msg.header.frame_id, image_msg.header.stamp)
@@ -699,6 +809,7 @@ class YoloV12MultiCameraDetector(Node):
                 "projected_nic": projected_nic,
                 "projected_board_quad": projected_board_quad,
                 "fused_targets": fused_targets,
+                "fix_locked": True,
             }
 
         overlay_rgba, binary = self._render_transformed_rails(state, M, (h, w))
@@ -735,8 +846,18 @@ class YoloV12MultiCameraDetector(Node):
         detections_out = []
         for det in detections:
             det2 = dict(det)
-            det2["base_class_name"] = str(det["class_name"])
+            raw_name = str(det.get("class_name", ""))
+            det2["raw_class_name"] = raw_name
+            det2["base_class_name"] = raw_name
+            det2["class_name"] = raw_name
+            det2["instance_name"] = raw_name
             detections_out.append(det2)
+
+        with self._lock:
+            ctx = self._assignment_context.get(camera_name)
+
+        if ctx is None or not bool(ctx.get("fix_locked", False)):
+            return detections_out
 
         self._assign_family_to_rails(
             detections_out,
@@ -1141,9 +1262,9 @@ class YoloV12MultiCameraDetector(Node):
         best = None
         best_conf = -1.0
         for det in detections:
-            name = self._norm_name(det["class_name"])
-            if name in allowed_names:
-                conf = float(det["confidence"])
+            name = det.get("raw_class_name", det.get("base_class_name", det.get("class_name", "")))
+            if self._class_in_family(name, allowed_names):
+                conf = float(det.get("confidence", 0.0))
                 if conf > best_conf:
                     best_conf = conf
                     best = det
