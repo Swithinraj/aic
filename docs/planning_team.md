@@ -215,5 +215,21 @@ cd ~/ws_aic/src/aic
 pixi run ros2 run team_policy rviz_click_to_move
 ```
 
+```bash
+cd ~/ws_aic/src/aic
+pixi run ros2 run aic_model aic_model --ros-args -p use_sim_time:=true -p policy:=team_policy.mypolicy
+```
+
+```bash
+cd ~/ws_aic/src/aic
+
+ros2 lifecycle set /aic_model configure
+
+ros2 lifecycle set /aic_model activate 
+
+ros2 action send_goal /insert_cable aic_task_interfaces/action/InsertCable "{task: {id: 'planner_test', cable_type: 'sfp_sc', cable_name: 'cable_0', plug_type: 'sfp', plug_name: 'sfp_tip', port_type: 'sfp', port_name: 'sfp_port_0', target_module_name: 'nic_card_mount_0', time_limit: 1000}}" --feedback
+
+```
+
 
 
