@@ -165,7 +165,7 @@ class MotionServoNode(Node):
         self._mode_request_sent = False
 
         self.command_frame = "base_link"
-        self.position_tolerance = 0.012
+        self.position_tolerance = 0.020
         self.orientation_tolerance_rad = 0.08
         self.linear_kp = 1.0
         self.angular_kp = 1.2
@@ -174,9 +174,9 @@ class MotionServoNode(Node):
         self.max_angular_speed = 0.8
         self.min_angular_speed = 0.08
         self.trans_stiffness = 90.0
-        self.rot_stiffness = 50.0
+        self.rot_stiffness = 5.0
         self.trans_damping = 50.0
-        self.rot_damping = 20.0
+        self.rot_damping = 5.0
 
         self.create_subscription(ControllerState, "/aic_controller/controller_state", self._on_controller_state, 10)
         self.pose_command_pub = self.create_publisher(MotionUpdate, "/aic_controller/pose_commands", 10)
@@ -342,6 +342,8 @@ class mypolicy(Policy):
 
         self._taskboard_classes = self._parse_name_set(os.environ.get("YOLOV12_TASKBOARD_CLASSES", "taskboard,task_board,task board,board"))
         self._nic_classes = self._parse_name_set(os.environ.get("YOLOV12_NIC_CLASSES", "nic_card,nic card,nic,nic_card_0,nic_card_1,nic_card_2,nic_card_3,nic_card_4"))
+        self._sfp_port_classes = self._parse_name_set(os.environ.get("YOLOV12_SFP_PORT_CLASSES", "sfp_port,sfp port,sfp_port_0,sfp_port_1,sfp_port_2,sfp_port_3"))
+        self._sc_port_classes = self._parse_name_set(os.environ.get("YOLOV12_SC_PORT_CLASSES", "sc_port,sc port,sc_port_0,sc_port_1,sc_port_2,sc_port_3"))
 
         self.get_logger().info("mypolicy.__init__()")
         self.get_logger().info("Started internal CombinedYoloDepthPosePlanner, detection listener, and motion servo.")
@@ -362,6 +364,36 @@ class mypolicy(Policy):
 
         self._motion_servo.ensure_cartesian_mode()
 
+        # Capture the current gripper orientation once — the robot is already
+        # pointing downward in its home pose, so we reuse this for all targets.
+        current_pose = self._motion_servo.get_current_pose() or observation.controller_state.tcp_pose
+        gripper_orientation = Quaternion(
+            x=float(current_pose.orientation.x),
+            y=float(current_pose.orientation.y),
+            z=float(current_pose.orientation.z),
+            w=float(current_pose.orientation.w),
+        )
+        send_feedback(
+            f"mypolicy/gripper_orientation x={gripper_orientation.x:.4f} y={gripper_orientation.y:.4f} "
+            f"z={gripper_orientation.z:.4f} w={gripper_orientation.w:.4f}"
+        )
+
+        # Pick the right port detection class based on the task
+        port_type = str(task.port_type).strip().lower()
+        if port_type == "sfp":
+            port_matcher = self._is_sfp_port_detection
+            port_label = "sfp_port"
+        elif port_type == "sc":
+            port_matcher = self._is_sc_port_detection
+            port_label = "sc_port"
+        else:
+            # Fallback to NIC card center
+            port_matcher = self._is_nic_detection
+            port_label = "nic_card"
+
+        send_feedback(f"mypolicy/target_port_type={port_type} matcher={port_label}")
+
+        # DETECT TASKBOARD UPFRONT
         send_feedback("mypolicy/search_taskboard_all_cameras")
         board_result = self._wait_for_detection(
             matcher=self._is_taskboard_detection,
@@ -378,8 +410,41 @@ class mypolicy(Policy):
             send_feedback("mypolicy/fail taskboard_pose_missing")
             return False
 
-        current_pose = self._motion_servo.get_current_pose() or observation.controller_state.tcp_pose
-        board_pose = self._make_position_only_target_pose(board_pose_raw, current_pose)
+        # DETECT TARGET PORT UPFRONT
+        send_feedback(f"mypolicy/search_{port_label}_upfront")
+        port_result = self._wait_for_detection(
+            matcher=port_matcher,
+            timeout_sec=12.0,
+            preferred_camera=None,
+            min_update_time=0.0,
+        )
+        if port_result is None:
+            # Fallback: try NIC card if specific port not found
+            send_feedback(f"mypolicy/{port_label}_not_found, fallback to nic_card")
+            port_result = self._wait_for_detection(
+                matcher=self._is_nic_detection,
+                timeout_sec=8.0,
+                preferred_camera=None,
+                min_update_time=0.0,
+            )
+            port_label = "nic_card_fallback"
+
+        if port_result is None:
+            send_feedback("mypolicy/fail port_not_found_upfront")
+            return False
+
+        port_pose_raw = self._pose_from_detection(port_result["detection"])
+        if port_pose_raw is None:
+            send_feedback("mypolicy/fail port_pose_missing_upfront")
+            return False
+
+        send_feedback(
+            f"mypolicy/port_detected camera={port_result['camera_name']} class={port_result['detection'].get('class_name', '')} "
+            f"conf={port_result['confidence']:.3f} xyz=({port_pose_raw.position.x:.3f},{port_pose_raw.position.y:.3f},{port_pose_raw.position.z:.3f})"
+        )
+
+        # EXECUTE TASKBOARD POSE — hover above the board center
+        board_pose = self._make_target_pose(board_pose_raw, gripper_orientation, z_offset=0.05)
 
         send_feedback(
             f"mypolicy/taskboard_found camera={board_result['camera_name']} class={board_result['detection'].get('class_name', '')} conf={board_result['confidence']:.3f}"
@@ -390,50 +455,28 @@ class mypolicy(Policy):
             get_observation=get_observation,
             move_robot=move_robot,
             send_feedback=send_feedback,
-            timeout_sec=18.0,
+            timeout_sec=25.0,
         ):
             send_feedback("mypolicy/fail taskboard_pose_failed")
             return False
 
-        detection_after_board_move_time = time.monotonic()
         self.sleep_for(1.0)
 
-        observation = self._wait_for_observation(get_observation=get_observation, timeout_sec=3.0)
-        if observation is None:
-            send_feedback("mypolicy/fail no_observation_after_taskboard_move")
-            return False
-
-        send_feedback("mypolicy/search_nic_card")
-        nic_result = self._wait_for_detection(
-            matcher=self._is_nic_detection,
-            timeout_sec=12.0,
-            preferred_camera="center",
-            min_update_time=detection_after_board_move_time,
-        )
-        if nic_result is None:
-            send_feedback("mypolicy/fail nic_card_not_found")
-            return False
-
-        nic_pose_raw = self._pose_from_detection(nic_result["detection"])
-        if nic_pose_raw is None:
-            send_feedback("mypolicy/fail nic_pose_missing")
-            return False
-
-        current_pose = self._motion_servo.get_current_pose() or observation.controller_state.tcp_pose
-        nic_pose = self._make_position_only_target_pose(nic_pose_raw, current_pose)
+        # EXECUTE PORT POSE — go to port XY, but stay above vertical NIC card (min_z=0.20)
+        port_pose = self._make_target_pose(port_pose_raw, gripper_orientation, z_offset=0.0, min_z=0.20)
 
         send_feedback(
-            f"mypolicy/nic_found camera={nic_result['camera_name']} class={nic_result['detection'].get('class_name', '')} conf={nic_result['confidence']:.3f}"
+            f"mypolicy/port_target class={port_result['detection'].get('class_name', '')} conf={port_result['confidence']:.3f}"
         )
         if not self._execute_pose_goal(
-            label="nic_pose",
-            target_pose=nic_pose,
+            label="port_pose",
+            target_pose=port_pose,
             get_observation=get_observation,
             move_robot=move_robot,
             send_feedback=send_feedback,
-            timeout_sec=18.0,
+            timeout_sec=30.0,
         ):
-            send_feedback("mypolicy/fail nic_pose_failed")
+            send_feedback("mypolicy/fail port_pose_failed")
             return False
 
         self._motion_servo.stop()
@@ -514,30 +557,46 @@ class mypolicy(Policy):
                 continue
 
             pos_error = self._position_distance(current_pose, waypoint)
-            _, ang_error = _quat_error_rotvec(current_pose.orientation, waypoint.orientation)
-            if pos_error <= self._motion_servo.position_tolerance and ang_error <= self._motion_servo.orientation_tolerance_rad:
+            # Position-only convergence check.
+            # Orientation is kept constant (== starting TCP orientation) so we
+            # skip the angular tolerance which is unreliable at the 180° singularity.
+            if pos_error <= self._motion_servo.position_tolerance:
                 self._motion_servo.stop()
                 return True
 
             twist = self._motion_servo.compute_twist_to_waypoint(current_pose, waypoint)
+            # Zero out angular velocity to avoid feeding the orientation
+            # singularity — we are not requesting any rotation change.
+            twist.angular.x = 0.0
+            twist.angular.y = 0.0
+            twist.angular.z = 0.0
             self._motion_servo.publish_twist_command(twist)
             self.sleep_for(0.05)
 
         self._motion_servo.stop()
         return False
 
-    def _make_position_only_target_pose(self, detected_pose: Pose, orientation_source_pose: Pose) -> Pose:
+    def _make_target_pose(self, detected_pose: Pose, orientation: Quaternion, z_offset: float = 0.0, min_z: float = 0.0) -> Pose:
+        """Build a target pose using the detected position and a known-safe orientation.
+
+        Args:
+            detected_pose: Pose from the perception system (position used, orientation ignored).
+            orientation: The gripper orientation to command (typically the current TCP orientation).
+            z_offset: Extra height above the detected z so the gripper approaches from above.
+            min_z: Minimum allowed z value. Use to prevent collision with vertical components.
+        """
         target_pose = Pose()
+        z_raw = float(detected_pose.position.z) + float(z_offset)
         target_pose.position = Point(
             x=float(detected_pose.position.x),
             y=float(detected_pose.position.y),
-            z=float(detected_pose.position.z),
+            z=max(z_raw, float(min_z)),
         )
         target_pose.orientation = Quaternion(
-            x=float(orientation_source_pose.orientation.x),
-            y=float(orientation_source_pose.orientation.y),
-            z=float(orientation_source_pose.orientation.z),
-            w=float(orientation_source_pose.orientation.w),
+            x=float(orientation.x),
+            y=float(orientation.y),
+            z=float(orientation.z),
+            w=float(orientation.w),
         )
         return target_pose
 
@@ -546,6 +605,12 @@ class mypolicy(Policy):
 
     def _is_nic_detection(self, det: Dict) -> bool:
         return self._matches_any_name(det, self._nic_classes)
+
+    def _is_sfp_port_detection(self, det: Dict) -> bool:
+        return self._matches_any_name(det, self._sfp_port_classes)
+
+    def _is_sc_port_detection(self, det: Dict) -> bool:
+        return self._matches_any_name(det, self._sc_port_classes)
 
     def _matches_any_name(self, det: Dict, allowed_names: set) -> bool:
         for key in ("class_name", "raw_class_name", "base_class_name", "instance_name"):
