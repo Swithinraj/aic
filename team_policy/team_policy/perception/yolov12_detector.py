@@ -65,6 +65,10 @@ class YoloV12MultiCameraDetector(Node):
         self._gripper_classes = self._parse_name_set(
             os.environ.get("YOLOV12_GRIPPER_CLASSES", "gripper,gripper_tip,gripper_tcp")
         )
+        self._max_sfp_ports = max(1, int(os.environ.get("YOLOV12_MAX_SFP_PORTS", "10")))
+        self._sfp_port_memory = {"left": {}, "center": {}, "right": {}}
+        self._sfp_port_memory_ttl_sec = float(os.environ.get("YOLOV12_SFP_PORT_MEMORY_TTL_SEC", "1.0"))
+        self._sfp_port_memory_match_px = float(os.environ.get("YOLOV12_SFP_PORT_MEMORY_MATCH_PX", "60.0"))
 
         self._pink_h1_min = int(os.environ.get("YOLOV12_PINK_H1_MIN", "145"))
         self._pink_h1_max = int(os.environ.get("YOLOV12_PINK_H1_MAX", "160"))
@@ -464,7 +468,7 @@ class YoloV12MultiCameraDetector(Node):
         add_family(self._top_k_family_detections(detections, self._fix_classes, 1))
         add_family(self._top_k_family_detections(detections, self._nic_classes, max(1, len(self._base_nic_rail_quads))))
         add_family(self._top_k_family_detections(detections, self._sc_classes, 5))
-        add_family(self._top_k_family_detections(detections, self._sfp_port_classes, 1))
+        add_family(self._top_k_family_detections(detections, self._sfp_port_classes, self._max_sfp_ports))
         add_family(self._top_k_family_detections(detections, self._sfp_module_classes, 1))
         add_family(self._top_k_family_detections(detections, self._gripper_classes, 1))
         return filtered
@@ -856,6 +860,8 @@ class YoloV12MultiCameraDetector(Node):
         with self._lock:
             ctx = self._assignment_context.get(camera_name)
 
+        self._assign_sfp_ports_by_board_edges(detections_out, camera_name, ctx)
+
         if ctx is None or not bool(ctx.get("fix_locked", False)):
             return detections_out
 
@@ -967,6 +973,92 @@ class YoloV12MultiCameraDetector(Node):
             det["class_name"] = instance_name
             det["instance_name"] = instance_name
             det["sc_sequence_id"] = int(global_idx)
+
+    def _assign_sfp_ports_by_board_edges(self, detections: List[Dict], camera_name: str, ctx: Optional[Dict]):
+        family = [det for det in detections if self._class_in_family(det.get("base_class_name", det["class_name"]), self._sfp_port_classes)]
+        if len(family) == 0:
+            return
+        board_bbox = self._taskboard_bbox_for_ordering(detections, ctx or {})
+        if board_bbox is None:
+            for det in family:
+                det["class_name"] = "sfp_port"
+                det["instance_name"] = "sfp_port"
+            return
+
+        scored = []
+        for det in family:
+            anchor_xy = self._detection_anchor_point(det, "GENERIC")
+            edge_score = self._two_nearest_bbox_edge_sum(anchor_xy, board_bbox)
+            det["anchor_xy"] = [float(anchor_xy[0]), float(anchor_xy[1])]
+            det["sfp_edge_score"] = float(edge_score)
+            scored.append((float(edge_score), det))
+
+        scored.sort(key=lambda item: item[0])
+
+        if len(scored) >= 2:
+            for idx, (_, det) in enumerate(scored[: self._max_sfp_ports]):
+                name = f"sfp_port_{idx}"
+                det["class_name"] = name
+                det["instance_name"] = name
+                self._update_sfp_port_memory(camera_name, idx, det)
+            for _, det in scored[self._max_sfp_ports :]:
+                det["class_name"] = "sfp_port"
+                det["instance_name"] = "sfp_port"
+            return
+
+        det = scored[0][1]
+        remembered_idx = self._match_sfp_port_from_memory(camera_name, det)
+        if remembered_idx is None:
+            det["class_name"] = "sfp_port"
+            det["instance_name"] = "sfp_port"
+            return
+        name = f"sfp_port_{remembered_idx}"
+        det["class_name"] = name
+        det["instance_name"] = name
+        self._update_sfp_port_memory(camera_name, remembered_idx, det)
+
+    def _two_nearest_bbox_edge_sum(self, point_xy: np.ndarray, bbox_xyxy: Optional[np.ndarray]) -> float:
+        if bbox_xyxy is None or len(bbox_xyxy) != 4:
+            return 1e9
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+        px, py = [float(v) for v in np.asarray(point_xy, dtype=np.float32).reshape(2)]
+        dists = sorted([abs(px - x1), abs(px - x2), abs(py - y1), abs(py - y2)])
+        return float(dists[0] + dists[1])
+
+    def _update_sfp_port_memory(self, camera_name: str, index: int, det: Dict):
+        anchor_xy = np.asarray(det.get("anchor_xy", self._detection_anchor_point(det, "GENERIC")), dtype=np.float32).reshape(2)
+        self._sfp_port_memory.setdefault(camera_name, {})[int(index)] = {
+            "time": time.monotonic(),
+            "anchor_xy": [float(anchor_xy[0]), float(anchor_xy[1])],
+            "edge_score": float(det.get("sfp_edge_score", 1e9)),
+        }
+
+    def _match_sfp_port_from_memory(self, camera_name: str, det: Dict) -> Optional[int]:
+        memory = self._sfp_port_memory.get(camera_name, {})
+        now = time.monotonic()
+        anchor_xy = np.asarray(det.get("anchor_xy", self._detection_anchor_point(det, "GENERIC")), dtype=np.float32).reshape(2)
+        edge_score = float(det.get("sfp_edge_score", 1e9))
+        candidates = []
+        for idx, entry in memory.items():
+            if entry is None:
+                continue
+            age = now - float(entry.get("time", 0.0))
+            if age > self._sfp_port_memory_ttl_sec:
+                continue
+            mem_anchor = np.asarray(entry.get("anchor_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+            center_dist = float(np.linalg.norm(anchor_xy - mem_anchor))
+            score_dist = abs(edge_score - float(entry.get("edge_score", 1e9)))
+            candidates.append((center_dist, score_dist, int(idx)))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        best_center_dist, _, best_idx = candidates[0]
+        if best_center_dist > self._sfp_port_memory_match_px:
+            candidates.sort(key=lambda item: (item[1], item[0]))
+            _, best_score_dist, best_idx = candidates[0]
+            if best_score_dist > 120.0:
+                return None
+        return int(best_idx)
 
     def _taskboard_bbox_for_ordering(self, detections: List[Dict], ctx: Dict) -> Optional[np.ndarray]:
         board_candidates = [det for det in detections if self._detection_family_name(det) == "taskboard"]
