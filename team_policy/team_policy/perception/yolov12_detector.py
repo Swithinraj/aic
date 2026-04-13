@@ -40,7 +40,7 @@ class YoloV12MultiCameraDetector(Node):
         self._conf = float(os.environ.get("YOLOV12_CONF", "0.25"))
         self._iou = float(os.environ.get("YOLOV12_IOU", "0.45"))
         self._imgsz = int(os.environ.get("YOLOV12_IMGSZ", "640"))
-        self._max_hz = max(0.1, float(os.environ.get("YOLOV12_MAX_HZ", "5.0")))
+        self._max_hz = max(0.1, float(os.environ.get("YOLOV12_MAX_HZ", "15.0")))
         self._min_period = 1.0 / self._max_hz
         self._mask_alpha = float(os.environ.get("YOLOV12_MASK_ALPHA", "0.55"))
 
@@ -65,7 +65,7 @@ class YoloV12MultiCameraDetector(Node):
         self._gripper_classes = self._parse_name_set(
             os.environ.get("YOLOV12_GRIPPER_CLASSES", "gripper,gripper_tip,gripper_tcp")
         )
-        self._max_sfp_ports = max(1, int(os.environ.get("YOLOV12_MAX_SFP_PORTS", "10")))
+        self._max_sfp_ports = max(1, int(os.environ.get("YOLOV12_MAX_SFP_PORTS", "2")))
         self._sfp_port_memory = {"left": {}, "center": {}, "right": {}}
         self._sfp_port_memory_ttl_sec = float(os.environ.get("YOLOV12_SFP_PORT_MEMORY_TTL_SEC", "1.0"))
         self._sfp_port_memory_match_px = float(os.environ.get("YOLOV12_SFP_PORT_MEMORY_MATCH_PX", "60.0"))
@@ -508,9 +508,15 @@ class YoloV12MultiCameraDetector(Node):
             family = self._detection_family_name(det)
             color = colors.get(family, (0, 255, 0))
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            
+            anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
+            anchor = self._detection_anchor_point(det, anchor_key)
+            cx, cy = int(round(float(anchor[0]))), int(round(float(anchor[1])))
+            cv2.circle(out, (cx, cy), 4, (0, 0, 255), -1, cv2.LINE_AA)
+            
             display_name = str(det.get("instance_name", det.get("class_name", det.get("raw_class_name", ""))))
             conf = float(det.get("confidence", 0.0))
-            text = f"{display_name} {conf:.2f}"
+            text = f"{display_name} {conf:.2f} uv({cx},{cy})"
             (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             tx = max(0, x1)
             ty = max(th + 6, y1 + th + 4)

@@ -29,7 +29,7 @@ Environment variables
   POSE_ESTIMATOR_CAMERA          center | left | right   (default: center)
   POSE_ESTIMATOR_GRIPPER_FRAME   gripper/tcp              (default: gripper/tcp)
   POSE_ESTIMATOR_FALLBACK_DEPTH_M  float in metres        (default: 0.20)
-  POSE_ESTIMATOR_MAX_HZ          float                    (default: 5.0)
+  POSE_ESTIMATOR_MAX_HZ          float                    (default: 15.0)
   POSE_ESTIMATOR_USE_DEPTH_NODE  1|0                      (default: 1)
 """
 
@@ -92,7 +92,7 @@ class PoseEstimatorNode(Node):
         self._camera: str = os.environ.get("POSE_ESTIMATOR_CAMERA", "center").strip().lower()
         self._gripper_frame: str = os.environ.get("POSE_ESTIMATOR_GRIPPER_FRAME", "gripper/tcp").strip()
         self._fallback_depth_m: float = float(os.environ.get("POSE_ESTIMATOR_FALLBACK_DEPTH_M", "0.20"))
-        self._max_hz: float = max(0.1, float(os.environ.get("POSE_ESTIMATOR_MAX_HZ", "5.0")))
+        self._max_hz: float = max(0.1, float(os.environ.get("POSE_ESTIMATOR_MAX_HZ", "15.0")))
         self._use_depth_node: bool = os.environ.get("POSE_ESTIMATOR_USE_DEPTH_NODE", "1") != "0"
         self._min_period: float = 1.0 / self._max_hz
 

@@ -9,6 +9,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import Point, Pose, PoseArray, Quaternion, TransformStamped
 from std_msgs.msg import ColorRGBA, String
+from tf2_msgs.msg import TFMessage
 from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -30,16 +31,12 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
 
         self._tf_broadcaster = TransformBroadcaster(self)
 
-        self._base_pose_pubs = {
-            "left": self.create_publisher(PoseArray, "/left_camera/yolo/poses_base_link", 10),
-            "center": self.create_publisher(PoseArray, "/center_camera/yolo/poses_base_link", 10),
-            "right": self.create_publisher(PoseArray, "/right_camera/yolo/poses_base_link", 10),
-        }
-        self._pose_markers_pubs = {
-            "left": self.create_publisher(MarkerArray, "/left_camera/yolo/pose_markers", 10),
-            "center": self.create_publisher(MarkerArray, "/center_camera/yolo/pose_markers", 10),
-            "right": self.create_publisher(MarkerArray, "/right_camera/yolo/pose_markers", 10),
-        }
+        self._fused_pose_pub = self.create_publisher(PoseArray, "/fused_yolo/poses_base_link", 10)
+        self._fused_json_pub = self.create_publisher(String, "/fused_yolo/detections_json", 10)
+        self._fused_marker_pub = self.create_publisher(MarkerArray, "/fused_yolo/pose_markers", 10)
+
+        self._latest_instance_obs = {}
+        self._tf_sub = self.create_subscription(TFMessage, "/tf", self._tf_callback, 100)
 
         self.get_logger().info(f"Combined planner node started: only true detection poses and TFs are published. TF camera={self._tf_camera}, base_frame={self._base_frame}")
 
@@ -60,6 +57,7 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         with self._lock:
             frames = dict(self._latest_frames)
 
+        camera_results = {}
         for camera_name, msg in frames.items():
             if msg is None:
                 continue
@@ -73,9 +71,19 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
                 continue
 
             self._last_infer_time[camera_name] = now
+            camera_results[camera_name] = {"msg": msg, "result": result}
 
-            annotated, detections, classes, mask_overlay, mask_binary, mask_status, base_pose_array, marker_array, tf_list = result
+        if not camera_results:
+            return
 
+        instance_obs = {}
+        stamp = self.get_clock().now().to_msg()
+
+        for camera_name, res in camera_results.items():
+            msg = res["msg"]
+            stamp = msg.header.stamp
+            annotated, detections, classes, mask_overlay, mask_binary, mask_status, _, _, _ = res["result"]
+            
             annotated_msg = self._bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
             annotated_msg.header = msg.header
             self._annotated_pubs[camera_name].publish(annotated_msg)
@@ -100,11 +108,207 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             status_msg.data = mask_status
             self._mask_status_pubs[camera_name].publish(status_msg)
 
-            self._base_pose_pubs[camera_name].publish(base_pose_array)
-            self._pose_markers_pubs[camera_name].publish(marker_array)
+            info = self._latest_infos.get(camera_name)
+            if info:
+                camera_frame_id = str(info.header.frame_id)
+                for det in detections:
+                    name = det.get("instance_name", det.get("class_name", ""))
+                    if not name:
+                        continue
+                    pose_cam = det.get("pose_camera")
+                    if not (isinstance(pose_cam, dict) and "t" in pose_cam and "q" in pose_cam):
+                        continue
+                    # Compute anchor UV for visual servoing
+                    family = self._detection_family_name(det)
+                    anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
+                    anchor = self._detection_anchor_point(det, anchor_key)
+                    anchor_uv = [float(anchor[0]), float(anchor[1])]
+                    if name not in instance_obs:
+                        instance_obs[name] = []
+                    instance_obs[name].append({
+                        "det": det,
+                        "camera_frame_id": camera_frame_id,
+                        "anchor_uv": anchor_uv,
+                        "camera_name": camera_name
+                    })
 
-            if camera_name == self._tf_camera and len(tf_list) > 0:
-                self._tf_broadcaster.sendTransform(tf_list)
+        with self._lock:
+            self._latest_instance_obs = instance_obs
+
+    def _tf_callback(self, msg: TFMessage) -> None:
+        with self._lock:
+            instance_obs = dict(getattr(self, "_latest_instance_obs", {}))
+            
+        if not instance_obs:
+            return
+            
+        stamp = self.get_clock().now().to_msg()
+        fused_records = []
+        used_tf_names = set()
+        
+        for name, obs_list in instance_obs.items():
+            best_obj = max(obs_list, key=lambda o: float(o["det"].get("confidence", 0.0)))
+            best_det = best_obj["det"]
+            camera_frame_id = best_obj["camera_frame_id"]
+            pose_cam = best_det.get("pose_camera")
+            
+            try:
+                R_tf, t_tf = self._lookup_transform(self._base_frame, camera_frame_id)
+            except Exception:
+                continue
+
+            R_cam = self._quaternion_to_matrix(np.array(pose_cam["q"], dtype=np.float32))
+            t_cam = np.array(pose_cam["t"], dtype=np.float32)
+
+            t_base = R_tf @ t_cam + t_tf
+            R_base = R_tf @ R_cam
+            q_base = self._matrix_to_quaternion(R_base)
+
+            vx, vy, vz, vw = float(q_base[0]), float(q_base[1]), float(q_base[2]), float(q_base[3])
+            yaw = np.arctan2(2.0 * (vw * vz + vx * vy), 1.0 - 2.0 * (vy * vy + vz * vz))
+
+            x, y = float(t_base[0]), float(t_base[1])
+            qz = float(np.sin(yaw / 2.0))
+            qw = float(np.cos(yaw / 2.0))
+
+            z = 0.17927 if "sfp_port" in str(name).lower() else 0.25
+
+            pose_base = {
+                "t": np.array([x, y, z], dtype=np.float32),
+                "q": np.array([0.0, 0.0, qz, qw], dtype=np.float32)
+            }
+
+            display_name = str(name)
+            tf_base = "det_" + self._tf_safe_name(display_name)
+            tf_name = tf_base
+            index = 1
+            while tf_name in used_tf_names:
+                tf_name = f"{tf_base}_{index}"
+                index += 1
+            used_tf_names.add(tf_name)
+
+            fused_records.append({
+                "name": display_name,
+                "tf_name": tf_name,
+                "bbox_xyxy": [float(v) for v in best_det.get("bbox_xyxy", [])],
+                "base_pose": self._pose_dict_to_msg(pose_base),
+                "class_name": str(best_det.get("class_name", "")),
+                "confidence": float(best_det.get("confidence", 0.0)),
+                "camera": "fused" if len(obs_list) > 1 else "single",
+                "anchor_uv": best_obj.get("anchor_uv", []),
+                "camera_frame_id": camera_frame_id,
+                "camera_name": best_obj.get("camera_name", "center")
+            })
+
+        self._publish_fused_records(stamp, fused_records)
+
+    def _publish_fused_records(self, stamp, fused_records: List[Dict]):
+        fused_pose_array = PoseArray()
+        fused_pose_array.header.stamp = stamp
+        fused_pose_array.header.frame_id = self._base_frame
+
+        fused_markers = MarkerArray()
+        del_m = Marker()
+        del_m.action = Marker.DELETEALL
+        fused_markers.markers.append(del_m)
+
+        fused_tf_list = []
+        fused_detections_json = []
+        marker_id = 0
+
+        for rec in fused_records:
+            base_pose = rec["base_pose"]
+            fused_pose_array.poses.append(base_pose)
+            fused_tf_list.append(self._pose_to_transform(stamp, self._base_frame, rec["tf_name"], base_pose))
+
+            axes = self._make_axes_marker(marker_id, stamp, rec["name"], base_pose)
+            fused_markers.markers.append(axes)
+            marker_id += 1
+
+            text = Marker()
+            text.header.frame_id = self._base_frame
+            text.header.stamp = stamp
+            text.ns = "combined_detection_pose_text"
+            text.id = marker_id
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose = base_pose
+            text.pose.position.z += 0.04
+            text.scale.z = self._text_scale
+            text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.95)
+            bp = base_pose.position
+            text.text = f"{rec['name']} x={bp.x:.3f} y={bp.y:.3f} z={bp.z:.3f}"
+            fused_markers.markers.append(text)
+            marker_id += 1
+
+            fused_detections_json.append({
+                "class_name": rec["class_name"],
+                "instance_name": rec["name"],
+                "confidence": rec["confidence"],
+                "bbox_xyxy": rec["bbox_xyxy"],
+                "tf_frame": rec["tf_name"],
+                "source": rec["camera"],
+                "anchor_uv": rec.get("anchor_uv", []),
+                "camera_frame_id": rec.get("camera_frame_id", ""),
+                "camera_name": rec.get("camera_name", ""),
+                "pose_base_link": {
+                    "position": {"x": float(bp.x), "y": float(bp.y), "z": float(bp.z)},
+                    "orientation": {"x": 0.0, "y": 0.0, "z": base_pose.orientation.z, "w": base_pose.orientation.w}
+                }
+            })
+
+        self._fused_pose_pub.publish(fused_pose_array)
+        self._fused_marker_pub.publish(fused_markers)
+        if len(fused_tf_list) > 0:
+            self._tf_broadcaster.sendTransform(fused_tf_list)
+
+        jd = String()
+        jd.data = json.dumps(fused_detections_json, separators=(",", ":"))
+        self._fused_json_pub.publish(jd)
+
+    def _triangulate_instance(self, obs_list: List[Dict]) -> Optional[np.ndarray]:
+        if len(obs_list) < self._min_triangulation_views:
+            return None
+        
+        # Triangulate local to the first camera to maintain matrix stability against long baseline scaling
+        anchor_frame = str(obs_list[0]["frame_id"])
+        A = np.zeros((3, 3), dtype=np.float64)
+        b = np.zeros(3, dtype=np.float64)
+        used = 0
+
+        for obs in obs_list:
+            info = obs["info"]
+            uv = obs["uv"]
+            ray_cam = self._camera_ray_from_pixel(info, uv)
+            try:
+                R, t = self._lookup_transform(anchor_frame, str(obs["frame_id"]))
+            except Exception:
+                continue
+            o = np.asarray(t, dtype=np.float64).reshape(3)
+            d = (np.asarray(R, dtype=np.float64) @ np.asarray(ray_cam, dtype=np.float64).reshape(3))
+            dn = np.linalg.norm(d)
+            if dn < 1e-9:
+                continue
+            d = d / dn
+            M = np.eye(3, dtype=np.float64) - np.outer(d, d)
+            A += M
+            b += M @ o
+            used += 1
+
+        if used < self._min_triangulation_views:
+            return None
+        try:
+            X_anchor = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return None
+
+        # Transform the stabilized point back to base_link
+        try:
+            R_base, t_base = self._lookup_transform(self._base_frame, anchor_frame)
+            X_base = (np.asarray(R_base, dtype=np.float64) @ X_anchor) + np.asarray(t_base, dtype=np.float64)
+            return X_base.astype(np.float32)
+        except Exception:
+            return None
 
     def _run_inference_combined(self, camera_name: str, msg):
         frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -147,11 +351,9 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
 
         annotated = self._draw_filtered_detections(frame, detections)
         annotated = self._draw_instance_labels(annotated, detections)
-        annotated = self._draw_pose_labels(annotated, detections)
 
         classes = [str(det.get("instance_name", det.get("class_name", ""))) for det in detections]
-        base_pose_array, marker_array, tf_list = self._build_pose_outputs(msg, pose_records)
-        return annotated, detections, classes, mask_overlay, mask_binary, mask_status, base_pose_array, marker_array, tf_list
+        return annotated, detections, classes, mask_overlay, mask_binary, mask_status, None, None, None
 
     def _estimate_detection_poses(self, camera_name: str, detections: List[Dict]) -> List[Dict]:
         with self._lock:
@@ -170,10 +372,6 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         if board_pose_camera is None:
             return []
 
-        board_pose_base = self._transform_pose_dict(board_pose_camera, str(info.header.frame_id), self._base_frame)
-        if board_pose_base is None:
-            return []
-
         image_to_board_h = self._compute_image_to_board_homography(board_quad)
         if image_to_board_h is None:
             return []
@@ -183,28 +381,28 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
 
         taskboard_det = self._find_best_detection(detections, self._taskboard_classes)
         if taskboard_det is not None:
-            pose_base = self._compose_local_pose(
-                board_pose_base,
+            pose_camera = self._compose_local_pose(
+                board_pose_camera,
                 np.array([0.0, 0.0, self._detection_plane_z_m], dtype=np.float32),
                 np.eye(3, dtype=np.float32),
             )
-            if pose_base is not None:
+            if pose_camera is not None:
                 records.append(
                     self._make_pose_record(
                         det=taskboard_det,
-                        pose_base=pose_base,
+                        pose_camera=pose_camera,
                         used_tf_names=used_tf_names,
                     )
                 )
 
         fix_det = self._find_best_detection(detections, self._fix_classes)
         if fix_det is not None:
-            pose_base = self._pose_from_detection_anchor(image_to_board_h, board_pose_base, fix_det, "FIX")
-            if pose_base is not None:
+            pose_camera = self._pose_from_detection_anchor(image_to_board_h, board_pose_camera, fix_det, "FIX")
+            if pose_camera is not None:
                 records.append(
                     self._make_pose_record(
                         det=fix_det,
-                        pose_base=pose_base,
+                        pose_camera=pose_camera,
                         used_tf_names=used_tf_names,
                     )
                 )
@@ -214,13 +412,13 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             if family not in {"nic", "sc", "sfp_port"}:
                 continue
             anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
-            pose_base = self._pose_from_detection_anchor(image_to_board_h, board_pose_base, det, anchor_key)
-            if pose_base is None:
+            pose_camera = self._pose_from_detection_anchor(image_to_board_h, board_pose_camera, det, anchor_key)
+            if pose_camera is None:
                 continue
             records.append(
                 self._make_pose_record(
                     det=det,
-                    pose_base=pose_base,
+                    pose_camera=pose_camera,
                     used_tf_names=used_tf_names,
                 )
             )
@@ -238,9 +436,9 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             np.eye(3, dtype=np.float32),
         )
 
-    def _make_pose_record(self, det: Dict, pose_base: Dict, used_tf_names: set) -> Dict:
+    def _make_pose_record(self, det: Dict, pose_camera: Dict, used_tf_names: set) -> Dict:
         display_name = str(det.get("instance_name", det.get("class_name", "")))
-        tf_base = self._tf_safe_name(display_name)
+        tf_base = "det_" + self._tf_safe_name(display_name)
         tf_name = tf_base
         index = 1
         while tf_name in used_tf_names:
@@ -251,7 +449,7 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             "name": display_name,
             "tf_name": tf_name,
             "bbox_xyxy": [float(v) for v in det.get("bbox_xyxy", [])],
-            "base_pose": self._pose_dict_to_msg(pose_base),
+            "pose_camera": pose_camera,
         }
 
     def _camera_matrix_from_info(self, info) -> np.ndarray:
@@ -391,7 +589,12 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
                 if len(rb) != len(db):
                     continue
                 if sum(abs(float(a) - float(b)) for a, b in zip(rb, db)) < 1e-3:
-                    det["pose_base_link"] = self._pose_to_dict(rec.get("base_pose"))
+                    pose_cam = rec.get("pose_camera")
+                    if pose_cam:
+                        det["pose_camera"] = {
+                            "t": [float(v) for v in pose_cam["t"]],
+                            "q": [float(v) for v in pose_cam["q"]]
+                        }
                     det["tf_frame"] = rec.get("tf_name")
                     break
         return out
