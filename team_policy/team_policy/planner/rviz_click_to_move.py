@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+import math
 import rclpy
 from rclpy.node import Node
 import tf2_ros
@@ -102,11 +103,15 @@ class RvizClickToMove(Node):
 
         self.declare_parameter("command_frame", "base_link")
         self.declare_parameter("position_tolerance", 0.012)
+        self.declare_parameter("orientation_tolerance_rad", 0.08)
         self.declare_parameter("publish_rate_hz", 20.0)
-        self.declare_parameter("target_marker_scale", 0.10)
+        self.declare_parameter("target_marker_scale", 0.14)
         self.declare_parameter("linear_kp", 1.0)
+        self.declare_parameter("angular_kp", 1.2)
         self.declare_parameter("max_linear_speed", 0.05)
         self.declare_parameter("min_linear_speed", 0.015)
+        self.declare_parameter("max_angular_speed", 0.8)
+        self.declare_parameter("min_angular_speed", 0.08)
         self.declare_parameter("trans_stiffness", 90.0)
         self.declare_parameter("rot_stiffness", 50.0)
         self.declare_parameter("trans_damping", 50.0)
@@ -114,11 +119,15 @@ class RvizClickToMove(Node):
 
         self.command_frame = str(self.get_parameter("command_frame").value)
         self.position_tolerance = float(self.get_parameter("position_tolerance").value)
+        self.orientation_tolerance_rad = float(self.get_parameter("orientation_tolerance_rad").value)
         publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
         self.target_marker_scale = float(self.get_parameter("target_marker_scale").value)
         self.linear_kp = float(self.get_parameter("linear_kp").value)
+        self.angular_kp = float(self.get_parameter("angular_kp").value)
         self.max_linear_speed = float(self.get_parameter("max_linear_speed").value)
         self.min_linear_speed = float(self.get_parameter("min_linear_speed").value)
+        self.max_angular_speed = float(self.get_parameter("max_angular_speed").value)
+        self.min_angular_speed = float(self.get_parameter("min_angular_speed").value)
         self.trans_stiffness = float(self.get_parameter("trans_stiffness").value)
         self.rot_stiffness = float(self.get_parameter("rot_stiffness").value)
         self.trans_damping = float(self.get_parameter("trans_damping").value)
@@ -395,38 +404,90 @@ class RvizClickToMove(Node):
         marker.header.frame_id = self.command_frame
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.name = "planner_target"
-        marker.description = "drag and release to execute"
+        marker.description = "drag / rotate and release to execute"
         marker.scale = self.target_marker_scale
         marker.pose = pose
 
         center_control = InteractiveMarkerControl()
         center_control.always_visible = True
-        center_control.interaction_mode = InteractiveMarkerControl.BUTTON
+        center_control.interaction_mode = InteractiveMarkerControl.NONE
         center_control.name = "target_visual"
-        center_control.markers.append(self._make_center_marker())
+        center_control.markers.extend(self._make_center_markers())
         marker.controls.append(center_control)
 
         marker.controls.append(self._make_move_axis_control("move_x", 1.0, 1.0, 0.0, 0.0))
         marker.controls.append(self._make_move_axis_control("move_y", 1.0, 0.0, 1.0, 0.0))
         marker.controls.append(self._make_move_axis_control("move_z", 1.0, 0.0, 0.0, 1.0))
 
+        marker.controls.append(self._make_rotate_axis_control("rotate_x", 1.0, 1.0, 0.0, 0.0))
+        marker.controls.append(self._make_rotate_axis_control("rotate_y", 1.0, 0.0, 1.0, 0.0))
+        marker.controls.append(self._make_rotate_axis_control("rotate_z", 1.0, 0.0, 0.0, 1.0))
+
+        marker.controls.append(self._make_move_rotate_3d_control())
+
         self.server.insert(marker, feedback_callback=self._on_marker_feedback)
         self.server.applyChanges()
 
-    def _make_center_marker(self) -> Marker:
-        marker = Marker()
-        marker.type = Marker.SPHERE
-        marker.scale.x = 0.035
-        marker.scale.y = 0.035
-        marker.scale.z = 0.035
-        marker.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=0.9)
-        return marker
+    def _make_center_markers(self) -> List[Marker]:
+        sphere = Marker()
+        sphere.type = Marker.SPHERE
+        sphere.scale.x = 0.03
+        sphere.scale.y = 0.03
+        sphere.scale.z = 0.03
+        sphere.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=0.9)
+
+        x_axis = Marker()
+        x_axis.type = Marker.ARROW
+        x_axis.scale.x = 0.06
+        x_axis.scale.y = 0.008
+        x_axis.scale.z = 0.008
+        x_axis.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.9)
+        x_axis.pose.orientation = _quat_to_msg(_quat_from_axis_angle([0.0, 0.0, 1.0], 0.0))
+
+        y_axis = Marker()
+        y_axis.type = Marker.ARROW
+        y_axis.scale.x = 0.06
+        y_axis.scale.y = 0.008
+        y_axis.scale.z = 0.008
+        y_axis.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.9)
+        y_axis.pose.orientation = _quat_to_msg(_quat_from_axis_angle([0.0, 0.0, 1.0], math.pi * 0.5))
+
+        z_axis = Marker()
+        z_axis.type = Marker.ARROW
+        z_axis.scale.x = 0.06
+        z_axis.scale.y = 0.008
+        z_axis.scale.z = 0.008
+        z_axis.color = ColorRGBA(r=0.0, g=0.4, b=1.0, a=0.9)
+        z_axis.pose.orientation = _quat_to_msg(_quat_multiply(
+            _quat_from_axis_angle([0.0, 1.0, 0.0], -math.pi * 0.5),
+            [0.0, 0.0, 0.0, 1.0],
+        ))
+
+        return [sphere, x_axis, y_axis, z_axis]
 
     def _make_move_axis_control(self, name: str, w: float, x: float, y: float, z: float) -> InteractiveMarkerControl:
         control = InteractiveMarkerControl()
         control.name = name
         control.orientation = Quaternion(w=w, x=x, y=y, z=z)
+        control.orientation_mode = InteractiveMarkerControl.INHERIT
         control.interaction_mode = InteractiveMarkerControl.MOVE_AXIS
+        control.always_visible = False
+        return control
+
+    def _make_rotate_axis_control(self, name: str, w: float, x: float, y: float, z: float) -> InteractiveMarkerControl:
+        control = InteractiveMarkerControl()
+        control.name = name
+        control.orientation = Quaternion(w=w, x=x, y=y, z=z)
+        control.orientation_mode = InteractiveMarkerControl.INHERIT
+        control.interaction_mode = InteractiveMarkerControl.ROTATE_AXIS
+        control.always_visible = False
+        return control
+
+    def _make_move_rotate_3d_control(self) -> InteractiveMarkerControl:
+        control = InteractiveMarkerControl()
+        control.name = "move_rotate_3d"
+        control.orientation_mode = InteractiveMarkerControl.INHERIT
+        control.interaction_mode = InteractiveMarkerControl.MOVE_ROTATE_3D
         control.always_visible = False
         return control
 
@@ -438,7 +499,9 @@ class RvizClickToMove(Node):
             return
 
         if self.last_planned_target_pose is not None:
-            if self._position_distance(feedback.pose, self.last_planned_target_pose) < 0.003:
+            pos_same = self._position_distance(feedback.pose, self.last_planned_target_pose) < 0.003
+            _, ang_same = _quat_error_rotvec(feedback.pose.orientation, self.last_planned_target_pose.orientation)
+            if pos_same and ang_same < 0.02:
                 return
 
         self._plan_and_start(feedback.pose)
@@ -469,13 +532,13 @@ class RvizClickToMove(Node):
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "planner_target"
         marker.id = 0
-        marker.type = Marker.SPHERE
+        marker.type = Marker.ARROW
         marker.action = Marker.ADD
         marker.pose = pose
-        marker.scale.x = 0.03
-        marker.scale.y = 0.03
-        marker.scale.z = 0.03
-        marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+        marker.scale.x = 0.08
+        marker.scale.y = 0.012
+        marker.scale.z = 0.012
+        marker.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=1.0)
         self.target_marker_pub.publish(marker)
 
 

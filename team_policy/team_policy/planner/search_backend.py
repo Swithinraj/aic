@@ -1,4 +1,5 @@
 from copy import deepcopy
+import math
 from typing import Dict, List, Tuple
 
 from geometry_msgs.msg import Pose
@@ -36,12 +37,15 @@ def build_clearance_waypoints(
         *workspace_bounds["z"],
     )
 
+    # Waypoint 1: lift straight up from start
     waypoint_1 = copy_pose(clamped_start)
     waypoint_1.position.z = safe_z
 
+    # Waypoint 2: translate horizontally above goal at safe height
     waypoint_2 = copy_pose(clamped_goal)
     waypoint_2.position.z = safe_z
 
+    # Waypoint 3: descend to goal
     waypoint_3 = copy_pose(clamped_goal)
 
     return [waypoint_1, waypoint_2, waypoint_3]
@@ -68,30 +72,34 @@ def densify_waypoints(waypoints: List[Pose], max_segment_length: float) -> List[
     return dense
 
 
-PSEUDO_ALGORITHM = """
-Suggested replacement for run_search(...): Weighted A* in Cartesian space
+def quaternion_slerp(q0: Pose, q1: Pose, fraction: float) -> Tuple[float, float, float, float]:
+    """Spherical linear interpolation between the orientations of two Poses."""
+    v0 = [q0.orientation.x, q0.orientation.y, q0.orientation.z, q0.orientation.w]
+    v1 = [q1.orientation.x, q1.orientation.y, q1.orientation.z, q1.orientation.w]
 
-1. Convert start pose and goal pose into a 3D grid or lattice in base_link.
-2. Define neighbor actions, for example:
-   - +/- x step
-   - +/- y step
-   - +/- z step
-   - optional diagonal moves
-3. Reject states outside workspace bounds.
-4. Reject states inside forbidden regions or known obstacle volumes.
-5. Cost g(n):
-   - translation distance
-   - optional penalty for z motion
-   - optional penalty near obstacles
-6. Heuristic h(n):
-   - Euclidean distance to goal
-7. Priority:
-   - f(n) = g(n) + w * h(n), where w is usually 1.2 to 2.0
-8. Stop when goal cell is reached.
-9. Reconstruct the path from parent links.
-10. Convert path cells back into Pose waypoints.
-11. Smooth or sparsify waypoints before execution.
-"""
+    dot = sum(a * b for a, b in zip(v0, v1))
+    # Ensure shortest path by flipping if needed
+    if dot < 0.0:
+        v1 = [-x for x in v1]
+        dot = -dot
+
+    # If quaternions are very close, use linear interpolation
+    if dot > 0.9995:
+        res = [a + fraction * (b - a) for a, b in zip(v0, v1)]
+        length = sum(x * x for x in res) ** 0.5
+        if length < 1e-6:
+            return tuple(v0)
+        return tuple(x / length for x in res)
+
+    theta_0 = math.acos(min(1.0, dot))
+    theta = theta_0 * fraction
+    sin_theta = math.sin(theta)
+    sin_theta_0 = math.sin(theta_0)
+
+    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+
+    return tuple(s0 * a + s1 * b for a, b in zip(v0, v1))
 
 
 def clamp_pose(pose: Pose, workspace_bounds: Bounds) -> Pose:
@@ -122,5 +130,11 @@ def interpolate_pose(start_pose: Pose, end_pose: Pose, alpha: float) -> Pose:
     pose.position.x = start_pose.position.x + alpha * (end_pose.position.x - start_pose.position.x)
     pose.position.y = start_pose.position.y + alpha * (end_pose.position.y - start_pose.position.y)
     pose.position.z = start_pose.position.z + alpha * (end_pose.position.z - start_pose.position.z)
-    pose.orientation = end_pose.orientation
+
+    qx, qy, qz, qw = quaternion_slerp(start_pose, end_pose, alpha)
+    pose.orientation.x = float(qx)
+    pose.orientation.y = float(qy)
+    pose.orientation.z = float(qz)
+    pose.orientation.w = float(qw)
+
     return pose

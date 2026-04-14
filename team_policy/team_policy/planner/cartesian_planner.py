@@ -9,7 +9,7 @@ from team_policy.planner.trajectory_planner import interpolate_poses_task_space
 
 @dataclass
 class PlannerConfig:
-    clearance_z: float = 0.12
+    clearance_z: float = 0.40 #adding z-cearence for moving between two poses
     workspace_min_x: float = -0.70
     workspace_max_x: float = 0.10
     workspace_min_y: float = -0.40
