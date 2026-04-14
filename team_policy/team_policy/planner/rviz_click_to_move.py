@@ -97,6 +97,78 @@ def solve_ik_pinocchio(model, q_init, oMdes, ee_frame):
     # print("Target:", oMdes) 
     return q
 
+
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _quat_to_np(q: Quaternion):
+    return [float(q.x), float(q.y), float(q.z), float(q.w)]
+
+
+def _quat_normalize(q):
+    n = math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+    if n < 1e-12:
+        return [0.0, 0.0, 0.0, 1.0]
+    return [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+
+
+def _quat_multiply(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
+
+
+def _quat_inverse(q):
+    x, y, z, w = _quat_normalize(q)
+    return [-x, -y, -z, w]
+
+
+def _quat_to_msg(q) -> Quaternion:
+    q = _quat_normalize(q)
+    msg = Quaternion()
+    msg.x = float(q[0])
+    msg.y = float(q[1])
+    msg.z = float(q[2])
+    msg.w = float(q[3])
+    return msg
+
+
+def _quat_from_axis_angle(axis, angle: float):
+    ax, ay, az = axis
+    n = math.sqrt(ax * ax + ay * ay + az * az)
+    if n < 1e-12:
+        return [0.0, 0.0, 0.0, 1.0]
+    ax /= n
+    ay /= n
+    az /= n
+    s = math.sin(0.5 * angle)
+    c = math.cos(0.5 * angle)
+    return [ax * s, ay * s, az * s, c]
+
+
+def _quat_error_rotvec(current: Quaternion, target: Quaternion):
+    qc = _quat_normalize(_quat_to_np(current))
+    qt = _quat_normalize(_quat_to_np(target))
+    q_err = _quat_multiply(qt, _quat_inverse(qc))
+    if q_err[3] < 0.0:
+        q_err = [-q_err[0], -q_err[1], -q_err[2], -q_err[3]]
+    vx, vy, vz, vw = q_err
+    sin_half = math.sqrt(vx * vx + vy * vy + vz * vz)
+    if sin_half < 1e-9:
+        return [0.0, 0.0, 0.0], 0.0
+    axis = [vx / sin_half, vy / sin_half, vz / sin_half]
+    angle = 2.0 * math.atan2(sin_half, max(1e-12, vw))
+    return [axis[0] * angle, axis[1] * angle, axis[2] * angle], abs(angle)
+
+
 class RvizClickToMove(Node):
     def __init__(self) -> None:
         super().__init__("rviz_click_to_move")
@@ -387,8 +459,7 @@ class RvizClickToMove(Node):
         target_pose = Pose()
         target_pose.position.x = tcp_pose.position.x
         target_pose.position.y = tcp_pose.position.y
-        # target_pose.position.z = min(tcp_pose.position.z + 0.05, 0.55)
-        target_pose.position.z = tcp_pose.position.z
+        target_pose.position.z = min(tcp_pose.position.z + 0.05, 0.55)
         target_pose.orientation = tcp_pose.orientation
 
         self.current_target_pose = target_pose
@@ -490,7 +561,7 @@ class RvizClickToMove(Node):
         control.interaction_mode = InteractiveMarkerControl.MOVE_ROTATE_3D
         control.always_visible = False
         return control
-
+    
     def _on_marker_feedback(self, feedback: InteractiveMarkerFeedback) -> None:
         self.current_target_pose = feedback.pose
         self._publish_target_marker(feedback.pose)
