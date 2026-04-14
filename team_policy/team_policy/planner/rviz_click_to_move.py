@@ -4,13 +4,14 @@ from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
-
+import tf2_ros
 from aic_control_interfaces.msg import ControllerState, MotionUpdate, TargetMode, TrajectoryGenerationMode
 from aic_control_interfaces.srv import ChangeTargetMode
 from geometry_msgs.msg import Pose, PoseStamped, Quaternion, Twist, Vector3, Wrench
 from interactive_markers.interactive_marker_server import InteractiveMarkerServer
 from nav_msgs.msg import Path
 from std_msgs.msg import ColorRGBA
+from sensor_msgs.msg import JointState
 from visualization_msgs.msg import (
     InteractiveMarker,
     InteractiveMarkerControl,
@@ -18,9 +19,82 @@ from visualization_msgs.msg import (
     Marker,
     MarkerArray,
 )
+from urdf_parser_py.urdf import URDF
+
+from rcl_interfaces.srv import GetParameters
+from aic_control_interfaces.msg import JointMotionUpdate
+
+import tempfile
+import pinocchio as pin
+import numpy as np
+from geometry_msgs.msg import TransformStamped
 
 from team_policy.planner.cartesian_planner import CartesianPlanner
 
+def tf_to_se3(transform: TransformStamped):
+    t = transform.transform.translation
+    q = transform.transform.rotation
+
+    R = pin.Quaternion(q.w, q.x, q.y, q.z).toRotationMatrix()
+    p = np.array([t.x, t.y, t.z])
+
+    return pin.SE3(R, p)
+
+def load_pinocchio_model_from_urdf(urdf_xml: str):
+    print("pin")
+    with tempfile.NamedTemporaryFile(suffix=".urdf", delete=False) as f:
+        f.write(urdf_xml.encode("utf-8"))
+        path = f.name
+
+    model = pin.buildModelFromUrdf(path)
+    data = model.createData()
+
+    return model, data
+
+def pose_to_se3(pose):
+    t = pose.position
+    q = pose.orientation
+
+    return pin.SE3(
+        pin.Quaternion(q.w, q.x, q.y, q.z).toRotationMatrix(),
+        np.array([t.x, t.y, t.z])
+    )
+
+def solve_ik_pinocchio(model, q_init, oMdes, ee_frame):
+
+    q = q_init.copy()
+    alpha = 0.1
+    damping = 1e-6
+    data = model.createData()
+    for _ in range(500):        
+
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+
+        oMee = data.oMf[ee_frame]
+
+        err = pin.log(oMee.actInv(oMdes)).vector
+
+        J = pin.computeFrameJacobian(
+            model,
+            data,
+            q,
+            ee_frame,
+            pin.ReferenceFrame.LOCAL
+        )
+
+        dq = np.linalg.solve(J.T @ J + 1e-6*np.eye(len(q)), J.T @ err)
+
+        dq = np.clip(dq, -0.05, 0.05)
+        q = pin.integrate(model, q, 0.1 * dq)
+    
+    pin.forwardKinematics(model, data, q)
+    pin.updateFramePlacements(model, data)
+
+    # T = data.oMf[ee_frame]
+    # print("FK result:", T)
+    # print("Target:", oMdes) 
+    return q
 
 class RvizClickToMove(Node):
     def __init__(self) -> None:
@@ -50,7 +124,6 @@ class RvizClickToMove(Node):
         self.trans_damping = float(self.get_parameter("trans_damping").value)
         self.rot_damping = float(self.get_parameter("rot_damping").value)
 
-        self.planner = CartesianPlanner()
         self.current_state: Optional[ControllerState] = None
         self.current_tcp_pose: Optional[Pose] = None
         self.current_target_pose: Optional[Pose] = None
@@ -62,14 +135,44 @@ class RvizClickToMove(Node):
         self.marker_initialized = False
         self.zero_sent = False
 
+        self.joint_limits = {}
+        self._load_joint_limits_from_robot_description()
+
+        self.model = None
+        self.data = None
+        self.ee_frame = None
+        self.pinocchio_ready = False
+
         self.controller_state_sub = self.create_subscription(
             ControllerState,
             "/aic_controller/controller_state",
             self._on_controller_state,
             10,
         )
+        self.latest_joint_state = None
+        self.joint_name_to_idx = {}
+        self.create_subscription(
+            JointState,
+            "/joint_states",
+            self._on_joint_state,
+            10
+        )
+        self.q_goal = None
+        self.q_goal_pub = self.create_publisher(
+            JointMotionUpdate,
+            "/aic_controller/joint_commands",
+            10
+        )
 
-        self.pose_command_pub = self.create_publisher(MotionUpdate, "/aic_controller/pose_commands", 10)
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.T_base_to_shoulder = None
+        self.tf_ready = False
+        self.create_timer(1.0, self._try_get_tf)
+
+        self.T_base_to_shoulder = None
+        self.tf_ready = False
+
         self.target_marker_pub = self.create_publisher(Marker, "/planner/target_marker", 10)
         self.waypoint_markers_pub = self.create_publisher(MarkerArray, "/planner/waypoint_markers", 10)
         self.path_pub = self.create_publisher(Path, "/planner/waypoint_path", 10)
@@ -80,31 +183,203 @@ class RvizClickToMove(Node):
         self.timer = self.create_timer(1.0 / publish_rate_hz, self._on_timer)
 
         self.get_logger().info("rviz_click_to_move started with a 3D interactive target marker.")
-        self.get_logger().info("This version executes waypoints with Cartesian velocity servo, not absolute pose jumps.")
+        self.get_logger().info("This version computes goal joint states and gives it directly to the aic controller.")
         self.get_logger().info("Set RViz Fixed Frame to base_link and add an InteractiveMarkers display for '/planner_target/update'.")
+        
+    def _on_joint_state(self, msg: JointState):
+
+        self.latest_joint_state = msg
+
+        if not self.joint_name_to_idx:
+            self.joint_name_to_idx = {
+                name: i for i, name in enumerate(msg.name)
+            }
+
+    def _try_get_tf(self):
+        if self.tf_ready:
+            return
+
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                "world",
+                "base_link",
+                rclpy.time.Time()
+            )
+
+            self.T_world_base = tf_to_se3(tf_msg)
+            self.tf_ready = True
+            # self.compute_tcp_calibration()
+
+            self.get_logger().info("TF base_link → shoulder_link ready")
+
+        except Exception as e:
+            self.get_logger().warn(f"TF not ready yet: {e}")
 
     def _on_controller_state(self, msg: ControllerState) -> None:
         self.current_state = msg
         self.current_tcp_pose = msg.tcp_pose
+
+        if not self.pinocchio_ready and self.latest_joint_state is not None:
+
+            urdf_xml = self.urdf_xml
+            if not urdf_xml:
+                return
+
+            full_model = load_pinocchio_model_from_urdf(urdf_xml)[0]
+            
+
+            self.js_names = set(self.latest_joint_state.name)
+
+            # Find joints NOT present in joint_states
+            lock_ids = []
+            removed_joints = []
+
+            for j in range(1, full_model.njoints):
+                joint = full_model.joints[j]
+                name = full_model.names[j]
+
+                if name == "universe":
+                    continue
+
+                # Only lock joints that are NOT in joint_state
+                if (name not in self.js_names) or ("gripper" in name):
+                    lock_ids.append(j)
+                    removed_joints.append(name)
+
+            # Build reduced model
+            self.model = pin.buildReducedModel(
+                full_model,
+                lock_ids,
+                np.zeros(full_model.nq)
+            )
+            self.pin_js_names =[name for name in self.model.names if name in self.js_names]
+
+            # Set EE frame (make sure this exists in reduced model)
+            self.ee_frame = self.model.getFrameId("gripper/tcp")
+
+            self.pinocchio_ready = True
+
+            self.get_logger().info(f"Pinocchio IK initialized.")
+            self.get_logger().info(f"Removed joints: {removed_joints}")
+            self.get_logger().info(f"Final DOF (nq): {self.model.nq}")
+            del self.urdf_xml
+
+       
         if not self.mode_request_sent:
-            self._request_cartesian_mode()
+            self._request_joint_mode()
         if not self.marker_initialized:
             self._initialize_interactive_target(msg.tcp_pose)
+            
+    def compute_tcp_calibration(self):
+        if self.current_tcp_pose is None:
+            self.get_logger().warn("No ROS TCP yet")
+            return
 
-    def _request_cartesian_mode(self) -> None:
+        q = self.get_q_from_joint_states()
+        if q is None:
+            self.get_logger().warn("No joint state yet")
+            return
+
+        # --- Pinocchio FK ---
+        data = self.model.createData()
+        pin.forwardKinematics(self.model, data, q)
+        pin.updateFramePlacements(self.model, data)
+
+        T_pin = data.oMf[self.ee_frame]
+
+        # --- ROS TCP ---
+        ros_p = self.current_tcp_pose.position
+        ros_q = self.current_tcp_pose.orientation
+
+        T_ros = pin.SE3(
+            pin.Quaternion(ros_q.w, ros_q.x, ros_q.y, ros_q.z).toRotationMatrix(),
+            np.array([ros_p.x, ros_p.y, ros_p.z])
+        )
+        print("T", T_pin)
+        print("ROS",T_ros)
+        print("T transformed", self.T_world_base.inverse()*T_pin)
+
+    def _get_robot_description(self):
+
+        client = self.create_client(
+            GetParameters,
+            "/robot_state_publisher/get_parameters"
+        )
+
+        if not client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("robot_state_publisher parameter service not available")
+            return ""
+
+        request = GetParameters.Request()
+        request.names = ["robot_description"]
+
+        future = client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+
+        if not future.result():
+            return ""
+
+        return future.result().values[0].string_value
+    
+    def _load_joint_limits_from_robot_description(self) -> None:
+        """
+        Load joint limits from the URDF stored in /robot_description.
+        """
+
+        urdf_xml = self._get_robot_description()
+        self.urdf_xml = urdf_xml
+
+        if not urdf_xml:
+            self.get_logger().warn(
+                "robot_description is empty. Joint limits not loaded."
+            )
+            return
+
+        try:
+            robot = URDF.from_xml_string(urdf_xml)
+
+            limits = {}
+
+            for joint in robot.joints:
+                if joint.limit is None:
+                    continue
+
+                limits[joint.name] = {
+                    "lower": joint.limit.lower,
+                    "upper": joint.limit.upper,
+                    "velocity": joint.limit.velocity,
+                    "effort": joint.limit.effort,
+                }
+
+            self.joint_limits = limits
+
+            self.get_logger().info("Loaded joint limits:")
+
+            for name, lim in limits.items():
+                self.get_logger().info(
+                    f"{name}: [{lim['lower']:.3f}, {lim['upper']:.3f}] "
+                    f"vel={lim['velocity']} effort={lim['effort']}"
+                )
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse URDF: {e}")
+
+
+    def _request_joint_mode(self) -> None:
         if not self.change_mode_client.wait_for_service(timeout_sec=0.1):
             return
         request = ChangeTargetMode.Request()
-        request.target_mode.mode = TargetMode.MODE_CARTESIAN
+        request.target_mode.mode = TargetMode.MODE_JOINT
         self.change_mode_client.call_async(request)
         self.mode_request_sent = True
-        self.get_logger().info("Requested Cartesian target mode.")
+        self.get_logger().info("Requested joint target mode.")
 
     def _initialize_interactive_target(self, tcp_pose: Pose) -> None:
         target_pose = Pose()
         target_pose.position.x = tcp_pose.position.x
         target_pose.position.y = tcp_pose.position.y
-        target_pose.position.z = min(tcp_pose.position.z + 0.05, 0.55)
+        # target_pose.position.z = min(tcp_pose.position.z + 0.05, 0.55)
+        target_pose.position.z = tcp_pose.position.z
         target_pose.orientation = tcp_pose.orientation
 
         self.current_target_pose = target_pose
@@ -169,120 +444,24 @@ class RvizClickToMove(Node):
         self._plan_and_start(feedback.pose)
 
     def _plan_and_start(self, target_pose: Pose) -> None:
+
         if self.current_tcp_pose is None:
-            self.get_logger().warn("No controller state received yet. Cannot plan.")
+            self.get_logger().warn("No state received yet.")
             return
 
-        plan_target = Pose()
-        plan_target.position.x = target_pose.position.x
-        plan_target.position.y = target_pose.position.y
-        plan_target.position.z = target_pose.position.z
-        plan_target.orientation = self.current_tcp_pose.orientation
+        # 1. Compute IK
+        q_goal = self.compute_joint_goal(target_pose)
 
-        self.active_waypoints = self.planner.plan_from_current_pose(
-            current_pose=self.current_tcp_pose,
-            target_pose=plan_target,
-        )
-        self.active_waypoint_index = 0
-        self.execution_active = len(self.active_waypoints) > 0
-        self.zero_sent = False
-        self.last_planned_target_pose = plan_target
-
-        self._publish_waypoint_visuals(self.active_waypoints)
-        self._publish_target_marker(plan_target)
-
-        self.get_logger().info(
-            f"Target set to ({plan_target.position.x:.3f}, {plan_target.position.y:.3f}, {plan_target.position.z:.3f}). "
-            f"Generated {len(self.active_waypoints)} waypoints."
-        )
-
-    def _on_timer(self) -> None:
-        if self.current_tcp_pose is None:
+        if q_goal is None:
+            self.get_logger().warn("IK failed.")
             return
 
-        if not self.execution_active:
-            if not self.zero_sent:
-                self._publish_twist_command(Twist())
-                self.zero_sent = True
-            return
+        # 2. Send directly to controller
+        self.q_goal = q_goal
+        self.send_q_goal()
+        self.execution_active = True
 
-        if self.active_waypoint_index >= len(self.active_waypoints):
-            self.execution_active = False
-            self.zero_sent = False
-            self.get_logger().info("Waypoint execution complete.")
-            return
-
-        waypoint = self.active_waypoints[self.active_waypoint_index]
-        distance = self._position_distance(self.current_tcp_pose, waypoint)
-        if distance <= self.position_tolerance:
-            self.active_waypoint_index += 1
-            if self.active_waypoint_index < len(self.active_waypoints):
-                self.get_logger().info(
-                    f"Advancing to waypoint {self.active_waypoint_index + 1}/{len(self.active_waypoints)}"
-                )
-            else:
-                self.execution_active = False
-                self.zero_sent = False
-                self.get_logger().info("Final waypoint reached.")
-            return
-
-        twist = self._compute_twist_to_waypoint(self.current_tcp_pose, waypoint)
-        self._publish_twist_command(twist)
-        self.zero_sent = False
-
-    def _compute_twist_to_waypoint(self, current_pose: Pose, waypoint: Pose) -> Twist:
-        dx = waypoint.position.x - current_pose.position.x
-        dy = waypoint.position.y - current_pose.position.y
-        dz = waypoint.position.z - current_pose.position.z
-        distance = (dx * dx + dy * dy + dz * dz) ** 0.5
-
-        twist = Twist()
-        if distance < 1e-6:
-            return twist
-
-        commanded_speed = self.linear_kp * distance
-        if commanded_speed > self.max_linear_speed:
-            commanded_speed = self.max_linear_speed
-        elif commanded_speed < self.min_linear_speed:
-            commanded_speed = self.min_linear_speed
-
-        scale = commanded_speed / distance
-        twist.linear.x = dx * scale
-        twist.linear.y = dy * scale
-        twist.linear.z = dz * scale
-        twist.angular.x = 0.0
-        twist.angular.y = 0.0
-        twist.angular.z = 0.0
-        return twist
-
-    def _publish_twist_command(self, twist: Twist) -> None:
-        msg = MotionUpdate()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.command_frame
-        msg.velocity = twist
-        msg.target_stiffness = [
-            self.trans_stiffness, 0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, self.trans_stiffness, 0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, self.trans_stiffness, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, self.rot_stiffness, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0, self.rot_stiffness, 0.0,
-            0.0, 0.0, 0.0, 0.0, 0.0, self.rot_stiffness,
-        ]
-        msg.target_damping = [
-            self.trans_damping, 0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, self.trans_damping, 0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, self.trans_damping, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, self.rot_damping, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0, self.rot_damping, 0.0,
-            0.0, 0.0, 0.0, 0.0, 0.0, self.rot_damping,
-        ]
-        msg.feedforward_wrench_at_tip = Wrench(
-            force=Vector3(x=0.0, y=0.0, z=0.0),
-            torque=Vector3(x=0.0, y=0.0, z=0.0),
-        )
-        msg.wrench_feedback_gains_at_tip = [0.5, 0.5, 0.5, 0.0, 0.0, 0.0]
-        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_VELOCITY
-        self.pose_command_pub.publish(msg)
+        self.last_planned_target_pose = target_pose
 
     def _publish_target_marker(self, pose: Pose) -> None:
         marker = Marker()
@@ -299,45 +478,93 @@ class RvizClickToMove(Node):
         marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
         self.target_marker_pub.publish(marker)
 
-    def _publish_waypoint_visuals(self, waypoints: List[Pose]) -> None:
-        marker_array = MarkerArray()
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
-
-        for index, waypoint in enumerate(waypoints):
-            marker = Marker()
-            marker.header.frame_id = self.command_frame
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "planner_waypoints"
-            marker.id = index
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose = waypoint
-            marker.scale.x = 0.02
-            marker.scale.y = 0.02
-            marker.scale.z = 0.02
-            marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-            marker_array.markers.append(marker)
-
-        self.waypoint_markers_pub.publish(marker_array)
-
-        path = Path()
-        path.header.frame_id = self.command_frame
-        path.header.stamp = self.get_clock().now().to_msg()
-        for waypoint in waypoints:
-            pose_stamped = PoseStamped()
-            pose_stamped.header.frame_id = self.command_frame
-            pose_stamped.header.stamp = self.get_clock().now().to_msg()
-            pose_stamped.pose = waypoint
-            path.poses.append(pose_stamped)
-        self.path_pub.publish(path)
 
     def _position_distance(self, pose_a: Pose, pose_b: Pose) -> float:
         dx = pose_a.position.x - pose_b.position.x
         dy = pose_a.position.y - pose_b.position.y
         dz = pose_a.position.z - pose_b.position.z
         return (dx * dx + dy * dy + dz * dz) ** 0.5
+    
+    def get_joint_limit(self, joint_name: str):
+        return self.joint_limits.get(joint_name, None)
+    
+    def _on_timer(self) -> None:
+        if self.current_tcp_pose is None:
+            return
+
+        if self.q_goal is None:
+            return
+        
+        # if self.execution_active:
+        #     self.send_q_goal()
+    
+    def get_q_from_joint_states(self):
+
+        if self.latest_joint_state is None:
+            return None
+
+        msg = self.latest_joint_state
+
+        # map: joint_name → position
+        name_to_pos = dict(zip(msg.name, msg.position))
+
+        q = []
+
+        for name in self.pin_js_names:
+            if "gripper" in name:
+                continue
+
+            if name not in name_to_pos:
+                self.get_logger().warn(f"Joint {name} not in JointState")
+                return None
+
+            q.append(name_to_pos[name])
+
+        return np.array(q)
+    
+    def compute_joint_goal(self, target_pose: Pose):
+        if not self.pinocchio_ready:
+            return None
+        
+        oMdes_base = pose_to_se3(target_pose)
+
+        q_init = self.get_q_from_joint_states()
+
+        if q_init is None:
+            self.get_logger().warn("No joint_states yet, skipping IK")
+            return None
+        oMdes_world = self.T_world_base * oMdes_base       
+
+        q_goal = solve_ik_pinocchio(
+            self.model,
+            np.array(q_init),
+            oMdes_world,
+            self.ee_frame
+        )    
+          
+
+        return q_goal
+    
+    def send_q_goal(self):
+
+        if self.q_goal is None:
+            return
+        msg = MotionUpdate()
+
+        msg = JointMotionUpdate()
+
+        msg.target_state.positions = self.q_goal.tolist()
+        # msg.target_state.positions = [0.0, -1.57, -1.57, -1.57, 1.57, 0]
+        msg.target_stiffness = ([85.0] * len(self.q_goal.tolist()))
+        msg.target_damping = ([75.0] * len(self.q_goal.tolist()))
+        # msg.target_stiffness = [85.0, 85.0, 85.0, 85.0, 85.0, 85.0]
+        # msg.target_damping = [75.0, 75.0, 75.0, 75.0, 75.0, 75.0]
+
+        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_POSITION
+
+        self.q_goal_pub.publish(msg)
+
+        self.get_logger().info(f"Sent q_goal: {self.q_goal}")
 
 
 def main() -> None:

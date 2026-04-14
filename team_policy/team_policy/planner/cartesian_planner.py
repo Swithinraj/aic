@@ -4,6 +4,7 @@ from typing import List
 from geometry_msgs.msg import Pose
 
 from team_policy.planner.search_backend import run_search
+from team_policy.planner.trajectory_planner import interpolate_poses_task_space
 
 
 @dataclass
@@ -34,3 +35,4 @@ class CartesianPlanner:
             },
             max_segment_length=self.config.max_segment_length,
         )
+        # return interpolate_poses_task_space(start_pose=current_pose, goal_pose=target_pose)

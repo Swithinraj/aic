@@ -35,6 +35,8 @@ ros-kilted-std-srvs = "*"
 ros-kilted-tf2-ros-py = "*"
 setuptools = ">=71.0.0,<81.0.0"                                                        # required by lerobot==0.4.3
 ros-kilted-team-policy = { path = "team_policy" }
+urdf-parser-py = ">=0.0.4,<0.0.5"
+pinocchio = ">=3.9.0,<4"
 
 [pypi-dependencies]
 huggingface-hub = { version = "==0.35.3", extras = ["hf-transfer", "cli"] }
