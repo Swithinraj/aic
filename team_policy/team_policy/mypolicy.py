@@ -19,6 +19,9 @@ from nav_msgs.msg import Path
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+import cv2
+from cv_bridge import CvBridge
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import ColorRGBA, String
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -86,19 +89,44 @@ class DetectionListener(Node):
     def __init__(self):
         super().__init__("mypolicy_detection_listener")
         self._lock = threading.Lock()
-        self._latest = {"time": 0.0, "detections": []}
-        self.create_subscription(String, "/fused_yolo/detections_json", self._cb, 10)
+        self._latest_fused = {"time": 0.0, "detections": []}
+        self._latest_per_camera = {
+            "left": {"time": 0.0, "detections": []},
+            "center": {"time": 0.0, "detections": []},
+            "right": {"time": 0.0, "detections": []},
+        }
 
-    def _cb(self, msg: String) -> None:
+        self.create_subscription(String, "/fused_yolo/detections_json", self._cb_fused, 10)
+        self.create_subscription(String, "/left_camera/yolo/detections_json", lambda msg: self._cb_camera("left", msg), 10)
+        self.create_subscription(String, "/center_camera/yolo/detections_json", lambda msg: self._cb_camera("center", msg), 10)
+        self.create_subscription(String, "/right_camera/yolo/detections_json", lambda msg: self._cb_camera("right", msg), 10)
+
+    def _parse_detection_list(self, raw: str) -> List[Dict]:
         try:
-            parsed = json.loads(msg.data)
+            parsed = json.loads(raw)
         except Exception:
-            return
+            return []
         if not isinstance(parsed, list):
-            return
-        detections = [dict(item) for item in parsed if isinstance(item, dict)]
+            return []
+        return [dict(item) for item in parsed if isinstance(item, dict)]
+
+    def _cb_fused(self, msg: String) -> None:
+        detections = self._parse_detection_list(msg.data)
         with self._lock:
-            self._latest = {"time": time.monotonic(), "detections": detections}
+            self._latest_fused = {
+                "time": time.monotonic(),
+                "detections": detections,
+            }
+
+    def _cb_camera(self, camera_name: str, msg: String) -> None:
+        detections = self._parse_detection_list(msg.data)
+        for det in detections:
+            det["camera_name"] = camera_name
+        with self._lock:
+            self._latest_per_camera[camera_name] = {
+                "time": time.monotonic(),
+                "detections": detections,
+            }
 
     def find_best(
         self,
@@ -111,13 +139,13 @@ class DetectionListener(Node):
         now = time.monotonic()
         with self._lock:
             snapshot = {
-                "time": float(self._latest["time"]),
-                "detections": [dict(det) for det in self._latest["detections"]],
+                "time": float(self._latest_fused["time"]),
+                "detections": [dict(det) for det in self._latest_fused["detections"]],
             }
 
         candidates: List[Dict] = []
         update_time = float(snapshot["time"])
-        
+
         if update_time > 0.0 and update_time >= float(min_update_time) and now - update_time <= float(freshness_sec):
             for det in snapshot["detections"]:
                 if require_pose and not self._has_pose(det):
@@ -126,7 +154,7 @@ class DetectionListener(Node):
                     continue
                 candidates.append(
                     {
-                        "camera_name": det.get("source", "fused"),
+                        "camera_name": det.get("camera_name", det.get("source", "fused")),
                         "update_time": update_time,
                         "detection": det,
                         "confidence": float(det.get("confidence", 0.0)),
@@ -135,6 +163,11 @@ class DetectionListener(Node):
 
         if not candidates:
             return None
+
+        if preferred_camera is not None:
+            preferred = [c for c in candidates if c["camera_name"] == preferred_camera]
+            if preferred:
+                candidates = preferred
 
         candidates.sort(
             key=lambda item: (
@@ -146,18 +179,33 @@ class DetectionListener(Node):
         return candidates[0]
 
     def get_all_detections(self, freshness_sec: float = 2.0) -> List[Dict]:
-        """Return all current detections if fresh enough."""
         now = time.monotonic()
         with self._lock:
-            update_time = float(self._latest["time"])
+            update_time = float(self._latest_fused["time"])
+            if update_time > 0.0 and now - update_time <= freshness_sec:
+                return [dict(det) for det in self._latest_fused["detections"]]
+
+            merged: List[Dict] = []
+            for camera_name, snapshot in self._latest_per_camera.items():
+                cam_time = float(snapshot["time"])
+                if cam_time <= 0.0 or now - cam_time > freshness_sec:
+                    continue
+                for det in snapshot["detections"]:
+                    merged.append(dict(det))
+            return merged
+
+    def get_camera_detections(self, camera_name: str, freshness_sec: float = 0.5) -> List[Dict]:
+        now = time.monotonic()
+        with self._lock:
+            snapshot = self._latest_per_camera.get(camera_name, {"time": 0.0, "detections": []})
+            update_time = float(snapshot["time"])
             if update_time <= 0.0 or now - update_time > freshness_sec:
                 return []
-            return [dict(det) for det in self._latest["detections"]]
+            return [dict(det) for det in snapshot["detections"]]
 
     def _has_pose(self, det: Dict) -> bool:
         pose = det.get("pose_base_link")
         return isinstance(pose, dict) and isinstance(pose.get("position"), dict) and isinstance(pose.get("orientation"), dict)
-
 
 class MotionServoNode(Node):
     def __init__(self):
@@ -381,30 +429,37 @@ class MotionServoNode(Node):
 
 
 class mypolicy(Policy):
-    # ---- Visual servo tuning constants ----
-    SERVO_HOVER_Z = 0.06              # Hover height above port for visual servo (m)
-    SERVO_PIXEL_TOLERANCE = 5.0       # Pixel error threshold for alignment convergence
-    SERVO_MAX_ITERATIONS = 80         # Max visual servo correction iterations
-    SERVO_GAIN = 0.4                  # Proportional gain for pixel→Cartesian correction
-    SERVO_STEP_SEC = 0.10             # Sleep between servo iterations
-    SERVO_TIMEOUT_SEC = 15.0          # Total visual servo timeout
+    SERVO_HOVER_Z = 0.06
+    SERVO_WORLD_TOLERANCE = 0.003
+    SERVO_MAX_ITERATIONS = 180
+    SERVO_GAIN_XY = 1.20
+    SERVO_GAIN_Z = 0.35
+    SERVO_STEP_SEC = 0.10
+    SERVO_TIMEOUT_SEC = 28.0
 
-    # ---- Force insertion tuning constants ----
-    INSERT_Z_STEP = 0.002             # Step down increment per iteration (m)
-    INSERT_Z_FORCE = 3.0              # Downward feedforward force (N). Positive is DOWN in tip frame!
-    INSERT_Z_STIFFNESS = 20.0         # Reduced Z stiffness during insertion
-    INSERT_MAX_LATERAL_FORCE = 8.0    # Max FX/FY before declaring misalignment (N)
-    INSERT_MAX_Z_FORCE = 15.0         # Max FZ before declaring jam (N)
-    INSERT_SETTLED_FORCE = 1.5        # Z force threshold to detect plug seated (N)
-    INSERT_MAX_DEPTH = 0.04           # Maximum insertion travel (m)
-    INSERT_STEP_SEC = 0.08            # Sleep between insertion steps
-    INSERT_TIMEOUT_SEC = 12.0         # Total insertion timeout
-    
-    _gripper_classes = {"gripper", "sfp_module", "plug"}
+    SERVO_DLS_DAMPING = 1.5
+    SERVO_MAX_LINEAR_SPEED_XY = 0.030
+    SERVO_MAX_LINEAR_SPEED_Z = 0.008
+    SERVO_MIN_LINEAR_SPEED_XY = 0.0
+    SERVO_CONVERGED_PX = 22.0
+    SERVO_CONVERGED_PX_STABLE_COUNT = 4
+    SERVO_Z_ENABLE_PX = 90.0
+    SERVO_ABORT_PX = 120.0
 
-    # ---- Camera intrinsic defaults (overridden from camera_info) ----
-    DEFAULT_FX = 450.0
-    DEFAULT_FY = 450.0
+    SERVO_MAX_YAW_RATE = 0.30
+    SERVO_MIN_CONFIDENCE = 0.20
+    SERVO_LAST_VALID_PAIR_SEC = 0.60
+
+    INSERT_Z_STEP = 0.001
+    INSERT_MAX_LATERAL_FORCE = 15.0
+    INSERT_MAX_Z_FORCE = 30.0
+    INSERT_SETTLED_FORCE = 2.0
+    INSERT_MAX_DEPTH = 0.04
+    INSERT_STEP_SEC = 0.15
+    INSERT_TIMEOUT_SEC = 20.0
+
+    DEFAULT_FX = 600.0
+    DEFAULT_FY = 600.0
     DEFAULT_CX = 320.0
     DEFAULT_CY = 240.0
 
@@ -425,10 +480,27 @@ class mypolicy(Policy):
         self._nic_classes = self._parse_name_set(os.environ.get("YOLOV12_NIC_CLASSES", "nic_card,nic card,nic,nic_card_0,nic_card_1,nic_card_2,nic_card_3,nic_card_4"))
         self._sfp_port_classes = self._parse_name_set(os.environ.get("YOLOV12_SFP_PORT_CLASSES", "sfp_port,sfp port,sfp_port_0,sfp_port_1,sfp_port_2,sfp_port_3"))
         self._sc_port_classes = self._parse_name_set(os.environ.get("YOLOV12_SC_PORT_CLASSES", "sc_port,sc port,sc_port_0,sc_port_1,sc_port_2,sc_port_3"))
-        self._sfp_module_classes = self._parse_name_set(os.environ.get("YOLOV12_SFP_MODULE_CLASSES", "sfp_module,sfp module"))
+        self._sfp_module_classes = self._parse_name_set(os.environ.get("YOLOV12_SFP_MODULE_CLASSES", "sfp_module,sfp module,transceiver"))
+        self._gripper_classes = self._parse_name_set(os.environ.get("YOLOV12_GRIPPER_CLASSES", "gripper,gripper_tip,gripper_tcp"))
+
+        # Image parsing for visual servoing debugging
+        self._cv_bridge = CvBridge()
+        self._annotated_images = {}
+        self._parent_node.create_subscription(Image, "/left_camera/yolo/annotated", lambda msg: self._annotated_img_cb("left", msg), 2)
+        self._parent_node.create_subscription(Image, "/center_camera/yolo/annotated", lambda msg: self._annotated_img_cb("center", msg), 2)
+        self._parent_node.create_subscription(Image, "/right_camera/yolo/annotated", lambda msg: self._annotated_img_cb("right", msg), 2)
+        
+        self._corner_match_pubs = {
+            "left": self._parent_node.create_publisher(Image, "/left_camera/corner_match", 10),
+            "center": self._parent_node.create_publisher(Image, "/center_camera/corner_match", 10),
+            "right": self._parent_node.create_publisher(Image, "/right_camera/corner_match", 10),
+        }
 
         self.get_logger().info("mypolicy.__init__()")
         self.get_logger().info("Started internal CombinedYoloDepthPosePlanner, detection listener, and motion servo.")
+
+    def _annotated_img_cb(self, cam_name: str, msg: Image):
+        self._annotated_images[cam_name] = msg
 
     # ==================================================================
     # Main entry point — insert_cable
@@ -541,7 +613,9 @@ class mypolicy(Policy):
             send_feedback=send_feedback,
         )
         if not servo_ok:
-            send_feedback("mypolicy/phase2_servo_failed (continuing with best position)")
+            send_feedback("mypolicy/phase2_servo_failed (stopping before insertion)")
+            self._motion_servo.stop()
+            return False
 
         self.sleep_for(0.5)
 
@@ -550,6 +624,7 @@ class mypolicy(Policy):
         insert_ok = self._sfp_force_insert(
             gripper_orientation=gripper_orientation,
             get_observation=get_observation,
+            move_robot=move_robot,
             send_feedback=send_feedback,
         )
 
@@ -572,125 +647,197 @@ class mypolicy(Policy):
         gripper_orientation: Quaternion,
         send_feedback: SendFeedbackCallback,
     ) -> bool:
-        """Iteratively correct XY position using Pixel IBVS logic between the plug and the slot."""
         deadline = time.monotonic() + self.SERVO_TIMEOUT_SEC
+        best_metric_error = float("inf")
+        stable_count = 0
+        last_valid_pairs: Dict[str, Dict] = {}
 
         for iteration in range(self.SERVO_MAX_ITERATIONS):
             if time.monotonic() > deadline:
-                send_feedback("mypolicy/servo_timeout")
-                return False
-
-            all_dets = self._detection_listener.get_all_detections(freshness_sec=1.0)
-            if not all_dets:
-                self.sleep_for(self.SERVO_STEP_SEC)
-                continue
-
-            # Find port and gripper in the SAME camera view
-            port_det = None
-            gripper_det = None
-            best_cam = None
-
-            # First, find the port
-            port_candidates = sorted([d for d in all_dets if port_matcher(d)], key=lambda x: -float(x.get("confidence", 0.0)))
-            if not port_candidates:
-                send_feedback(f"mypolicy/servo_iter_{iteration} port_not_visible")
-                self.sleep_for(self.SERVO_STEP_SEC)
-                continue
-            
-            port_det = port_candidates[0]
-            best_cam = port_det.get("camera_name", "center")
-
-            # Then find the gripper specifically in that SAME camera view
-            gripper_candidates = [d for d in all_dets if self._is_gripper_detection(d) and d.get("camera_name") == best_cam]
-            if gripper_candidates:
-                gripper_det = sorted(gripper_candidates, key=lambda x: -float(x.get("confidence", 0.0)))[0]
-            
-            if gripper_det is None:
-                # If we don't see the gripper, we assume image center, but this is a fallback
-                fx, fy, cx, cy = self._get_camera_intrinsics(best_cam)
-                target_u, target_v = cx, cy
-                gripper_pose_x, gripper_pose_y = None, None
-            else:
-                target_u, target_v = gripper_det.get("anchor_uv", [0, 0])
-                gripper_pose = self._pose_from_detection(gripper_det)
-                gripper_pose_x = gripper_pose.position.x if gripper_pose else None
-                gripper_pose_y = gripper_pose.position.y if gripper_pose else None
-
-            anchor_uv = port_det.get("anchor_uv", [])
-            if len(anchor_uv) != 2:
-                self.sleep_for(self.SERVO_STEP_SEC)
-                continue
-
-            du = float(anchor_uv[0]) - float(target_u)
-            dv = float(anchor_uv[1]) - float(target_v)
-            pixel_error = math.sqrt(du * du + dv * dv)
-
-            send_feedback(
-                f"mypolicy/servo_iter_{iteration} cam={best_cam} "
-                f"uv=({anchor_uv[0]:.1f},{anchor_uv[1]:.1f}) error={pixel_error:.1f}px"
-            )
-
-            if pixel_error <= self.SERVO_PIXEL_TOLERANCE:
-                send_feedback(f"mypolicy/servo_converged pixel_error={pixel_error:.1f}")
-                return True
+                send_feedback(f"mypolicy/servo_timeout best_px_err={best_metric_error:.1f}")
+                self._motion_servo.stop()
+                return best_metric_error <= self.SERVO_CONVERGED_PX
 
             current_pose = self._motion_servo.get_current_pose()
             if current_pose is None:
                 self.sleep_for(self.SERVO_STEP_SEC)
                 continue
 
-            # To avoid manual Jacobian camera axis assumptions, we take advantage of the combined planner's robust true-metric pose projections.
-            port_pose = self._pose_from_detection(port_det)
-            if not port_pose:
+            J_rows = []
+            e_rows = []
+            per_cam_errors = []
+            used_cameras = []
+            best_fallback_port = None
+            best_fallback_conf = -1.0
+            now = time.monotonic()
+
+            for cam in ("left", "center", "right"):
+                cam_dets = self._detection_listener.get_camera_detections(cam, freshness_sec=0.80)
+
+                port_cands = [
+                    d for d in cam_dets
+                    if port_matcher(d) and float(d.get("confidence", 0.0)) >= self.SERVO_MIN_CONFIDENCE
+                ]
+                plug_cands = [
+                    d for d in cam_dets
+                    if self._is_gripper_detection(d) and float(d.get("confidence", 0.0)) >= self.SERVO_MIN_CONFIDENCE
+                ]
+
+                port_det = max(port_cands, key=lambda d: float(d.get("confidence", 0.0))) if port_cands else None
+                plug_det = max(plug_cands, key=lambda d: float(d.get("confidence", 0.0))) if plug_cands else None
+
+                if port_det is not None:
+                    conf = float(port_det.get("confidence", 0.0))
+                    if conf > best_fallback_conf:
+                        best_fallback_conf = conf
+                        best_fallback_port = port_det
+
+                if port_det is not None and plug_det is not None:
+                    last_valid_pairs[cam] = {
+                        "time": now,
+                        "port": dict(port_det),
+                        "plug": dict(plug_det),
+                    }
+                else:
+                    cached = last_valid_pairs.get(cam)
+                    if cached is not None and now - float(cached.get("time", 0.0)) <= self.SERVO_LAST_VALID_PAIR_SEC:
+                        if port_det is None:
+                            port_det = dict(cached["port"])
+                        if plug_det is None:
+                            plug_det = dict(cached["plug"])
+
+                self._publish_servo_debug_image(cam, cam_dets, port_det, plug_det)
+
+                if port_det is None or plug_det is None:
+                    continue
+
+                J_cam, e_cam, px_err = self._compute_center_ibvs_camera_system(
+                    camera_name=cam,
+                    current_pose=current_pose,
+                    port_det=port_det,
+                    plug_det=plug_det,
+                )
+                if J_cam is None or e_cam is None or J_cam.shape[0] < 2:
+                    continue
+
+                port_conf = float(port_det.get("confidence", 0.0))
+                plug_conf = float(plug_det.get("confidence", 0.0))
+                weight = max(0.35, min(1.0, math.sqrt(max(1e-6, port_conf * plug_conf))))
+
+                J_rows.append(weight * J_cam)
+                e_rows.append(weight * e_cam.reshape(-1, 1))
+                per_cam_errors.append(float(px_err))
+                used_cameras.append(cam)
+
+            if J_rows:
+                if len(used_cameras) >= 2:
+                    J = np.vstack(J_rows)
+                    e = np.vstack(e_rows)
+
+                    H = J.T @ J + (self.SERVO_DLS_DAMPING ** 2) * np.eye(3, dtype=np.float64)
+                    g = J.T @ e
+
+                    try:
+                        v_cmd = -np.linalg.solve(H, g).reshape(3)
+                    except np.linalg.LinAlgError:
+                        v_cmd = -(np.linalg.pinv(J) @ e).reshape(3)
+
+                    vx = float(self.SERVO_GAIN_XY * v_cmd[0])
+                    vy = float(self.SERVO_GAIN_XY * v_cmd[1])
+                    vz_raw = float(self.SERVO_GAIN_Z * v_cmd[2])
+                else:
+                    J2 = np.asarray(J_rows[0][:, :2], dtype=np.float64)
+                    e2 = np.asarray(e_rows[0], dtype=np.float64)
+                    H2 = J2.T @ J2 + (self.SERVO_DLS_DAMPING ** 2) * np.eye(2, dtype=np.float64)
+                    g2 = J2.T @ e2
+                    try:
+                        vxy_cmd = -np.linalg.solve(H2, g2).reshape(2)
+                    except np.linalg.LinAlgError:
+                        vxy_cmd = -(np.linalg.pinv(J2) @ e2).reshape(2)
+                    vx = float(self.SERVO_GAIN_XY * vxy_cmd[0])
+                    vy = float(self.SERVO_GAIN_XY * vxy_cmd[1])
+                    vz_raw = 0.0
+
+                v_xy = np.asarray([vx, vy], dtype=np.float64)
+                speed_xy = float(np.linalg.norm(v_xy))
+                if speed_xy > self.SERVO_MAX_LINEAR_SPEED_XY:
+                    v_xy *= self.SERVO_MAX_LINEAR_SPEED_XY / speed_xy
+
+                avg_px_error = float(sum(per_cam_errors) / len(per_cam_errors))
+                metric_px_error = float(max(per_cam_errors))
+                best_metric_error = min(best_metric_error, metric_px_error)
+
+                if len(used_cameras) >= 2 and metric_px_error <= self.SERVO_Z_ENABLE_PX:
+                    vz = float(np.clip(vz_raw, -self.SERVO_MAX_LINEAR_SPEED_Z, self.SERVO_MAX_LINEAR_SPEED_Z))
+                else:
+                    vz = 0.0
+
+                if metric_px_error <= self.SERVO_CONVERGED_PX:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+
+                send_feedback(
+                    f"mypolicy/servo_iter_{iteration} cams={used_cameras} "
+                    f"px_err_max={metric_px_error:.1f} px_err_avg={avg_px_error:.1f} "
+                    f"vx={v_xy[0]:.4f} vy={v_xy[1]:.4f} vz={vz:.4f}"
+                )
+
+                if stable_count >= self.SERVO_CONVERGED_PX_STABLE_COUNT:
+                    self._motion_servo.stop()
+                    send_feedback(f"mypolicy/servo_converged px_err={metric_px_error:.1f}")
+                    return True
+
+                twist = Twist()
+                twist.linear.x = float(v_xy[0])
+                twist.linear.y = float(v_xy[1])
+                twist.linear.z = float(vz)
+                twist.angular.x = 0.0
+                twist.angular.y = 0.0
+                twist.angular.z = 0.0
+
+                self._motion_servo.publish_twist_command(twist)
                 self.sleep_for(self.SERVO_STEP_SEC)
                 continue
 
-            # Use task-space error mapping calculated accurately from the homography pipeline projection
-            if gripper_pose_x is not None and gripper_pose_y is not None:
-                world_dx = float(port_pose.position.x) - gripper_pose_x
-                world_dy = float(port_pose.position.y) - gripper_pose_y
-            else:
-                # Fallback purely on the port's target position mapped by the system
-                world_dx = float(port_pose.position.x) - float(current_pose.position.x)
-                world_dy = float(port_pose.position.y) - float(current_pose.position.y)
+            self._motion_servo.stop()
 
-            # Apply gain and clamp
-            world_dx *= self.SERVO_GAIN
-            world_dy *= self.SERVO_GAIN
+            if best_fallback_port is not None:
+                fallback_pose = self._pose_from_detection(best_fallback_port)
+                if fallback_pose is not None:
+                    world_dx = float(fallback_pose.position.x) - float(current_pose.position.x)
+                    world_dy = float(fallback_pose.position.y) - float(current_pose.position.y)
+                    world_dist = math.sqrt(world_dx * world_dx + world_dy * world_dy)
 
-            max_step = 0.015
-            mag = math.sqrt(world_dx * world_dx + world_dy * world_dy)
-            if mag > max_step:
-                world_dx = (world_dx / mag) * max_step
-                world_dy = (world_dy / mag) * max_step
+                    send_feedback(f"mypolicy/servo_iter_{iteration} fallback_to_port err={world_dist*1000.0:.1f}mm")
 
-            corrected_pose = _copy_pose(current_pose)
-            corrected_pose.position.x += world_dx
-            corrected_pose.position.y += world_dy
+                    if world_dist <= self.SERVO_WORLD_TOLERANCE:
+                        self._motion_servo.stop()
+                        send_feedback(f"mypolicy/servo_converged_fallback err={world_dist*1000.0:.1f}mm")
+                        return True
 
-            # Also detect and match slot orientation
-            slot_yaw = self._detect_slot_orientation(port_det)
-            if slot_yaw is not None:
-                send_feedback(f"mypolicy/servo_slot_yaw={math.degrees(slot_yaw):.1f}deg")
-                corrected_pose.orientation = Quaternion(
-                    x=float(gripper_orientation.x),
-                    y=float(gripper_orientation.y),
-                    z=float(math.sin(slot_yaw / 2.0)),
-                    w=float(math.cos(slot_yaw / 2.0)),
-                )
+                    cmd = np.asarray([world_dx, world_dy], dtype=np.float64) * 0.45
+                    mag = float(np.linalg.norm(cmd))
+                    if mag > self.SERVO_MAX_LINEAR_SPEED_XY:
+                        cmd *= self.SERVO_MAX_LINEAR_SPEED_XY / mag
 
-            # Send correction twist
-            twist = self._motion_servo.compute_twist_to_waypoint(current_pose, corrected_pose)
-            # Zero angular velocity — we handle orientation separately
-            twist.angular.x = 0.0
-            twist.angular.y = 0.0
-            twist.angular.z = 0.0
-            self._motion_servo.publish_twist_command(twist)
+                    twist = Twist()
+                    twist.linear.x = float(cmd[0])
+                    twist.linear.y = float(cmd[1])
+                    twist.linear.z = 0.0
+                    twist.angular.x = 0.0
+                    twist.angular.y = 0.0
+                    twist.angular.z = 0.0
+                    self._motion_servo.publish_twist_command(twist)
+                    self.sleep_for(self.SERVO_STEP_SEC)
+                    continue
 
+            send_feedback(f"mypolicy/servo_iter_{iteration} waiting_for_valid_port_and_plug")
             self.sleep_for(self.SERVO_STEP_SEC)
 
-        send_feedback("mypolicy/servo_max_iterations_reached")
-        return False
+        self._motion_servo.stop()
+        send_feedback(f"mypolicy/servo_max_iterations best_px_err={best_metric_error:.1f}")
+        return best_metric_error <= self.SERVO_CONVERGED_PX
 
     def _compute_pixel_correction(
         self,
@@ -720,6 +867,354 @@ class mypolicy(Policy):
         max_step = 0.015  # 15mm max correction per iteration
         mag = math.sqrt(world_dx * world_dx + world_dy * world_dy)
         return world_dx, world_dy
+
+    def _feature_uv(self, det: Optional[Dict]) -> Optional[np.ndarray]:
+        if det is None:
+            return None
+        anchor_uv = det.get("anchor_uv", [])
+        if isinstance(anchor_uv, list) and len(anchor_uv) == 2:
+            try:
+                return np.asarray([float(anchor_uv[0]), float(anchor_uv[1])], dtype=np.float64)
+            except Exception:
+                pass
+        return self._bbox_center_uv(det)
+
+    def _bbox_center_uv(self, det: Dict) -> Optional[np.ndarray]:
+        bbox = det.get("bbox_xyxy", [])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return None
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        return np.asarray([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float64)
+
+    def _bbox_size_uv(self, det: Dict) -> Optional[np.ndarray]:
+        bbox = det.get("bbox_xyxy", [])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return None
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        return np.asarray([abs(x2 - x1), abs(y2 - y1)], dtype=np.float64)
+
+    def _angle_wrap(self, angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def _bbox_axis_frame(self, det: Dict) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]:
+        bbox = det.get("bbox_xyxy", [])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return None
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        w = abs(x2 - x1)
+        h = abs(y2 - y1)
+        if w < 4.0 or h < 4.0:
+            return None
+        center = np.asarray([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float64)
+        if w >= h:
+            major = np.asarray([1.0, 0.0], dtype=np.float64)
+            minor = np.asarray([0.0, 1.0], dtype=np.float64)
+            major_half = 0.5 * w
+            minor_half = 0.5 * h
+        else:
+            major = np.asarray([0.0, 1.0], dtype=np.float64)
+            minor = np.asarray([1.0, 0.0], dtype=np.float64)
+            major_half = 0.5 * h
+            minor_half = 0.5 * w
+        return center, major, minor, major_half, minor_half
+
+    def _bbox_orientation_angle(self, det: Dict) -> Optional[float]:
+        frame = self._bbox_axis_frame(det)
+        if frame is None:
+            return None
+        _, major, _, _, _ = frame
+        return math.atan2(float(major[1]), float(major[0]))
+
+    def _axis_angle_error(self, target_angle: float, current_angle: float) -> float:
+        err = float(target_angle) - float(current_angle)
+        while err > (math.pi * 0.5):
+            err -= math.pi
+        while err < -(math.pi * 0.5):
+            err += math.pi
+        return err
+
+    def _estimate_detection_yaw_error(self, port_det: Dict, plug_det: Dict) -> Optional[float]:
+        port_angle = self._bbox_orientation_angle(port_det)
+        plug_angle = self._bbox_orientation_angle(plug_det)
+        if port_angle is None or plug_angle is None:
+            return None
+        return self._axis_angle_error(port_angle, plug_angle)
+
+    def _bbox_ibvs_feature_points(self, det: Dict, ref_major: Optional[np.ndarray] = None) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray, float, float, List[np.ndarray]]]:
+        frame = self._bbox_axis_frame(det)
+        if frame is None:
+            return None
+        center, major, minor, major_half, minor_half = frame
+        if ref_major is not None and float(np.dot(major, ref_major)) < 0.0:
+            major = -major
+            minor = -minor
+        pts = [
+            center,
+            center + major * major_half,
+            center - major * major_half,
+            center + minor * minor_half,
+            center - minor * minor_half,
+        ]
+        return center, major, minor, major_half, minor_half, pts
+
+    def _camera_rotation_image_gain(self, camera_name: str) -> float:
+        try:
+            with self._detection_node._lock:
+                info = self._detection_node._latest_infos.get(camera_name)
+            if info is None:
+                return 1.0
+            camera_frame = str(info.header.frame_id)
+            R_cam_base, _ = self._detection_node._lookup_transform(camera_frame, "base_link")
+            base_z_in_cam = np.asarray(R_cam_base, dtype=np.float64) @ np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+            gain = float(base_z_in_cam[2])
+            if abs(gain) < 0.2:
+                return 0.2 if gain >= 0.0 else -0.2
+            return gain
+        except Exception:
+            return 1.0
+
+
+    def _compute_center_ibvs_camera_system(
+        self,
+        camera_name: str,
+        current_pose: Pose,
+        port_det: Dict,
+        plug_det: Dict,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], float]:
+        J_xyz, _ = self._compute_ibvs_jacobian_xyz(camera_name, current_pose)
+        if J_xyz is None:
+            return None, None, float("inf")
+
+        port_uv = self._bbox_center_uv(port_det)
+        plug_uv = self._bbox_center_uv(plug_det)
+        if port_uv is None or plug_uv is None:
+            return None, None, float("inf")
+
+        e = np.asarray(plug_uv - port_uv, dtype=np.float64).reshape(2, 1)
+        px_err = float(np.linalg.norm(e.reshape(-1)))
+        return J_xyz, e, px_err
+
+    def _compute_ibvs_jacobian_xyz(
+        self,
+        camera_name: str,
+        current_pose: Pose,
+    ) -> tuple[Optional[np.ndarray], float]:
+        try:
+            with self._detection_node._lock:
+                info = self._detection_node._latest_infos.get(camera_name)
+            if info is None:
+                return None, 0.0
+
+            camera_frame = str(info.header.frame_id)
+            R_cam_base, t_cam_base = self._detection_node._lookup_transform(camera_frame, "base_link")
+
+            p_base = np.asarray([
+                float(current_pose.position.x),
+                float(current_pose.position.y),
+                float(current_pose.position.z),
+            ], dtype=np.float64)
+
+            p_cam = np.asarray(R_cam_base, dtype=np.float64) @ p_base + np.asarray(t_cam_base, dtype=np.float64)
+
+            X = float(p_cam[0])
+            Y = float(p_cam[1])
+            Z = float(p_cam[2])
+
+            if Z <= 1e-4:
+                return None, 0.0
+
+            fx = float(info.k[0]) if len(info.k) >= 6 else self.DEFAULT_FX
+            fy = float(info.k[4]) if len(info.k) >= 6 else self.DEFAULT_FY
+
+            L_trans = np.asarray([
+                [fx / Z, 0.0, -fx * X / (Z * Z)],
+                [0.0, fy / Z, -fy * Y / (Z * Z)],
+            ], dtype=np.float64)
+
+            G_xyz = np.asarray(R_cam_base, dtype=np.float64)[:, :3]
+            J_xyz = L_trans @ G_xyz
+            return J_xyz, Z
+        except Exception:
+            return None, 0.0
+
+    def _compute_pure_ibvs_camera_system(
+        self,
+        camera_name: str,
+        current_pose: Pose,
+        port_det: Dict,
+        plug_det: Dict,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], float, Optional[float]]:
+        J_xy, _ = self._compute_ibvs_jacobian_xy(camera_name, current_pose)
+        if J_xy is None:
+            return None, None, float("inf"), None
+
+        plug_frame = self._bbox_ibvs_feature_points(plug_det)
+        port_frame = self._bbox_ibvs_feature_points(port_det)
+        if plug_frame is None or port_frame is None:
+            return None, None, float("inf"), None
+
+        plug_center, plug_major, plug_minor, _, _, plug_pts = plug_frame
+        port_center, port_major, port_minor, _, _, _ = port_frame
+
+        if float(np.dot(port_major, plug_major)) < 0.0:
+            port_major = -port_major
+            port_minor = -port_minor
+
+        port_pts = [
+            port_center,
+            port_center + port_major * np.linalg.norm(plug_pts[1] - plug_center),
+            port_center - port_major * np.linalg.norm(plug_pts[1] - plug_center),
+            port_center + port_minor * np.linalg.norm(plug_pts[3] - plug_center),
+            port_center - port_minor * np.linalg.norm(plug_pts[3] - plug_center),
+        ]
+
+        rot_gain = self._camera_rotation_image_gain(camera_name)
+        J_rows = []
+        e_rows = []
+
+        for plug_pt, port_pt in zip(plug_pts, port_pts):
+            rel = np.asarray(plug_pt - plug_center, dtype=np.float64)
+            j_wz = rot_gain * np.asarray([-rel[1], rel[0]], dtype=np.float64).reshape(2, 1)
+            J_feat = np.hstack([np.asarray(J_xy, dtype=np.float64), j_wz])
+            err = np.asarray(plug_pt - port_pt, dtype=np.float64).reshape(2, 1)
+            J_rows.append(J_feat)
+            e_rows.append(err)
+
+        J = np.vstack(J_rows)
+        e = np.vstack(e_rows)
+        center_px_err = float(np.linalg.norm(plug_center - port_center))
+        yaw_err = self._estimate_detection_yaw_error(port_det, plug_det)
+        return J, e, center_px_err, yaw_err
+
+    def _compute_ibvs_jacobian_xy(self, camera_name: str, current_pose: Pose) -> tuple[Optional[np.ndarray], float]:
+        try:
+            with self._detection_node._lock:
+                info = self._detection_node._latest_infos.get(camera_name)
+            if info is None:
+                return None, 0.0
+
+            camera_frame = str(info.header.frame_id)
+            R_cam_base, t_cam_base = self._detection_node._lookup_transform(camera_frame, "base_link")
+
+            p_base = np.asarray([
+                float(current_pose.position.x),
+                float(current_pose.position.y),
+                float(current_pose.position.z),
+            ], dtype=np.float64)
+
+            p_cam = np.asarray(R_cam_base, dtype=np.float64) @ p_base + np.asarray(t_cam_base, dtype=np.float64)
+
+            X = float(p_cam[0])
+            Y = float(p_cam[1])
+            Z = float(p_cam[2])
+
+            if Z <= 1e-4:
+                return None, 0.0
+
+            fx = float(info.k[0]) if len(info.k) >= 6 else self.DEFAULT_FX
+            fy = float(info.k[4]) if len(info.k) >= 6 else self.DEFAULT_FY
+
+            L_trans = np.asarray([
+                [fx / Z, 0.0, -fx * X / (Z * Z)],
+                [0.0, fy / Z, -fy * Y / (Z * Z)],
+            ], dtype=np.float64)
+
+            G_xy = np.asarray(R_cam_base, dtype=np.float64)[:, :2]
+            J_xy = L_trans @ G_xy
+            return J_xy, Z
+        except Exception:
+            return None, 0.0
+
+    def _publish_servo_debug_image(
+        self,
+        cam: str,
+        cam_dets: List[Dict],
+        port_det: Optional[Dict],
+        plug_det: Optional[Dict],
+    ) -> None:
+        if cam not in self._annotated_images:
+            return
+
+        try:
+            cv_img = self._cv_bridge.imgmsg_to_cv2(self._annotated_images[cam], "bgr8")
+
+            pb = port_det.get("bbox_xyxy", []) if port_det else []
+            gb = plug_det.get("bbox_xyxy", []) if plug_det else []
+
+            if len(pb) == 4:
+                cv2.rectangle(cv_img, (int(pb[0]), int(pb[1])), (int(pb[2]), int(pb[3])), (255, 0, 0), 2)
+            if len(gb) == 4:
+                cv2.rectangle(cv_img, (int(gb[0]), int(gb[1])), (int(gb[2]), int(gb[3])), (0, 0, 255), 2)
+
+            def draw_axis(det: Optional[Dict], color_major, color_minor):
+                if det is None:
+                    return
+                frame = self._bbox_ibvs_feature_points(det)
+                if frame is None:
+                    return
+                center, major, minor, major_half, minor_half, _ = frame
+                c = (int(round(center[0])), int(round(center[1])))
+                m1 = center + major * major_half
+                m2 = center - major * major_half
+                s1 = center + minor * minor_half
+                s2 = center - minor * minor_half
+                cv2.circle(cv_img, c, 5, (255, 255, 255), -1)
+                cv2.line(cv_img, c, (int(round(m1[0])), int(round(m1[1]))), color_major, 2)
+                cv2.line(cv_img, c, (int(round(m2[0])), int(round(m2[1]))), color_major, 2)
+                cv2.line(cv_img, c, (int(round(s1[0])), int(round(s1[1]))), color_minor, 2)
+                cv2.line(cv_img, c, (int(round(s2[0])), int(round(s2[1]))), color_minor, 2)
+
+            draw_axis(port_det, (255, 255, 0), (255, 128, 0))
+            draw_axis(plug_det, (0, 255, 255), (0, 128, 255))
+
+            port_uv = self._feature_uv(port_det) if port_det else None
+            plug_uv = self._feature_uv(plug_det) if plug_det else None
+
+            if port_uv is not None and plug_uv is not None:
+                cv2.line(
+                    cv_img,
+                    (int(plug_uv[0]), int(plug_uv[1])),
+                    (int(port_uv[0]), int(port_uv[1])),
+                    (0, 255, 0),
+                    3,
+                )
+                err = float(np.linalg.norm(plug_uv - port_uv))
+                cv2.putText(
+                    cv_img,
+                    f"err={err:.1f}px",
+                    (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            y_off = 60
+            for d in cam_dets[:8]:
+                cn = str(d.get("instance_name", d.get("class_name", "")))
+                conf = float(d.get("confidence", 0.0))
+                cv2.putText(
+                    cv_img,
+                    f"{cn} {conf:.2f}",
+                    (15, y_off),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                y_off += 24
+
+            msg_out = self._cv_bridge.cv2_to_imgmsg(cv_img, "bgr8")
+            msg_out.header = self._annotated_images[cam].header
+            self._corner_match_pubs[cam].publish(msg_out)
+        except Exception:
+            return
 
     def _is_gripper_detection(self, det: Dict) -> bool:
         return self._matches_any_name(det, self._gripper_classes)
@@ -771,13 +1266,29 @@ class mypolicy(Policy):
         self,
         gripper_orientation: Quaternion,
         get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
     ) -> bool:
-        """Perform compliant insertion: slowly descend with force monitoring."""
+        """Perform insertion by stepping down using MODE_POSITION via set_pose_target.
+        
+        Uses the official move_robot callback with MODE_POSITION which reliably
+        moves the robot to the commanded pose. Forces are monitored via wrist_wrench
+        with wrench taring to subtract static loads.
+        """
         current_pose = self._motion_servo.get_current_pose()
         if current_pose is None:
             send_feedback("mypolicy/insert_fail no_pose")
             return False
+
+        # ---- Tare the wrench ----
+        tare_fx, tare_fy, tare_fz = 0.0, 0.0, 0.0
+        tare_obs = get_observation()
+        if tare_obs is not None:
+            w = tare_obs.wrist_wrench.wrench
+            tare_fx = float(w.force.x)
+            tare_fy = float(w.force.y)
+            tare_fz = float(w.force.z)
+            send_feedback(f"mypolicy/insert_tare fx={tare_fx:.2f} fy={tare_fy:.2f} fz={tare_fz:.2f}")
 
         start_z = float(current_pose.position.z)
         target_z = start_z - self.INSERT_MAX_DEPTH
@@ -787,6 +1298,7 @@ class mypolicy(Policy):
 
         insertion_started = False
         settled_count = 0
+        step_z = start_z  # track commanded Z
 
         while time.monotonic() < deadline:
             current_pose = self._motion_servo.get_current_pose()
@@ -796,72 +1308,56 @@ class mypolicy(Policy):
 
             current_z = float(current_pose.position.z)
 
-            if current_z <= target_z:
+            if step_z <= target_z:
                 send_feedback(f"mypolicy/insert_max_depth_reached z={current_z:.4f}")
                 break
 
+            # Monitor forces
             observation = get_observation()
             if observation is not None:
-                # Actual real-time FTS wrench readings!
                 w = observation.wrist_wrench.wrench
-                raw_fz = float(w.force.z)
-                raw_fx = float(w.force.x)
-                raw_fy = float(w.force.y)
-                
+                raw_fz = float(w.force.z) - tare_fz
+                raw_fx = float(w.force.x) - tare_fx
+                raw_fy = float(w.force.y) - tare_fy
+
                 fz = abs(raw_fz)
                 fx = abs(raw_fx)
                 fy = abs(raw_fy)
                 lateral_force = math.sqrt(fx * fx + fy * fy)
 
                 send_feedback(
-                    f"mypolicy/insert z={current_z:.4f} fz={raw_fz:.2f} "
+                    f"mypolicy/insert z={current_z:.4f} cmd_z={step_z:.4f} fz={raw_fz:.2f} "
                     f"fx={raw_fx:.2f} fy={raw_fy:.2f} lat={lateral_force:.2f}"
                 )
 
                 if lateral_force > self.INSERT_MAX_LATERAL_FORCE:
                     send_feedback(f"mypolicy/insert_abort lateral_force={lateral_force:.2f}")
-                    self._motion_servo.stop()
-                    self._retract_z(current_pose, 0.01, gripper_orientation)
                     return False
 
                 if fz > self.INSERT_MAX_Z_FORCE:
                     send_feedback(f"mypolicy/insert_abort z_force={fz:.2f}")
-                    self._motion_servo.stop()
-                    self._retract_z(current_pose, 0.01, gripper_orientation)
                     return False
 
                 if insertion_started and fz < self.INSERT_SETTLED_FORCE:
                     settled_count += 1
                     if settled_count >= 5:
                         send_feedback(f"mypolicy/insert_seated z={current_z:.4f}")
-                        self._motion_servo.stop()
                         return True
                 else:
                     settled_count = 0
 
-                if fz > 1.0:
+                if fz > 2.0:
                     insertion_started = True
 
-            descent_pose = _copy_pose(current_pose)
-            descent_pose.position.z -= self.INSERT_Z_STEP
-            descent_pose.orientation = gripper_orientation
-
-            twist = self._motion_servo.compute_twist_to_waypoint(current_pose, descent_pose)
-            twist.angular.x = 0.0
-            twist.angular.y = 0.0
-            twist.angular.z = 0.0
-
-            self._motion_servo.publish_compliant_insertion_command(
-                twist=twist,
-                z_force=self.INSERT_Z_FORCE,
-                z_stiffness=self.INSERT_Z_STIFFNESS,
-            )
+            # Step down using pure velocity Twist to avoid impedance position drifting!
+            twist = Twist()
+            twist.linear.z = -0.010  # Descend at 10mm/sec (doubled to fix timeout)
+            self._motion_servo.publish_twist_command(twist)
 
             self.sleep_for(self.INSERT_STEP_SEC)
 
-        self._motion_servo.stop()
         send_feedback("mypolicy/insert_timeout")
-        return insertion_started  # Partial success if we at least made contact
+        return insertion_started
 
     def _retract_z(self, current_pose: Pose, distance: float, orientation: Quaternion) -> None:
         """Retract upward by a small distance after an abort."""
@@ -911,6 +1407,8 @@ class mypolicy(Policy):
             )
             if result is not None:
                 return result
+            self.sleep_for(0.05)
+        return None
     def _execute_sample_and_verify_goal(
         self,
         label: str,
@@ -942,6 +1440,14 @@ class mypolicy(Policy):
             while time.monotonic() < sample_deadline:
                 all_dets = self._detection_listener.get_all_detections(freshness_sec=1.0)
                 port_dets = [d for d in all_dets if matcher(d)]
+                
+                # The port is elevated off the board. Using angled cameras (left/right) introduces extreme
+                # projection XY parallax since the homography assumes Z=0 (board surface).
+                # The center camera avoids this completely because it natively points perfectly vertical.
+                center_dets = [d for d in port_dets if d.get("camera_name") == "center"]
+                if center_dets:
+                    port_dets = center_dets
+                
                 for det in port_dets:
                     pose = self._pose_from_detection(det)
                     if pose:
@@ -1009,22 +1515,26 @@ class mypolicy(Policy):
                     gripper_candidates = [d for d in live_dets if self._is_gripper_detection(d) and d.get("camera_name") == best_cam]
                     if gripper_candidates:
                         gripper_det = sorted(gripper_candidates, key=lambda x: -float(x.get("confidence", 0.0)))[0]
-                        port_uv = port_det.get("anchor_uv", [0, 0])
-                        grip_uv = gripper_det.get("anchor_uv", [0, 0])
-                        
+                        port_uv = self._feature_uv(port_det)
+                        grip_uv = self._feature_uv(gripper_det)
+                        if port_uv is None or grip_uv is None:
+                            self.sleep_for(0.05)
+                            continue
+
                         du = float(port_uv[0]) - float(grip_uv[0])
                         dv = float(port_uv[1]) - float(grip_uv[1])
                         pixel_error = math.sqrt(du*du + dv*dv)
                         
                         # Monitor if it is strictly reducing (with a 3px noise margin)
-                        if last_pixel_error != float('inf') and pixel_error > last_pixel_error + 3.0:
+                        prev_pixel_error = last_pixel_error
+                        if prev_pixel_error != float('inf') and pixel_error > prev_pixel_error + 20.0:
                             error_increase_count += 1
                         else:
                             error_increase_count = max(0, error_increase_count - 1)
-                            last_pixel_error = min(last_pixel_error, pixel_error)
-                            
+                        last_pixel_error = pixel_error
+
                         if error_increase_count > 5:
-                            send_feedback(f"mypolicy/abort_increase_err ({last_pixel_error:.1f}px -> {pixel_error:.1f}px)")
+                            send_feedback(f"mypolicy/abort_increase_err ({prev_pixel_error:.1f}px -> {pixel_error:.1f}px)")
                             self._motion_servo.stop()
                             path_aborted = True
                             break

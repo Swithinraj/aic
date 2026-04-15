@@ -136,22 +136,41 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             self._latest_instance_obs = instance_obs
 
     def _tf_callback(self, msg: TFMessage) -> None:
+        """When new TF arrives, run fresh inference on the latest camera frames
+        so that both detections AND transforms are up-to-date simultaneously."""
+
+        # 1. Grab the latest camera frames under lock
         with self._lock:
-            instance_obs = dict(getattr(self, "_latest_instance_obs", {}))
-            
-        if not instance_obs:
+            frames = dict(self._latest_frames)
+
+        if not frames:
             return
-            
+
+        # 2. Run fresh YOLO inference on every available camera frame
+        instance_obs = self._run_fresh_detections(frames)
+
+        if not instance_obs:
+            # No detections from fresh inference — fall back to cached detections
+            with self._lock:
+                instance_obs = dict(getattr(self, "_latest_instance_obs", {}))
+            if not instance_obs:
+                return
+
+        # 3. Update the cache so _tick and other consumers see these fresh results too
+        with self._lock:
+            self._latest_instance_obs = instance_obs
+
+        # 4. Transform camera-frame poses to base_link using the FRESH TF
         stamp = self.get_clock().now().to_msg()
         fused_records = []
         used_tf_names = set()
-        
+
         for name, obs_list in instance_obs.items():
             best_obj = max(obs_list, key=lambda o: float(o["det"].get("confidence", 0.0)))
             best_det = best_obj["det"]
             camera_frame_id = best_obj["camera_frame_id"]
             pose_cam = best_det.get("pose_camera")
-            
+
             try:
                 R_tf, t_tf = self._lookup_transform(self._base_frame, camera_frame_id)
             except Exception:
@@ -201,6 +220,54 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             })
 
         self._publish_fused_records(stamp, fused_records)
+
+    def _run_fresh_detections(self, frames: Dict) -> Dict:
+        """Run YOLO inference on the provided camera frames and return instance_obs
+        in the same format as _tick produces, but without publishing per-camera topics."""
+        instance_obs = {}
+
+        for camera_name, msg in frames.items():
+            if msg is None:
+                continue
+
+            try:
+                result = self._run_inference_combined(camera_name, msg)
+            except Exception:
+                continue
+
+            _, detections, _, _, _, _, _, _, _ = result
+
+            with self._lock:
+                info = self._latest_infos.get(camera_name)
+
+            if info is None:
+                continue
+
+            camera_frame_id = str(info.header.frame_id)
+
+            for det in detections:
+                name = det.get("instance_name", det.get("class_name", ""))
+                if not name:
+                    continue
+                pose_cam = det.get("pose_camera")
+                if not (isinstance(pose_cam, dict) and "t" in pose_cam and "q" in pose_cam):
+                    continue
+
+                family = self._detection_family_name(det)
+                anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
+                anchor = self._detection_anchor_point(det, anchor_key)
+                anchor_uv = [float(anchor[0]), float(anchor[1])]
+
+                if name not in instance_obs:
+                    instance_obs[name] = []
+                instance_obs[name].append({
+                    "det": det,
+                    "camera_frame_id": camera_frame_id,
+                    "anchor_uv": anchor_uv,
+                    "camera_name": camera_name
+                })
+
+        return instance_obs
 
     def _publish_fused_records(self, stamp, fused_records: List[Dict]):
         fused_pose_array = PoseArray()
