@@ -29,8 +29,102 @@ import tempfile
 import pinocchio as pin
 import numpy as np
 from geometry_msgs.msg import TransformStamped
+from scipy.optimize import minimize
 
 from team_policy.planner.cartesian_planner import CartesianPlanner
+
+from scipy.optimize import minimize
+
+
+class TrajectoryOptimizer:
+
+    def __init__(self, model, ee_frame, limits, dt=0.1):
+        self.model = model
+        self.data = model.createData()
+        self.ee_frame = ee_frame
+        self.limits = limits
+        self.dt = dt
+
+        self.joint_names = [model.names[i] for i in range(model.nq)]
+
+    def forward_T(self, q):
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        return self.data.oMf[self.ee_frame]
+
+    def pose_error(self, T, T_des):
+        dR = T.rotation @ T_des.rotation.T
+        rot_err = pin.log3(dR)
+        pos_err = T.translation - T_des.translation
+        return np.hstack([pos_err, rot_err])
+
+    # ---------------------------
+    # COST FUNCTION (FIXED)
+    # ---------------------------
+    def cost(self, q_flat, N, T_des):
+        nq = self.model.nq
+        q = q_flat.reshape(N, nq)
+
+        cost = 0.0
+
+        # 🔥 start constraint
+        cost += 1000 * np.sum((q[0] - self.q_init) ** 2)
+
+        # 🔥 final task constraint (ONLY thing that matters)
+        T_end = self.forward_T(q[-1])
+        e = self.pose_error(T_end, T_des)
+        cost += 10000 * np.dot(e, e)
+
+        # 🔥 smoothness (no q_goal used!)
+        for t in range(N - 1):
+            dq = (q[t+1] - q[t]) / self.dt
+            cost += 1.0 * np.dot(dq, dq)
+
+        # 🔥 acceleration smoothness
+        for t in range(1, N - 1):
+            ddq = (q[t+1] - 2*q[t] + q[t-1]) / (self.dt**2)
+            cost += 5.0 * np.dot(ddq, ddq)
+
+        return cost
+
+    # ---------------------------
+    # OPTIMIZATION (FIXED INIT)
+    # ---------------------------
+    def optimize(self, q_init, T_des, N=20):
+
+        self.q_init = np.array(q_init)
+        nq = self.model.nq
+
+        # 🔥 better initial guess: linear interpolation
+        q_traj = []
+        for t in range(N):
+            alpha = t / (N - 1)
+            q_interp = (1 - alpha) * q_init + alpha * q_init
+            q_traj.append(q_interp)
+
+        q0 = np.array(q_traj).flatten()
+
+        # bounds
+        bounds = []
+        for _ in range(N):
+            for j, joint_name in enumerate(self.joint_names):
+                lim = self.limits.get(joint_name, None)
+
+                if lim is None:
+                    bounds.append((None, None))
+                else:
+                    bounds.append((lim["lower"], lim["upper"]))
+
+        res = minimize(
+            self.cost,
+            q0,
+            args=(N, T_des),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 200}
+        )
+
+        return res.x.reshape(N, nq)
 
 def tf_to_se3(transform: TransformStamped):
     t = transform.transform.translation
@@ -275,6 +369,20 @@ class RvizClickToMove(Node):
             self.joint_name_to_idx = {
                 name: i for i, name in enumerate(msg.name)
             }
+        joint_state=[]
+        if self.execution_active:
+            for name in self.pin_js_names:
+                joint_state.append(msg.position[self.joint_name_to_idx[name]])
+            if np.all(np.abs(np.array(self.q_goal) - np.array(joint_state)) < 1e-1):
+                if len(self.q_traj)>0:
+                    self.q_goal = self.q_traj.pop(0)
+                    print("reached a  mid point")
+                    self.send_q_goal()
+                    self.execution_active = True
+                else:
+                    self.execution_active = False
+                    print("reached")
+
 
     def _try_get_tf(self):
         if self.tf_ready:
@@ -576,6 +684,7 @@ class RvizClickToMove(Node):
                 return
 
         self._plan_and_start(feedback.pose)
+        print("feedback.....")
 
     def _plan_and_start(self, target_pose: Pose) -> None:
 
@@ -583,17 +692,24 @@ class RvizClickToMove(Node):
             self.get_logger().warn("No state received yet.")
             return
 
-        # 1. Compute IK
+        # # 1. Compute IK
         q_goal = self.compute_joint_goal(target_pose)
+        print("expected final q goal", q_goal)
 
-        if q_goal is None:
-            self.get_logger().warn("IK failed.")
-            return
+        # if q_goal is None:
+        #     self.get_logger().warn("IK failed.")
+        #     return
 
-        # 2. Send directly to controller
-        self.q_goal = q_goal
+        # # 2. Send directly to controller
+        # self.q_goal = q_goal
+        self.q_traj = self.get_q_traj(target_pose=target_pose)
+        print("traj", self.q_traj)
+        self.q_traj = self.q_traj.tolist()
+        self.q_goal = self.q_traj.pop(0)
+
         self.send_q_goal()
         self.execution_active = True
+       
 
         self.last_planned_target_pose = target_pose
 
@@ -679,6 +795,28 @@ class RvizClickToMove(Node):
 
         return q_goal
     
+
+    def get_q_traj(self, target_pose):
+        optimizer = TrajectoryOptimizer(
+            model=self.model,
+            ee_frame=self.ee_frame,
+            limits=self.joint_limits)
+
+        T_des = pose_to_se3(target_pose)
+        oMdes_world = self.T_world_base * T_des 
+        q_init = self.get_q_from_joint_states()
+
+
+        if q_init is None:
+            self.get_logger().warn("No joint_states yet, skipping IK")
+            return None
+
+        q_traj = optimizer.optimize(
+            q_init=q_init,
+            T_des=oMdes_world,
+            N=3)
+        return q_traj
+            
     def send_q_goal(self):
 
         if self.q_goal is None:
@@ -687,10 +825,10 @@ class RvizClickToMove(Node):
 
         msg = JointMotionUpdate()
 
-        msg.target_state.positions = self.q_goal.tolist()
+        msg.target_state.positions = self.q_goal
         # msg.target_state.positions = [0.0, -1.57, -1.57, -1.57, 1.57, 0]
-        msg.target_stiffness = ([85.0] * len(self.q_goal.tolist()))
-        msg.target_damping = ([75.0] * len(self.q_goal.tolist()))
+        msg.target_stiffness = ([85.0] * len(self.q_goal))
+        msg.target_damping = ([75.0] * len(self.q_goal))
         # msg.target_stiffness = [85.0, 85.0, 85.0, 85.0, 85.0, 85.0]
         # msg.target_damping = [75.0, 75.0, 75.0, 75.0, 75.0, 75.0]
 
