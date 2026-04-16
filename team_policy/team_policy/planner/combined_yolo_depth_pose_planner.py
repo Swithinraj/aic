@@ -42,6 +42,9 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         self._depth_fallback_m = self._env_float("YOLO_DEPTH_POSE_FALLBACK_M", 0.30)
         self._assets_models_dir = self._env_path("YOLO_DEPTH_POSE_AIC_ASSETS_MODELS_DIR", "")
         self._preferred_camera_for_fusion = self._tf_camera
+        self._force_table_flat = self._env_bool("YOLO_POSE_FORCE_TABLE_FLAT", True)
+        self._table_normal_base = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self._table_constrained_families = {"taskboard", "nic", "sc", "sfp_port", "sfp_module"}
 
         self._tf_broadcaster = TransformBroadcaster(self)
         self._fused_pose_pub = self.create_publisher(PoseArray, "/fused_yolo/poses_base_link", 10)
@@ -81,6 +84,11 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         import os
         value = str(os.environ.get(key, default)).strip().lower()
         return value if value in {"left", "center", "right"} else str(default)
+
+    def _env_bool(self, key: str, default: bool) -> bool:
+        import os
+        value = str(os.environ.get(key, "1" if default else "0")).strip().lower()
+        return value in {"1", "true", "yes", "on"}
 
     def _env_path(self, key: str, default: str) -> str:
         import os
@@ -206,6 +214,7 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             pose_base = self._transform_pose_dict(pose_cam, camera_frame_id, self._base_frame)
             if pose_base is None:
                 continue
+            pose_base = self._maybe_constrain_pose_to_table_plane(best_det, pose_base)
 
             display_name = str(name)
             tf_base = "det_" + self._tf_safe_name(display_name)
@@ -404,36 +413,53 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         if info is None:
             return []
 
-        board_quad = None
+        observed_board_quad = None
         board_pose_camera = None
         if ctx is not None:
-            board_quad = ctx.get("projected_board_quad")
-        if board_quad is not None:
-            board_quad = np.asarray(board_quad, dtype=np.float32).reshape(4, 2)
-            board_pose_camera = self._estimate_board_pose_from_quad(info, board_quad)
+            observed_board_quad = ctx.get("observed_board_quad")
+            if observed_board_quad is not None:
+                observed_board_quad = np.asarray(observed_board_quad, dtype=np.float32).reshape(4, 2)
 
         records: List[Dict] = []
         used_tf_names = set()
 
         taskboard_det = self._find_best_detection(detections, self._taskboard_classes)
-        if taskboard_det is not None and board_pose_camera is not None:
-            refined_board_pose = None
-            if depth is not None:
-                refined_board_pose = self._cad_estimator.estimate_pose(info, depth, taskboard_det, "taskboard", init_pose_camera=board_pose_camera)
-            pose = refined_board_pose if refined_board_pose is not None else dict(board_pose_camera, source="board_pnp")
-            records.append(self._make_pose_record(taskboard_det, pose, used_tf_names))
+        if taskboard_det is not None:
+            board_pose_camera = self._estimate_board_pose_geometry(info, depth, taskboard_det, observed_board_quad)
+            if board_pose_camera is None and observed_board_quad is not None:
+                board_pose_camera = self._estimate_board_pose_from_quad(info, observed_board_quad)
+
+            if board_pose_camera is not None:
+                pose = dict(board_pose_camera)
+                pose["R"] = self._orthonormalize_rotation(np.asarray(pose["R"], dtype=np.float32))
+                pose["q"] = self._matrix_to_quaternion(pose["R"])
+                pose["source"] = str(pose.get("source", "board_depth_plane"))
+                records.append(self._make_pose_record(taskboard_det, pose, used_tf_names))
 
         for det in detections:
             if taskboard_det is det:
                 continue
             family = self._detection_family_name(det)
-            init_pose = board_pose_camera if board_pose_camera is not None else None
-            pose = None
+            raw_pose = None
             if depth is not None:
                 mesh_family = family if family in {"nic", "sc", "sfp_module"} else None
-                pose = self._cad_estimator.estimate_pose(info, depth, det, mesh_family, init_pose_camera=init_pose)
+                raw_pose = self._cad_estimator.estimate_pose(info, depth, det, mesh_family, init_pose_camera=board_pose_camera)
+
+            pose = None
+            if board_pose_camera is not None:
+                translation_hint = None if raw_pose is None else np.asarray(raw_pose.get("t", None), dtype=np.float32).reshape(3)
+                pose = self._estimate_component_pose_on_board_plane(
+                    info=info,
+                    depth=depth,
+                    det=det,
+                    board_pose_camera=board_pose_camera,
+                    raw_pose_camera=raw_pose,
+                    translation_hint=translation_hint,
+                )
+            elif raw_pose is not None:
+                pose = raw_pose
             if pose is None:
-                pose = self._fallback_pose_from_depth_or_anchor(info, depth, det, init_pose)
+                pose = self._fallback_pose_from_depth_or_anchor(info, depth, det, board_pose_camera)
             if pose is None:
                 continue
             records.append(self._make_pose_record(det, pose, used_tf_names))
@@ -450,7 +476,8 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         R = np.eye(3, dtype=np.float32)
         if init_pose_camera is not None:
             R = np.asarray(init_pose_camera["R"], dtype=np.float32).reshape(3, 3)
-        return {"R": R, "t": t.astype(np.float32), "q": self._matrix_to_quaternion(R), "source": "depth_anchor"}
+        R = self._orthonormalize_rotation(R)
+        return {"R": R.astype(np.float32), "t": t.astype(np.float32), "q": self._matrix_to_quaternion(R), "source": "depth_anchor_board_oriented" if init_pose_camera is not None else "depth_anchor"}
 
     def _backproject_anchor(self, info: CameraInfo, depth: Optional[np.ndarray], anchor_uv: np.ndarray) -> Optional[np.ndarray]:
         u = float(anchor_uv[0])
@@ -553,8 +580,290 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             return None
         R, _ = cv2.Rodrigues(rvec)
         t = np.asarray(tvec, dtype=np.float32).reshape(3)
-        R = np.asarray(R, dtype=np.float32).reshape(3, 3)
+        R = self._orthonormalize_rotation(np.asarray(R, dtype=np.float32).reshape(3, 3))
         return {"R": R, "t": t, "q": self._matrix_to_quaternion(R), "source": "board_pnp"}
+
+    def _estimate_board_pose_geometry(self, info: CameraInfo, depth: Optional[np.ndarray], taskboard_det: Dict, observed_board_quad: Optional[np.ndarray]) -> Optional[Dict]:
+        if depth is None:
+            return self._estimate_board_pose_from_quad(info, observed_board_quad) if observed_board_quad is not None else None
+        pts = self._depth_points_from_region(info, depth, taskboard_det, observed_board_quad)
+        if pts is None or len(pts) < 80:
+            return self._estimate_board_pose_from_quad(info, observed_board_quad) if observed_board_quad is not None else None
+        plane = self._fit_dominant_plane_ransac(pts)
+        if plane is None:
+            return self._estimate_board_pose_from_quad(info, observed_board_quad) if observed_board_quad is not None else None
+        normal, plane_point, plane_pts = plane
+        quad3d = None
+        if observed_board_quad is not None:
+            quad3d = self._lift_quad_to_plane(info, observed_board_quad, normal, plane_point)
+        if quad3d is not None:
+            centroid = quad3d.mean(axis=0).astype(np.float32)
+            x_hint = (quad3d[1] - quad3d[0]) + (quad3d[2] - quad3d[3])
+            y_hint = (quad3d[3] - quad3d[0]) + (quad3d[2] - quad3d[1])
+            x_axis = self._normalize_vec(self._project_vec_to_plane(x_hint, normal))
+            y_axis = self._normalize_vec(self._project_vec_to_plane(y_hint, normal))
+            if x_axis is not None and y_axis is not None and float(np.dot(np.cross(x_axis, y_axis), normal)) < 0.0:
+                x_axis = -x_axis
+        else:
+            centroid = np.median(plane_pts, axis=0).astype(np.float32)
+            x_axis = self._board_x_axis_from_image(info, centroid, normal, observed_board_quad, taskboard_det)
+            y_axis = None
+        if x_axis is None:
+            x_axis = self._board_x_axis_from_image(info, centroid, normal, observed_board_quad, taskboard_det)
+        if x_axis is None:
+            x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            x_axis = self._normalize_vec(self._project_vec_to_plane(x_axis, normal))
+        if x_axis is None:
+            return None
+        y_axis = self._normalize_vec(np.cross(normal, x_axis))
+        if y_axis is None:
+            return None
+        x_axis = self._normalize_vec(np.cross(y_axis, normal))
+        if x_axis is None:
+            return None
+        R = self._orthonormalize_rotation(np.column_stack([x_axis, y_axis, normal]).astype(np.float32))
+        return {"R": R, "t": centroid.astype(np.float32), "q": self._matrix_to_quaternion(R), "source": "board_depth_plane_ransac"}
+
+    def _depth_points_from_region(self, info: CameraInfo, depth: np.ndarray, det: Dict, quad: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        h, w = depth.shape[:2]
+        if quad is not None:
+            quad_i = np.round(np.asarray(quad, dtype=np.float32)).astype(np.int32).reshape(-1, 2)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, quad_i, 255)
+        else:
+            box = det.get("bbox_xyxy", [0, 0, 0, 0])
+            x1, y1, x2, y2 = [float(v) for v in box]
+            bw = max(2.0, x2 - x1)
+            bh = max(2.0, y2 - y1)
+            ix1 = int(np.clip(np.floor(x1 + 0.05 * bw), 0, w - 1))
+            iy1 = int(np.clip(np.floor(y1 + 0.05 * bh), 0, h - 1))
+            ix2 = int(np.clip(np.ceil(x2 - 0.05 * bw), ix1 + 1, w))
+            iy2 = int(np.clip(np.ceil(y2 - 0.05 * bh), iy1 + 1, h))
+            mask = np.zeros((h, w), dtype=np.uint8)
+            mask[iy1:iy2, ix1:ix2] = 255
+        z = np.asarray(depth, dtype=np.float32)
+        valid = (mask > 0) & np.isfinite(z) & (z > 0.05) & (z < 3.0)
+        if not np.any(valid):
+            return None
+        valid_z = z[valid]
+        z_med = float(np.median(valid_z))
+        z_mad = float(np.median(np.abs(valid_z - z_med)))
+        z_band = max(0.015, 3.0 * z_mad)
+        valid &= (z >= z_med - z_band) & (z <= z_med + z_band)
+        ys, xs = np.where(valid)
+        if xs.size < 30:
+            return None
+        fx = float(info.k[0])
+        fy = float(info.k[4])
+        cx = float(info.k[2])
+        cy = float(info.k[5])
+        if fx <= 1e-6 or fy <= 1e-6:
+            return None
+        zs = z[ys, xs].astype(np.float32)
+        X = (xs.astype(np.float32) - cx) * zs / fx
+        Y = (ys.astype(np.float32) - cy) * zs / fy
+        pts = np.column_stack([X, Y, zs]).astype(np.float32)
+        centroid = np.median(pts, axis=0)
+        dist = np.linalg.norm(pts - centroid.reshape(1, 3), axis=1)
+        pts = pts[dist <= np.percentile(dist, 94.0)]
+        return pts.astype(np.float32) if len(pts) >= 30 else None
+
+    def _fit_dominant_plane_ransac(self, pts: np.ndarray, iterations: int = 120, threshold_m: float = 0.008) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        pts = np.asarray(pts, dtype=np.float32)
+        if pts.shape[0] < 40:
+            return None
+        rng = np.random.default_rng(12345)
+        best_inliers = None
+        best_normal = None
+        best_point = None
+        n_pts = pts.shape[0]
+        for _ in range(iterations):
+            idx = rng.choice(n_pts, size=3, replace=False)
+            p0, p1, p2 = pts[idx]
+            normal = np.cross(p1 - p0, p2 - p0)
+            normal = self._normalize_vec(normal)
+            if normal is None:
+                continue
+            d = np.abs((pts - p0.reshape(1, 3)) @ normal.reshape(3, 1)).reshape(-1)
+            inliers = d < threshold_m
+            if best_inliers is None or int(np.count_nonzero(inliers)) > int(np.count_nonzero(best_inliers)):
+                best_inliers = inliers
+                best_normal = normal
+                best_point = p0
+        if best_inliers is None or int(np.count_nonzero(best_inliers)) < 40:
+            return None
+        inlier_pts = pts[best_inliers]
+        center = np.median(inlier_pts, axis=0)
+        X = inlier_pts - center.reshape(1, 3)
+        cov = np.cov(X.T)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        normal = eigvecs[:, np.argmin(eigvals)].astype(np.float32)
+        if float(np.dot(normal, center)) > 0.0:
+            normal = -normal
+        normal = self._normalize_vec(normal)
+        if normal is None:
+            return None
+        dist = np.abs((pts - center.reshape(1, 3)) @ normal.reshape(3, 1)).reshape(-1)
+        inlier_pts = pts[dist < threshold_m]
+        if len(inlier_pts) < 40:
+            return None
+        plane_point = np.median(inlier_pts, axis=0).astype(np.float32)
+        return normal.astype(np.float32), plane_point, inlier_pts.astype(np.float32)
+
+    def _lift_quad_to_plane(self, info: CameraInfo, quad_uv: np.ndarray, normal: np.ndarray, plane_point: np.ndarray) -> Optional[np.ndarray]:
+        quad_uv = np.asarray(quad_uv, dtype=np.float32).reshape(4, 2)
+        pts = []
+        for uv in quad_uv:
+            ray = self._ray_from_pixel(info, float(uv[0]), float(uv[1]))
+            if ray is None:
+                return None
+            denom = float(np.dot(normal, ray))
+            if abs(denom) < 1e-6:
+                return None
+            t = float(np.dot(normal, plane_point) / denom)
+            if t <= 0.01:
+                return None
+            pts.append((ray * t).astype(np.float32))
+        pts = np.asarray(pts, dtype=np.float32)
+        return pts if pts.shape == (4, 3) else None
+
+    def _board_x_axis_from_image(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, quad: Optional[np.ndarray], taskboard_det: Dict) -> Optional[np.ndarray]:
+        if quad is not None:
+            quad = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+            top_edge = quad[1] - quad[0]
+            bottom_edge = quad[2] - quad[3]
+            uv_dir = top_edge + bottom_edge
+            if float(np.linalg.norm(uv_dir)) < 1e-6:
+                uv_dir = quad[1] - quad[0]
+            center_uv = quad.mean(axis=0)
+            return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
+        box = np.asarray(taskboard_det.get("bbox_xyxy", [0, 0, 0, 0]), dtype=np.float32)
+        center_uv = np.array([(box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5], dtype=np.float32)
+        uv_dir = np.array([1.0, 0.0], dtype=np.float32)
+        return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
+
+    def _image_dir_to_plane_axis(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, center_uv: np.ndarray, uv_dir: np.ndarray) -> Optional[np.ndarray]:
+        uv_dir = np.asarray(uv_dir, dtype=np.float32).reshape(2)
+        nrm = float(np.linalg.norm(uv_dir))
+        if nrm < 1e-6:
+            return None
+        uv_dir = uv_dir / nrm
+        p0 = self._ray_from_pixel(info, float(center_uv[0]), float(center_uv[1]))
+        p1 = self._ray_from_pixel(info, float(center_uv[0] + 8.0 * uv_dir[0]), float(center_uv[1] + 8.0 * uv_dir[1]))
+        if p0 is None or p1 is None:
+            return None
+        axis = p1 - p0
+        axis = self._project_vec_to_plane(axis, normal)
+        return self._normalize_vec(axis)
+
+    def _ray_from_pixel(self, info: CameraInfo, u: float, v: float) -> Optional[np.ndarray]:
+        fx = float(info.k[0])
+        fy = float(info.k[4])
+        cx = float(info.k[2])
+        cy = float(info.k[5])
+        if fx <= 1e-6 or fy <= 1e-6:
+            return None
+        ray = np.array([(u - cx) / fx, (v - cy) / fy, 1.0], dtype=np.float32)
+        return self._normalize_vec(ray)
+
+    def _project_vec_to_plane(self, v: np.ndarray, normal: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float32).reshape(3)
+        n = np.asarray(normal, dtype=np.float32).reshape(3)
+        return v - n * float(np.dot(v, n))
+
+    def _normalize_vec(self, v: np.ndarray) -> Optional[np.ndarray]:
+        v = np.asarray(v, dtype=np.float32).reshape(3)
+        n = float(np.linalg.norm(v))
+        if n < 1e-6:
+            return None
+        return (v / n).astype(np.float32)
+
+    def _orthonormalize_rotation(self, R: np.ndarray) -> np.ndarray:
+        U, _, Vt = np.linalg.svd(np.asarray(R, dtype=np.float32).reshape(3, 3))
+        Rn = U @ Vt
+        if np.linalg.det(Rn) < 0.0:
+            U[:, -1] *= -1.0
+            Rn = U @ Vt
+        return np.asarray(Rn, dtype=np.float32)
+
+    def _bbox_long_axis_on_plane(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, det: Dict) -> Optional[np.ndarray]:
+        box = np.asarray(det.get("bbox_xyxy", [0, 0, 0, 0]), dtype=np.float32)
+        if box.size != 4:
+            return None
+        x1, y1, x2, y2 = [float(v) for v in box]
+        if (x2 - x1) >= (y2 - y1):
+            center_uv = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+            uv_dir = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            center_uv = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+            uv_dir = np.array([0.0, 1.0], dtype=np.float32)
+        return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
+
+    def _principal_axis_from_points_on_plane(self, pts: np.ndarray, normal: np.ndarray, fallback_axis: np.ndarray) -> Optional[np.ndarray]:
+        pts = np.asarray(pts, dtype=np.float32)
+        if pts.shape[0] < 12:
+            return None
+        center = np.median(pts, axis=0)
+        X = pts - center.reshape(1, 3)
+        X = X - (X @ normal.reshape(3, 1)) * normal.reshape(1, 3)
+        cov = np.cov(X.T)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        axis = eigvecs[:, np.argmax(eigvals)].astype(np.float32)
+        axis = self._normalize_vec(self._project_vec_to_plane(axis, normal))
+        if axis is None:
+            return None
+        fallback_axis = self._normalize_vec(self._project_vec_to_plane(fallback_axis, normal))
+        if fallback_axis is not None and float(np.dot(axis, fallback_axis)) < 0.0:
+            axis = -axis
+        return axis.astype(np.float32)
+
+    def _estimate_component_pose_on_board_plane(self, info: CameraInfo, depth: Optional[np.ndarray], det: Dict, board_pose_camera: Dict, raw_pose_camera: Optional[Dict] = None, translation_hint: Optional[np.ndarray] = None) -> Optional[Dict]:
+        if board_pose_camera is None:
+            return None
+        Rb = np.asarray(board_pose_camera["R"], dtype=np.float32).reshape(3, 3)
+        board_x = Rb[:, 0]
+        board_y = Rb[:, 1]
+        normal = Rb[:, 2]
+        pts = None if depth is None else self._depth_points_from_region(info, depth, det, None)
+        if translation_hint is not None:
+            t = np.asarray(translation_hint, dtype=np.float32).reshape(3)
+        elif pts is not None and len(pts) >= 12:
+            t = np.median(pts, axis=0).astype(np.float32)
+        else:
+            family = self._detection_family_name(det)
+            anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
+            anchor = self._detection_anchor_point(det, anchor_key)
+            t = self._backproject_anchor(info, depth, anchor)
+        if t is None:
+            return None
+
+        raw_axis = None
+        if raw_pose_camera is not None and raw_pose_camera.get("R", None) is not None:
+            raw_axis = np.asarray(raw_pose_camera["R"], dtype=np.float32).reshape(3, 3)[:, 0]
+        if raw_axis is None:
+            raw_axis = board_x
+
+        x_axis = None
+        if pts is not None and len(pts) >= 12:
+            x_axis = self._principal_axis_from_points_on_plane(pts, normal, raw_axis)
+        if x_axis is None:
+            x_axis = self._bbox_long_axis_on_plane(info, t, normal, det)
+        if x_axis is None and raw_axis is not None:
+            x_axis = self._normalize_vec(self._project_vec_to_plane(raw_axis, normal))
+        if x_axis is None:
+            x_axis = board_x
+        if float(np.dot(x_axis, board_x)) < 0.0:
+            x_axis = -x_axis
+        y_axis = self._normalize_vec(np.cross(normal, x_axis))
+        if y_axis is None:
+            y_axis = board_y
+        if float(np.dot(y_axis, board_y)) < 0.0:
+            y_axis = -y_axis
+        x_axis = self._normalize_vec(np.cross(y_axis, normal))
+        if x_axis is None:
+            x_axis = board_x
+        R = self._orthonormalize_rotation(np.column_stack([x_axis, y_axis, normal]).astype(np.float32))
+        return {"R": R, "t": t.astype(np.float32), "q": self._matrix_to_quaternion(R), "source": "board_plane_component"}
 
     def _transform_pose_dict(self, pose: Optional[Dict], source_frame: str, target_frame: str) -> Optional[Dict]:
         if pose is None:
@@ -583,6 +892,46 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         R_tgt = R_tf @ R_src
         t_tgt = R_tf @ t_src + t_tf
         return {"R": R_tgt.astype(np.float32), "t": t_tgt.astype(np.float32), "q": self._matrix_to_quaternion(R_tgt)}
+
+    def _maybe_constrain_pose_to_table_plane(self, det: Dict, pose_base: Dict) -> Dict:
+        if not self._force_table_flat:
+            return pose_base
+        family = self._detection_family_name(det)
+        if family not in self._table_constrained_families:
+            return pose_base
+
+        R = np.asarray(pose_base.get("R"), dtype=np.float32).reshape(3, 3)
+        t = np.asarray(pose_base.get("t"), dtype=np.float32).reshape(3)
+
+        world_up = self._table_normal_base.astype(np.float32)
+        z_axis = R[:, 2].astype(np.float32)
+        if float(np.dot(z_axis, world_up)) < 0.0:
+            world_up = -world_up
+
+        x_hint = self._project_vec_to_plane(R[:, 0], world_up)
+        x_axis = self._normalize_vec(x_hint)
+        if x_axis is None:
+            y_hint = self._project_vec_to_plane(R[:, 1], world_up)
+            y_axis = self._normalize_vec(y_hint)
+            if y_axis is None:
+                return pose_base
+            x_axis = self._normalize_vec(np.cross(y_axis, world_up))
+            if x_axis is None:
+                return pose_base
+        y_axis = self._normalize_vec(np.cross(world_up, x_axis))
+        if y_axis is None:
+            return pose_base
+        x_axis = self._normalize_vec(np.cross(y_axis, world_up))
+        if x_axis is None:
+            return pose_base
+
+        R_flat = self._orthonormalize_rotation(np.column_stack([x_axis, y_axis, world_up]).astype(np.float32))
+        return {
+            "R": R_flat.astype(np.float32),
+            "t": t.astype(np.float32),
+            "q": self._matrix_to_quaternion(R_flat),
+            "source": str(pose_base.get("source", "")) + "+table_flat",
+        }
 
     def _pose_dict_to_msg(self, pose: Dict) -> Pose:
         msg = Pose()

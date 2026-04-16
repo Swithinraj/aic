@@ -749,6 +749,7 @@ class YoloV12MultiCameraDetector(Node):
                     "projected_sc": [],
                     "projected_nic": [],
                     "projected_board_quad": None,
+                    "observed_board_quad": None,
                     "fused_targets": fused_targets,
                     "fix_locked": False,
                 }
@@ -763,6 +764,7 @@ class YoloV12MultiCameraDetector(Node):
                     "projected_sc": [],
                     "projected_nic": [],
                     "projected_board_quad": fallback_board_quad.astype(np.float32),
+                    "observed_board_quad": fallback_board_quad.astype(np.float32),
                     "fused_targets": fused_targets,
                     "fix_locked": False,
                 }
@@ -777,6 +779,7 @@ class YoloV12MultiCameraDetector(Node):
                     "projected_sc": [],
                     "projected_nic": [],
                     "projected_board_quad": fallback_board_quad.astype(np.float32),
+                    "observed_board_quad": fallback_board_quad.astype(np.float32),
                     "fused_targets": fused_targets,
                     "fix_locked": False,
                 }
@@ -818,6 +821,7 @@ class YoloV12MultiCameraDetector(Node):
                 "projected_sc": projected_sc,
                 "projected_nic": projected_nic,
                 "projected_board_quad": projected_board_quad,
+                "observed_board_quad": fallback_board_quad.astype(np.float32),
                 "fused_targets": fused_targets,
                 "fix_locked": True,
             }
