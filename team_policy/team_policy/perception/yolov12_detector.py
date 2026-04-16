@@ -1002,7 +1002,9 @@ class YoloV12MultiCameraDetector(Node):
         scored.sort(key=lambda item: item[0])
 
         if len(scored) >= 2:
-            for idx, (_, det) in enumerate(scored[: self._max_sfp_ports]):
+            top_scored = scored[: self._max_sfp_ports]
+            top_scored.reverse()
+            for idx, (_, det) in enumerate(top_scored):
                 name = f"sfp_port_{idx}"
                 det["class_name"] = name
                 det["instance_name"] = name

@@ -429,17 +429,19 @@ class MotionServoNode(Node):
 
 
 class mypolicy(Policy):
-    SERVO_HOVER_Z = 0.06
+    PIXEL_CORRECTION_ENABLED = True
+    SERVO_HOVER_Z = 0.0
+    PATH_SETTLE_SEC = 1.0
     SERVO_WORLD_TOLERANCE = 0.003
-    SERVO_MAX_ITERATIONS = 180
-    SERVO_GAIN_XY = 1.20
-    SERVO_GAIN_Z = 0.35
-    SERVO_STEP_SEC = 0.10
-    SERVO_TIMEOUT_SEC = 28.0
+    SERVO_MAX_ITERATIONS = 240
+    SERVO_GAIN_XY = 0.002
+    SERVO_GAIN_Z = 0.008
+    SERVO_STEP_SEC = 0.12
+    SERVO_TIMEOUT_SEC = 90.0
 
-    SERVO_DLS_DAMPING = 1.5
-    SERVO_MAX_LINEAR_SPEED_XY = 0.030
-    SERVO_MAX_LINEAR_SPEED_Z = 0.008
+    SERVO_DLS_DAMPING = 2.5
+    SERVO_MAX_LINEAR_SPEED_XY = 0.0010
+    SERVO_MAX_LINEAR_SPEED_Z = 0.0003
     SERVO_MIN_LINEAR_SPEED_XY = 0.0
     SERVO_CONVERGED_PX = 22.0
     SERVO_CONVERGED_PX_STABLE_COUNT = 4
@@ -449,6 +451,10 @@ class mypolicy(Policy):
     SERVO_MAX_YAW_RATE = 0.30
     SERVO_MIN_CONFIDENCE = 0.20
     SERVO_LAST_VALID_PAIR_SEC = 0.60
+
+    SAMPLE_VERIFY_GOAL_LOST_MAX_COUNT = 4
+    SAMPLE_VERIFY_GOAL_VISIBILITY_FRESHNESS_SEC = 1.0
+    SAMPLE_VERIFY_IMAGE_MARGIN_PX = 2.0
 
     INSERT_Z_STEP = 0.001
     INSERT_MAX_LATERAL_FORCE = 15.0
@@ -498,9 +504,80 @@ class mypolicy(Policy):
 
         self.get_logger().info("mypolicy.__init__()")
         self.get_logger().info("Started internal CombinedYoloDepthPosePlanner, detection listener, and motion servo.")
+        self.get_logger().info(f"Pixel correction enabled: {self.PIXEL_CORRECTION_ENABLED}")
 
     def _annotated_img_cb(self, cam_name: str, msg: Image):
         self._annotated_images[cam_name] = msg
+
+    def _camera_image_size(self, camera_name: str) -> Optional[tuple[int, int]]:
+        msg = self._annotated_images.get(camera_name)
+        if msg is not None:
+            try:
+                width = int(getattr(msg, "width", 0))
+                height = int(getattr(msg, "height", 0))
+                if width > 0 and height > 0:
+                    return width, height
+            except Exception:
+                pass
+
+        try:
+            with self._detection_node._lock:
+                info = self._detection_node._latest_infos.get(camera_name)
+            if info is not None:
+                width = int(getattr(info, "width", 0))
+                height = int(getattr(info, "height", 0))
+                if width > 0 and height > 0:
+                    return width, height
+        except Exception:
+            pass
+        return None
+
+    def _uv_inside_image(self, camera_name: str, uv: Optional[np.ndarray], margin_px: Optional[float] = None) -> bool:
+        if uv is None:
+            return False
+        size = self._camera_image_size(camera_name)
+        if size is None:
+            return True
+        width, height = size
+        margin = float(self.SAMPLE_VERIFY_IMAGE_MARGIN_PX if margin_px is None else margin_px)
+        u = float(uv[0])
+        v = float(uv[1])
+        return (-margin <= u <= float(width) + margin) and (-margin <= v <= float(height) + margin)
+
+    def _detection_intersects_image(self, camera_name: str, det: Optional[Dict], margin_px: Optional[float] = None) -> bool:
+        if det is None:
+            return False
+        size = self._camera_image_size(camera_name)
+        if size is None:
+            return True
+        width, height = size
+        margin = float(self.SAMPLE_VERIFY_IMAGE_MARGIN_PX if margin_px is None else margin_px)
+
+        bbox = det.get("bbox_xyxy", [])
+        if isinstance(bbox, list) and len(bbox) == 4:
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+                return not (x2 < -margin or x1 > float(width) + margin or y2 < -margin or y1 > float(height) + margin)
+            except Exception:
+                pass
+
+        return self._uv_inside_image(camera_name, self._feature_uv(det), margin_px=margin)
+
+    def _goal_feature_visible_cameras(self, matcher: Callable[[Dict], bool], freshness_sec: Optional[float] = None) -> List[str]:
+        freshness = self.SAMPLE_VERIFY_GOAL_VISIBILITY_FRESHNESS_SEC if freshness_sec is None else float(freshness_sec)
+        visible_cameras: List[str] = []
+
+        for cam in ("left", "center", "right"):
+            cam_dets = self._detection_listener.get_camera_detections(cam, freshness_sec=freshness)
+            goal_dets = [
+                d for d in cam_dets
+                if matcher(d) and float(d.get("confidence", 0.0)) >= self.SERVO_MIN_CONFIDENCE
+            ]
+            goal_dets.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+            if any(self._detection_intersects_image(cam, det) for det in goal_dets):
+                visible_cameras.append(cam)
+
+        return visible_cameras
 
     # ==================================================================
     # Main entry point — insert_cable
@@ -593,8 +670,8 @@ class mypolicy(Policy):
             label="hover_above_port",
             matcher=port_matcher,
             gripper_orientation=gripper_orientation,
-            z_offset=self.SERVO_HOVER_Z,
-            min_z=0.20,
+            z_offset=0.0,
+            min_z=0.0,
             get_observation=get_observation,
             send_feedback=send_feedback,
             timeout_sec=60.0,
@@ -602,22 +679,27 @@ class mypolicy(Policy):
             send_feedback("mypolicy/fail hover_pose_failed")
             return False
 
-        self.sleep_for(0.5)
+        self._motion_servo.stop()
+        send_feedback("mypolicy/phase1_path_complete")
+        self.sleep_for(self.PATH_SETTLE_SEC)
 
-        # ====== PHASE 2: Visual servoing alignment ======
-        send_feedback("mypolicy/phase2_visual_servo_start")
-        servo_ok = self._sfp_visual_servo_align(
-            port_matcher=port_matcher,
-            port_label=port_label,
-            gripper_orientation=gripper_orientation,
-            send_feedback=send_feedback,
-        )
-        if not servo_ok:
-            send_feedback("mypolicy/phase2_servo_failed (stopping before insertion)")
-            self._motion_servo.stop()
-            return False
+        # ====== PHASE 2: Pixel correction / visual servoing ======
+        if self.PIXEL_CORRECTION_ENABLED:
+            send_feedback("mypolicy/phase2_visual_servo_start")
+            servo_ok = self._sfp_visual_servo_align(
+                port_matcher=port_matcher,
+                port_label=port_label,
+                gripper_orientation=gripper_orientation,
+                send_feedback=send_feedback,
+            )
+            if not servo_ok:
+                send_feedback("mypolicy/phase2_servo_failed (stopping before insertion)")
+                self._motion_servo.stop()
+                return False
 
-        self.sleep_for(0.5)
+            self.sleep_for(0.5)
+        else:
+            send_feedback("mypolicy/phase2_visual_servo_disabled")
 
         # ====== PHASE 3: Force-feedback insertion ======
         send_feedback("mypolicy/phase3_force_insertion_start")
@@ -651,6 +733,7 @@ class mypolicy(Policy):
         best_metric_error = float("inf")
         stable_count = 0
         last_valid_pairs: Dict[str, Dict] = {}
+        goal_lost_all_count = 0
 
         for iteration in range(self.SERVO_MAX_ITERATIONS):
             if time.monotonic() > deadline:
@@ -663,12 +746,25 @@ class mypolicy(Policy):
                 self.sleep_for(self.SERVO_STEP_SEC)
                 continue
 
+            visible_goal_cameras = self._goal_feature_visible_cameras(port_matcher, freshness_sec=0.80)
+            if visible_goal_cameras:
+                goal_lost_all_count = 0
+            else:
+                goal_lost_all_count += 1
+                self._motion_servo.stop()
+                send_feedback(
+                    f"mypolicy/servo_goal_out_of_all_cameras lost_count={goal_lost_all_count}/{self.SAMPLE_VERIFY_GOAL_LOST_MAX_COUNT}"
+                )
+                if goal_lost_all_count >= self.SAMPLE_VERIFY_GOAL_LOST_MAX_COUNT:
+                    send_feedback("mypolicy/servo_replan_goal_out_of_all_cameras")
+                    return False
+                self.sleep_for(self.SERVO_STEP_SEC)
+                continue
+
             J_rows = []
             e_rows = []
             per_cam_errors = []
             used_cameras = []
-            best_fallback_port = None
-            best_fallback_conf = -1.0
             now = time.monotonic()
 
             for cam in ("left", "center", "right"):
@@ -685,12 +781,6 @@ class mypolicy(Policy):
 
                 port_det = max(port_cands, key=lambda d: float(d.get("confidence", 0.0))) if port_cands else None
                 plug_det = max(plug_cands, key=lambda d: float(d.get("confidence", 0.0))) if plug_cands else None
-
-                if port_det is not None:
-                    conf = float(port_det.get("confidence", 0.0))
-                    if conf > best_fallback_conf:
-                        best_fallback_conf = conf
-                        best_fallback_port = port_det
 
                 if port_det is not None and plug_det is not None:
                     last_valid_pairs[cam] = {
@@ -729,110 +819,81 @@ class mypolicy(Policy):
                 per_cam_errors.append(float(px_err))
                 used_cameras.append(cam)
 
-            if J_rows:
-                if len(used_cameras) >= 2:
-                    J = np.vstack(J_rows)
-                    e = np.vstack(e_rows)
-
-                    H = J.T @ J + (self.SERVO_DLS_DAMPING ** 2) * np.eye(3, dtype=np.float64)
-                    g = J.T @ e
-
-                    try:
-                        v_cmd = -np.linalg.solve(H, g).reshape(3)
-                    except np.linalg.LinAlgError:
-                        v_cmd = -(np.linalg.pinv(J) @ e).reshape(3)
-
-                    vx = float(self.SERVO_GAIN_XY * v_cmd[0])
-                    vy = float(self.SERVO_GAIN_XY * v_cmd[1])
-                    vz_raw = float(self.SERVO_GAIN_Z * v_cmd[2])
-                else:
-                    J2 = np.asarray(J_rows[0][:, :2], dtype=np.float64)
-                    e2 = np.asarray(e_rows[0], dtype=np.float64)
-                    H2 = J2.T @ J2 + (self.SERVO_DLS_DAMPING ** 2) * np.eye(2, dtype=np.float64)
-                    g2 = J2.T @ e2
-                    try:
-                        vxy_cmd = -np.linalg.solve(H2, g2).reshape(2)
-                    except np.linalg.LinAlgError:
-                        vxy_cmd = -(np.linalg.pinv(J2) @ e2).reshape(2)
-                    vx = float(self.SERVO_GAIN_XY * vxy_cmd[0])
-                    vy = float(self.SERVO_GAIN_XY * vxy_cmd[1])
-                    vz_raw = 0.0
-
-                v_xy = np.asarray([vx, vy], dtype=np.float64)
-                speed_xy = float(np.linalg.norm(v_xy))
-                if speed_xy > self.SERVO_MAX_LINEAR_SPEED_XY:
-                    v_xy *= self.SERVO_MAX_LINEAR_SPEED_XY / speed_xy
-
-                avg_px_error = float(sum(per_cam_errors) / len(per_cam_errors))
-                metric_px_error = float(max(per_cam_errors))
-                best_metric_error = min(best_metric_error, metric_px_error)
-
-                if len(used_cameras) >= 2 and metric_px_error <= self.SERVO_Z_ENABLE_PX:
-                    vz = float(np.clip(vz_raw, -self.SERVO_MAX_LINEAR_SPEED_Z, self.SERVO_MAX_LINEAR_SPEED_Z))
-                else:
-                    vz = 0.0
-
-                if metric_px_error <= self.SERVO_CONVERGED_PX:
-                    stable_count += 1
-                else:
-                    stable_count = 0
-
+            if not J_rows:
+                self._motion_servo.stop()
                 send_feedback(
-                    f"mypolicy/servo_iter_{iteration} cams={used_cameras} "
-                    f"px_err_max={metric_px_error:.1f} px_err_avg={avg_px_error:.1f} "
-                    f"vx={v_xy[0]:.4f} vy={v_xy[1]:.4f} vz={vz:.4f}"
+                    f"mypolicy/servo_iter_{iteration} waiting_for_valid_port_and_plug visible_goal_cams={visible_goal_cameras}"
                 )
-
-                if stable_count >= self.SERVO_CONVERGED_PX_STABLE_COUNT:
-                    self._motion_servo.stop()
-                    send_feedback(f"mypolicy/servo_converged px_err={metric_px_error:.1f}")
-                    return True
-
-                twist = Twist()
-                twist.linear.x = float(v_xy[0])
-                twist.linear.y = float(v_xy[1])
-                twist.linear.z = float(vz)
-                twist.angular.x = 0.0
-                twist.angular.y = 0.0
-                twist.angular.z = 0.0
-
-                self._motion_servo.publish_twist_command(twist)
                 self.sleep_for(self.SERVO_STEP_SEC)
                 continue
 
-            self._motion_servo.stop()
+            if len(used_cameras) >= 2:
+                J = np.vstack(J_rows)
+                e = np.vstack(e_rows)
 
-            if best_fallback_port is not None:
-                fallback_pose = self._pose_from_detection(best_fallback_port)
-                if fallback_pose is not None:
-                    world_dx = float(fallback_pose.position.x) - float(current_pose.position.x)
-                    world_dy = float(fallback_pose.position.y) - float(current_pose.position.y)
-                    world_dist = math.sqrt(world_dx * world_dx + world_dy * world_dy)
+                H = J.T @ J + (self.SERVO_DLS_DAMPING ** 2) * np.eye(3, dtype=np.float64)
+                g = J.T @ e
 
-                    send_feedback(f"mypolicy/servo_iter_{iteration} fallback_to_port err={world_dist*1000.0:.1f}mm")
+                try:
+                    v_cmd = -np.linalg.solve(H, g).reshape(3)
+                except np.linalg.LinAlgError:
+                    v_cmd = -(np.linalg.pinv(J) @ e).reshape(3)
 
-                    if world_dist <= self.SERVO_WORLD_TOLERANCE:
-                        self._motion_servo.stop()
-                        send_feedback(f"mypolicy/servo_converged_fallback err={world_dist*1000.0:.1f}mm")
-                        return True
+                vx = float(self.SERVO_GAIN_XY * v_cmd[0])
+                vy = float(self.SERVO_GAIN_XY * v_cmd[1])
+                vz_raw = float(self.SERVO_GAIN_Z * v_cmd[2])
+            else:
+                J2 = np.asarray(J_rows[0][:, :2], dtype=np.float64)
+                e2 = np.asarray(e_rows[0], dtype=np.float64)
+                H2 = J2.T @ J2 + (self.SERVO_DLS_DAMPING ** 2) * np.eye(2, dtype=np.float64)
+                g2 = J2.T @ e2
+                try:
+                    vxy_cmd = -np.linalg.solve(H2, g2).reshape(2)
+                except np.linalg.LinAlgError:
+                    vxy_cmd = -(np.linalg.pinv(J2) @ e2).reshape(2)
+                vx = float(self.SERVO_GAIN_XY * vxy_cmd[0])
+                vy = float(self.SERVO_GAIN_XY * vxy_cmd[1])
+                vz_raw = 0.0
 
-                    cmd = np.asarray([world_dx, world_dy], dtype=np.float64) * 0.45
-                    mag = float(np.linalg.norm(cmd))
-                    if mag > self.SERVO_MAX_LINEAR_SPEED_XY:
-                        cmd *= self.SERVO_MAX_LINEAR_SPEED_XY / mag
+            v_xy = np.asarray([vx, vy], dtype=np.float64)
+            speed_xy = float(np.linalg.norm(v_xy))
+            if speed_xy > self.SERVO_MAX_LINEAR_SPEED_XY:
+                v_xy *= self.SERVO_MAX_LINEAR_SPEED_XY / speed_xy
 
-                    twist = Twist()
-                    twist.linear.x = float(cmd[0])
-                    twist.linear.y = float(cmd[1])
-                    twist.linear.z = 0.0
-                    twist.angular.x = 0.0
-                    twist.angular.y = 0.0
-                    twist.angular.z = 0.0
-                    self._motion_servo.publish_twist_command(twist)
-                    self.sleep_for(self.SERVO_STEP_SEC)
-                    continue
+            avg_px_error = float(sum(per_cam_errors) / len(per_cam_errors))
+            metric_px_error = float(max(per_cam_errors))
+            best_metric_error = min(best_metric_error, metric_px_error)
 
-            send_feedback(f"mypolicy/servo_iter_{iteration} waiting_for_valid_port_and_plug")
+            if len(used_cameras) >= 2 and metric_px_error <= self.SERVO_Z_ENABLE_PX:
+                vz = float(np.clip(vz_raw, -self.SERVO_MAX_LINEAR_SPEED_Z, self.SERVO_MAX_LINEAR_SPEED_Z))
+            else:
+                vz = 0.0
+
+            if metric_px_error <= self.SERVO_CONVERGED_PX:
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            send_feedback(
+                f"mypolicy/servo_iter_{iteration} cams={used_cameras} "
+                f"px_err_max={metric_px_error:.1f} px_err_avg={avg_px_error:.1f} "
+                f"vx={v_xy[0]:.4f} vy={v_xy[1]:.4f} vz={vz:.4f}"
+            )
+
+            if stable_count >= self.SERVO_CONVERGED_PX_STABLE_COUNT:
+                self._motion_servo.stop()
+                send_feedback(f"mypolicy/servo_converged px_err={metric_px_error:.1f}")
+                return True
+
+            twist = Twist()
+            twist.linear.x = float(v_xy[0])
+            twist.linear.y = float(v_xy[1])
+            twist.linear.z = float(vz)
+            twist.angular.x = 0.0
+            twist.angular.y = 0.0
+            twist.angular.z = 0.0
+
+            self._motion_servo.publish_twist_command(twist)
             self.sleep_for(self.SERVO_STEP_SEC)
 
         self._motion_servo.stop()
@@ -1421,33 +1482,29 @@ class mypolicy(Policy):
         timeout_sec: float,
     ) -> bool:
         """
-        State 1: Sample for 15s to find Average port location
-        State 2: Execute trajectory.
-        State 3: Monitor Pixel error continually. If error diverges consistently, abort and repeat State 1.
+        State 1: Sample for 15s to find average port location.
+        State 2: Execute the planned path only.
+        State 3: Replan only if the goal is completely out of frame in all cameras.
+
+        Internal phase time limits are intentionally disabled here.
         """
+        del timeout_sec
         self._motion_servo.ensure_cartesian_mode()
-        total_deadline = time.monotonic() + timeout_sec
-        
-        while time.monotonic() < total_deadline:
-            # ==============================
-            # STATE 1: Sample (15s)
-            # ==============================
+
+        while True:
             send_feedback(f"mypolicy/{label}_sampling (15s)")
             sample_deadline = time.monotonic() + 15.0
-            
+
             positions_x, positions_y, positions_z = [], [], []
-            
+
             while time.monotonic() < sample_deadline:
                 all_dets = self._detection_listener.get_all_detections(freshness_sec=1.0)
                 port_dets = [d for d in all_dets if matcher(d)]
-                
-                # The port is elevated off the board. Using angled cameras (left/right) introduces extreme
-                # projection XY parallax since the homography assumes Z=0 (board surface).
-                # The center camera avoids this completely because it natively points perfectly vertical.
+
                 center_dets = [d for d in port_dets if d.get("camera_name") == "center"]
                 if center_dets:
                     port_dets = center_dets
-                
+
                 for det in port_dets:
                     pose = self._pose_from_detection(det)
                     if pose:
@@ -1460,7 +1517,6 @@ class mypolicy(Policy):
                 send_feedback(f"mypolicy/{label}_sampling_fail: no detections. Retrying.")
                 continue
 
-            # Average out the coordinate noise
             avg_x = sum(positions_x) / len(positions_x)
             avg_y = sum(positions_y) / len(positions_y)
             avg_z = sum(positions_z) / len(positions_z)
@@ -1473,82 +1529,54 @@ class mypolicy(Policy):
             target_pose = self._make_target_pose(raw_target_pose, gripper_orientation, z_offset, min_z)
             send_feedback(f"mypolicy/{label}_sampled_target xyz=({avg_x:.3f},{avg_y:.3f},{avg_z:.3f})")
 
-            # ==============================
-            # STATE 2: Plan
-            # ==============================
             current_pose = self._motion_servo.get_current_pose()
-            if current_pose is None:
-                self.sleep_for(0.5)
-                continue
+            while current_pose is None:
+                self.sleep_for(0.05)
+                current_pose = self._motion_servo.get_current_pose()
 
             waypoints = self._planner.plan_from_current_pose(current_pose, target_pose)
             if not waypoints:
                 waypoints = [target_pose]
-                
+
             self._motion_servo.publish_target_marker(target_pose)
             self._motion_servo.publish_waypoint_visuals(waypoints)
-
-            # ==============================
-            # STATE 3: Move & Monitor
-            # ==============================
             send_feedback(f"mypolicy/{label}_moving")
-            
-            waypoint_idx = 0
-            path_aborted = False
-            last_pixel_error = float('inf')
-            error_increase_count = 0
 
-            while waypoint_idx < len(waypoints) and not path_aborted and time.monotonic() < total_deadline:
+            waypoint_idx = 0
+            goal_feature_lost_count = 0
+
+            while True:
                 current_pose = self._motion_servo.get_current_pose()
                 if current_pose is None:
                     self.sleep_for(0.05)
                     continue
 
-                # ---- Validate Pixel Error ----
-                live_dets = self._detection_listener.get_all_detections(freshness_sec=1.0)
-                port_candidates = sorted([d for d in live_dets if matcher(d)], key=lambda x: -float(x.get("confidence", 0.0)))
-                
-                if port_candidates:
-                    port_det = port_candidates[0]
-                    best_cam = port_det.get("camera_name", "center")
-                    
-                    gripper_candidates = [d for d in live_dets if self._is_gripper_detection(d) and d.get("camera_name") == best_cam]
-                    if gripper_candidates:
-                        gripper_det = sorted(gripper_candidates, key=lambda x: -float(x.get("confidence", 0.0)))[0]
-                        port_uv = self._feature_uv(port_det)
-                        grip_uv = self._feature_uv(gripper_det)
-                        if port_uv is None or grip_uv is None:
-                            self.sleep_for(0.05)
-                            continue
-
-                        du = float(port_uv[0]) - float(grip_uv[0])
-                        dv = float(port_uv[1]) - float(grip_uv[1])
-                        pixel_error = math.sqrt(du*du + dv*dv)
-                        
-                        # Monitor if it is strictly reducing (with a 3px noise margin)
-                        prev_pixel_error = last_pixel_error
-                        if prev_pixel_error != float('inf') and pixel_error > prev_pixel_error + 20.0:
-                            error_increase_count += 1
-                        else:
-                            error_increase_count = max(0, error_increase_count - 1)
-                        last_pixel_error = pixel_error
-
-                        if error_increase_count > 5:
-                            send_feedback(f"mypolicy/abort_increase_err ({prev_pixel_error:.1f}px -> {pixel_error:.1f}px)")
-                            self._motion_servo.stop()
-                            path_aborted = True
-                            break
-
-                # ---- Servo Execution ----
                 if self._position_distance(current_pose, target_pose) <= self._motion_servo.position_tolerance:
                     self._motion_servo.stop()
+                    send_feedback(f"mypolicy/{label}_path_complete")
                     return True
 
-                current_wp = waypoints[waypoint_idx]
-                if self._position_distance(current_pose, current_wp) <= self._motion_servo.position_tolerance:
-                    if waypoint_idx < len(waypoints) - 1:
+                visible_goal_cameras = self._goal_feature_visible_cameras(matcher, freshness_sec=1.0)
+                if visible_goal_cameras:
+                    goal_feature_lost_count = 0
+                else:
+                    goal_feature_lost_count += 1
+                    self._motion_servo.stop()
+                    send_feedback(
+                        f"mypolicy/{label}_goal_out_of_all_cameras lost_count={goal_feature_lost_count}/{self.SAMPLE_VERIFY_GOAL_LOST_MAX_COUNT}"
+                    )
+                    if goal_feature_lost_count >= self.SAMPLE_VERIFY_GOAL_LOST_MAX_COUNT:
+                        send_feedback(f"mypolicy/{label}_replan_goal_out_of_all_cameras")
+                        break
+                    self.sleep_for(0.05)
+                    continue
+
+                if waypoint_idx < len(waypoints) - 1:
+                    current_wp = waypoints[waypoint_idx]
+                    if self._position_distance(current_pose, current_wp) <= self._motion_servo.position_tolerance:
                         waypoint_idx += 1
-                        current_wp = waypoints[waypoint_idx]
+
+                current_wp = waypoints[min(waypoint_idx, len(waypoints) - 1)]
 
                 twist = self._motion_servo.compute_twist_to_waypoint(current_pose, current_wp)
                 twist.angular.x = 0.0
@@ -1557,16 +1585,7 @@ class mypolicy(Policy):
                 self._motion_servo.publish_twist_command(twist)
                 self.sleep_for(0.05)
 
-            if path_aborted:
-                # Do not return. Let the outer loop run the sampling phase again.
-                continue
-                
-            # If we exhausted waypoints naturally safely
-            self._motion_servo.stop()
-            return True
-
-        self._motion_servo.stop()
-        return False
+            continue
 
     def _execute_pose_goal(
         self,
@@ -1604,48 +1623,32 @@ class mypolicy(Policy):
         return True
 
     def _servo_to_pose(self, waypoint: Pose, timeout_sec: float) -> bool:
-        deadline = time.monotonic() + float(timeout_sec)
-        while time.monotonic() < deadline:
+        del timeout_sec
+        while True:
             current_pose = self._motion_servo.get_current_pose()
             if current_pose is None:
                 self.sleep_for(0.05)
                 continue
 
             pos_error = self._position_distance(current_pose, waypoint)
-            # Position-only convergence check.
-            # Orientation is kept constant (== starting TCP orientation) so we
-            # skip the angular tolerance which is unreliable at the 180° singularity.
             if pos_error <= self._motion_servo.position_tolerance:
                 self._motion_servo.stop()
                 return True
 
             twist = self._motion_servo.compute_twist_to_waypoint(current_pose, waypoint)
-            # Zero out angular velocity to avoid feeding the orientation
-            # singularity — we are not requesting any rotation change.
             twist.angular.x = 0.0
             twist.angular.y = 0.0
             twist.angular.z = 0.0
             self._motion_servo.publish_twist_command(twist)
             self.sleep_for(0.05)
 
-        self._motion_servo.stop()
-        return False
-
     def _make_target_pose(self, detected_pose: Pose, orientation: Quaternion, z_offset: float = 0.0, min_z: float = 0.0) -> Pose:
-        """Build a target pose using the detected position and a known-safe orientation.
-
-        Args:
-            detected_pose: Pose from the perception system (position used, orientation ignored).
-            orientation: The gripper orientation to command (typically the current TCP orientation).
-            z_offset: Extra height above the detected z so the gripper approaches from above.
-            min_z: Minimum allowed z value. Use to prevent collision with vertical components.
-        """
+        """Build a target pose with no policy-side positional offsets."""
         target_pose = Pose()
-        z_raw = float(detected_pose.position.z) + float(z_offset)
         target_pose.position = Point(
             x=float(detected_pose.position.x),
             y=float(detected_pose.position.y),
-            z=max(z_raw, float(min_z)),
+            z=float(detected_pose.position.z),
         )
         target_pose.orientation = Quaternion(
             x=float(orientation.x),

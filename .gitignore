@@ -19,3 +19,4 @@ aic_utils/aic_isaac/aic_isaaclab/source/aic_task/aic_task/tasks/manager_based/ai
 
 team_policy/models/depth_anything_v2_small/
 
+team_policy/models/Depth-Anything-V2-Metric-Indoor-Base-hf/

@@ -81,19 +81,25 @@ class StereoCenterDepth:
         self._PILImage = None
         self._model_loaded = False
         self._model_load_failed = False
+        self._metric_max_depth_m = None
 
-        self._max_side_cpu = int(os.environ.get("DEPTH_ANYTHING_V2_MAX_SIDE_CPU", "448"))
+        self._max_side_cpu = int(os.environ.get("DEPTH_ANYTHING_V2_MAX_SIDE_CPU", "518"))
         self._max_side_gpu = int(os.environ.get("DEPTH_ANYTHING_V2_MAX_SIDE_GPU", "700"))
         self._max_hz_per_camera = float(os.environ.get("DEPTH_ANYTHING_V2_MAX_HZ_PER_CAMERA", "5.0"))
         self._max_total_hz = float(os.environ.get("DEPTH_ANYTHING_V2_MAX_TOTAL_HZ", "5.0"))
         self._use_fp16 = os.environ.get("DEPTH_ANYTHING_V2_USE_FP16", "1") != "0"
         self._gpu_min_vram_gb = float(os.environ.get("DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB", "6.0"))
         self._device_pref = os.environ.get("DEPTH_ANYTHING_V2_DEVICE", "auto").strip().lower()
-        self._model_id_or_path = os.environ.get(
-            "DEPTH_ANYTHING_V2_MODEL_ID_OR_PATH",
-            "depth-anything/Depth-Anything-V2-Small-hf",
-        )
-        self._local_only = os.environ.get("DEPTH_ANYTHING_V2_LOCAL_ONLY", "0") == "1"
+        self._default_model_dir = self._resolve_default_model_dir()
+        self._default_repo_id = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
+        requested_model = os.environ.get("DEPTH_ANYTHING_V2_MODEL_ID_OR_PATH")
+        self._model_id_or_path = requested_model if requested_model else (self._default_model_dir if self._default_model_dir is not None else self._default_repo_id)
+        self._model_id_or_path = self._normalize_model_id_or_path(self._model_id_or_path)
+        local_only_env = os.environ.get("DEPTH_ANYTHING_V2_LOCAL_ONLY")
+        if local_only_env is None:
+            self._local_only = os.path.isdir(self._model_id_or_path)
+        else:
+            self._local_only = local_only_env == "1"
 
         self._sync_left = message_filters.ApproximateTimeSynchronizer(
             [
@@ -171,6 +177,43 @@ class StereoCenterDepth:
     def stop_calibration(self):
         return None
 
+    def _resolve_default_model_dir(self) -> Optional[str]:
+        model_name = "Depth-Anything-V2-Metric-Indoor-Base-hf"
+        here = os.path.abspath(os.path.dirname(__file__))
+        cwd = os.path.abspath(os.getcwd())
+        candidates = [
+            os.path.join(here, "..", "models", model_name),
+            os.path.join(here, "..", "..", "models", model_name),
+            os.path.join(cwd, "team_policy", "models", model_name),
+            os.path.join(cwd, "models", model_name),
+        ]
+        seen = set()
+        for candidate in candidates:
+            candidate = os.path.abspath(candidate)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if not os.path.isdir(candidate):
+                continue
+            config_path = os.path.join(candidate, "config.json")
+            if os.path.isfile(config_path):
+                return candidate
+        return None
+
+
+    def _normalize_model_id_or_path(self, value: Optional[str]) -> str:
+        if value is None:
+            return self._default_repo_id
+        normalized = os.path.abspath(value) if any(sep in value for sep in (os.sep, "/", "\\")) else value
+        if os.path.isdir(normalized):
+            return normalized
+        if normalized != self._default_repo_id and any(sep in normalized for sep in (os.sep, "/", "\\")):
+            self._node.get_logger().warn(
+                f"Depth Anything V2 local model directory not found: {normalized}. Falling back to Hugging Face repo {self._default_repo_id}"
+            )
+            return self._default_repo_id
+        return normalized
+
     def _sync_callback(self, camera_name: str, image_msg: Image, info_msg: CameraInfo):
         with self._worker_cond:
             self._pending[camera_name] = (image_msg, info_msg, time.monotonic())
@@ -193,7 +236,7 @@ class StereoCenterDepth:
                 self._ensure_model_loaded()
                 result = self._compute(camera_name, image_msg, info_msg)
             except Exception as exc:
-                self._log_throttled(f"Depth Anything V2 multi-camera depth failed for {camera_name}: {exc}")
+                self._log_throttled(f"Depth Anything V2 metric depth failed for {camera_name}: {exc}")
                 continue
 
             with self._lock:
@@ -238,7 +281,7 @@ class StereoCenterDepth:
 
     def _compute(self, camera_name: str, image_msg: Image, info_msg: CameraInfo) -> StereoCenterDepthResult:
         if not self._model_loaded or self._model is None or self._processor is None or self._torch is None:
-            raise RuntimeError("Depth Anything V2 model is not loaded")
+            raise RuntimeError("Depth Anything V2 metric model is not loaded")
 
         bgr = self._to_bgr(image_msg)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -263,16 +306,18 @@ class StereoCenterDepth:
                 ).squeeze(1).squeeze(0)
         except RuntimeError as exc:
             if self._device is not None and self._device.type == "cuda" and "out of memory" in str(exc).lower():
-                self._node.get_logger().warn("CUDA OOM during Depth Anything V2 inference; switching to CPU")
+                self._node.get_logger().warn("CUDA OOM during Depth Anything V2 metric inference; switching to CPU")
                 self._switch_model_to_cpu()
                 return self._compute(camera_name, image_msg, info_msg)
             raise
 
         depth = prediction.detach().float().cpu().numpy().astype(np.float32)
         depth = np.maximum(depth, 0.0)
+        if self._metric_max_depth_m is not None and np.isfinite(self._metric_max_depth_m) and self._metric_max_depth_m > 0.0:
+            depth = np.minimum(depth, self._metric_max_depth_m)
         positive = np.isfinite(depth) & (depth > 0.0)
         if not np.any(positive):
-            raise RuntimeError("Model returned no positive depth values")
+            raise RuntimeError("Metric model returned no positive depth values")
 
         depth_vis = self._make_depth_vis(depth)
         overlay = bgr.copy()
@@ -313,14 +358,14 @@ class StereoCenterDepth:
             num_inliers=0,
             coverage=coverage,
             baseline_m=0.0,
-            sources_used=f"depth-anything-v2-small-{camera_name}",
+            sources_used=f"depth-anything-v2-metric-indoor-base-{camera_name}",
         )
 
     def _ensure_model_loaded(self):
         if self._model_loaded:
             return
         if self._model_load_failed:
-            raise RuntimeError("Depth Anything V2 model previously failed to load")
+            raise RuntimeError("Depth Anything V2 metric model previously failed to load")
 
         try:
             import torch
@@ -336,15 +381,30 @@ class StereoCenterDepth:
         self._dtype = torch.float16 if self._device.type == "cuda" and self._use_fp16 else torch.float32
 
         kwargs = {"local_files_only": self._local_only}
-        self._processor = AutoImageProcessor.from_pretrained(self._model_id_or_path, **kwargs)
-        self._model = AutoModelForDepthEstimation.from_pretrained(self._model_id_or_path, **kwargs)
+        try:
+            self._processor = AutoImageProcessor.from_pretrained(self._model_id_or_path, **kwargs)
+            self._model = AutoModelForDepthEstimation.from_pretrained(self._model_id_or_path, **kwargs)
+        except Exception as exc:
+            if self._local_only and os.path.isabs(self._model_id_or_path) and not os.path.isdir(self._model_id_or_path):
+                self._model_id_or_path = self._default_repo_id
+                self._local_only = False
+                kwargs = {"local_files_only": False}
+                self._node.get_logger().warn(
+                    f"Depth Anything V2 local model path is unavailable at runtime. Falling back to Hugging Face repo {self._default_repo_id}"
+                )
+                self._processor = AutoImageProcessor.from_pretrained(self._model_id_or_path, **kwargs)
+                self._model = AutoModelForDepthEstimation.from_pretrained(self._model_id_or_path, **kwargs)
+            else:
+                raise exc
         self._model.to(self._device)
         if self._device.type == "cuda" and self._dtype == torch.float16:
             self._model.to(dtype=torch.float16)
         self._model.eval()
+        max_depth = getattr(getattr(self._model, "config", None), "max_depth", None)
+        self._metric_max_depth_m = float(max_depth) if max_depth is not None else None
         self._model_loaded = True
         self._node.get_logger().info(
-            f"Depth Anything V2 Small loaded from {self._model_id_or_path} on {self._device} dtype={self._dtype}"
+            f"Depth Anything V2 Metric Indoor Base loaded from {self._model_id_or_path} on {self._device} dtype={self._dtype} max_depth_m={self._metric_max_depth_m}"
         )
 
     def _switch_model_to_cpu(self):
@@ -361,8 +421,6 @@ class StereoCenterDepth:
 
     def _select_device(self, torch):
         def _cuda_supported() -> bool:
-            """Return True only if the current GPU's compute capability is
-            actually in the list of capabilities this PyTorch build supports."""
             if not torch.cuda.is_available():
                 return False
             major, minor = torch.cuda.get_device_capability(0)
@@ -390,8 +448,7 @@ class StereoCenterDepth:
             )
         elif torch.cuda.is_available() and not cuda_ok:
             self._node.get_logger().warn(
-                "GPU detected but its compute capability is not supported by this PyTorch build. "
-                "Falling back to CPU."
+                "GPU detected but its compute capability is not supported by this PyTorch build. Falling back to CPU."
             )
         return torch.device("cpu")
 
