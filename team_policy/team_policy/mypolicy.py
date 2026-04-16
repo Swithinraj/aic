@@ -431,11 +431,12 @@ class MotionServoNode(Node):
 class mypolicy(Policy):
     SERVO_HOVER_Z = 0.06
     SERVO_WORLD_TOLERANCE = 0.003
-    SERVO_MAX_ITERATIONS = 180
+    SERVO_MAX_ITERATIONS = 500
     SERVO_GAIN_XY = 1.20
     SERVO_GAIN_Z = 0.35
     SERVO_STEP_SEC = 0.10
-    SERVO_TIMEOUT_SEC = 28.0
+    # Extended to allow world-frame fallback to converge (~50s for 100mm at 3mm/iter*0.1s/iter)
+    SERVO_TIMEOUT_SEC = 50.0
 
     SERVO_DLS_DAMPING = 1.5
     SERVO_MAX_LINEAR_SPEED_XY = 0.030
@@ -446,17 +447,30 @@ class mypolicy(Policy):
     SERVO_Z_ENABLE_PX = 90.0
     SERVO_ABORT_PX = 120.0
 
-    SERVO_MAX_YAW_RATE = 0.30
+    SERVO_MAX_YAW_RATE = 0.20
+    SERVO_YAW_GAIN = 0.8
+    SERVO_YAW_CONVERGED_RAD = 0.10
     SERVO_MIN_CONFIDENCE = 0.20
     SERVO_LAST_VALID_PAIR_SEC = 0.60
 
     INSERT_Z_STEP = 0.001
     INSERT_MAX_LATERAL_FORCE = 15.0
     INSERT_MAX_Z_FORCE = 30.0
-    INSERT_SETTLED_FORCE = 2.0
-    INSERT_MAX_DEPTH = 0.04
+    # Raised from 2.0 to 4.0: during SFP insertion the spring-loaded latch
+    # keeps resistance elevated (3-8N) through most of the stroke.
+    # A 2N threshold means settled_count never accumulates mid-stroke.
+    INSERT_SETTLED_FORCE = 4.0
+    # Minimum depth past first contact for a force-settled success.
+    INSERT_MIN_DEPTH_FOR_SETTLED_MM = 5.0
+    # Depth-only success threshold: if plug travels >= 8mm past contact,
+    # declare success regardless of force reading (SFP minimum engagement).
+    INSERT_DEEP_SUCCESS_MM = 8.0
+    # From observed runs: TCP starts at ~0.299m. Port face at ~0.179m.
+    # Gap = 0.120m to port face + 0.025m insertion depth = 0.145m total.
+    # Use 0.160m to give margin.
+    INSERT_MAX_DEPTH = 0.160
     INSERT_STEP_SEC = 0.15
-    INSERT_TIMEOUT_SEC = 20.0
+    INSERT_TIMEOUT_SEC = 45.0
 
     DEFAULT_FX = 600.0
     DEFAULT_FY = 600.0
@@ -621,11 +635,16 @@ class mypolicy(Policy):
 
         # ====== PHASE 3: Force-feedback insertion ======
         send_feedback("mypolicy/phase3_force_insertion_start")
+        # Use the initial port detection Z as the port face hint.
+        # port_pose_raw.position.z is the board-surface Z from the camera homography
+        # (real measured depth, not the hardcoded fused-detection value).
+        port_face_hint_z = float(port_pose_raw.position.z) if port_pose_raw is not None else None
         insert_ok = self._sfp_force_insert(
             gripper_orientation=gripper_orientation,
             get_observation=get_observation,
             move_robot=move_robot,
             send_feedback=send_feedback,
+            port_face_hint_z=port_face_hint_z,
         )
 
         self._motion_servo.stop()
@@ -652,11 +671,92 @@ class mypolicy(Policy):
         stable_count = 0
         last_valid_pairs: Dict[str, Dict] = {}
 
+        # Cache the initial port pose for use as a stable world-frame fallback reference.
+        # This prevents the noisy live fused detection from jumping the fallback target around.
+        # We update this cache when a fresh high-confidence fused detection is available.
+        cached_port_pose: Optional[Pose] = None
+
+        # Log servo entry state
+        initial_fused = self._detection_listener.find_best(
+            matcher=port_matcher, require_pose=True, freshness_sec=2.0
+        )
+        if initial_fused is None:
+            initial_fused = self._detection_listener.find_best(
+                matcher=self._is_sfp_port_detection, require_pose=True, freshness_sec=2.0
+            )
+        if initial_fused is not None:
+            ip = self._pose_from_detection(initial_fused["detection"])
+            if ip is not None:
+                cached_port_pose = ip
+                port_yaw_init = math.degrees(2.0 * math.atan2(float(ip.orientation.z), float(ip.orientation.w)))
+                send_feedback(
+                    f"mypolicy/servo_entry"
+                    f" port_xyz=({ip.position.x:.4f},{ip.position.y:.4f},{ip.position.z:.4f})"
+                    f" port_yaw_deg={port_yaw_init:.2f}"
+                    f" conf={initial_fused['confidence']:.3f}"
+                )
+        tcp0 = self._motion_servo.get_current_pose()
+        if tcp0 is not None:
+            tcp_yaw_init = math.degrees(self._quat_yaw_rad(tcp0.orientation))
+            send_feedback(
+                f"mypolicy/servo_entry"
+                f" tcp_xyz=({tcp0.position.x:.4f},{tcp0.position.y:.4f},{tcp0.position.z:.4f})"
+                f" tcp_yaw_deg={tcp_yaw_init:.2f}"
+            )
+        send_feedback(
+            f"mypolicy/servo_params"
+            f" converged_px={self.SERVO_CONVERGED_PX}"
+            f" stable_count_req={self.SERVO_CONVERGED_PX_STABLE_COUNT}"
+            f" yaw_converged_deg={math.degrees(self.SERVO_YAW_CONVERGED_RAD):.1f}"
+            f" timeout_sec={self.SERVO_TIMEOUT_SEC}"
+            f" gain_xy={self.SERVO_GAIN_XY} gain_z={self.SERVO_GAIN_Z}"
+            f" yaw_gain={self.SERVO_YAW_GAIN} max_yaw_rate={self.SERVO_MAX_YAW_RATE}"
+        )
+
         for iteration in range(self.SERVO_MAX_ITERATIONS):
             if time.monotonic() > deadline:
                 send_feedback(f"mypolicy/servo_timeout best_px_err={best_metric_error:.1f}")
                 self._motion_servo.stop()
-                return best_metric_error <= self.SERVO_CONVERGED_PX
+                # Even on timeout, allow insertion if world-frame XY is close enough.
+                # Gripper detection is intermittent so pixel convergence may not be reached,
+                # but the robot may still be aligned well enough for the force-insertion phase.
+                if best_metric_error <= self.SERVO_CONVERGED_PX:
+                    return True
+                cur_at_timeout = self._motion_servo.get_current_pose()
+                fused_at_timeout = self._detection_listener.find_best(
+                    matcher=port_matcher, require_pose=True, freshness_sec=10.0
+                )
+                send_feedback(
+                    f"mypolicy/servo_timeout_fused_found={fused_at_timeout is not None}"
+                    f" cur_found={cur_at_timeout is not None}"
+                )
+                if cur_at_timeout is not None and fused_at_timeout is not None:
+                    fp = self._pose_from_detection(fused_at_timeout["detection"])
+                    if fp is not None:
+                        dx = float(fp.position.x) - float(cur_at_timeout.position.x)
+                        dy = float(fp.position.y) - float(cur_at_timeout.position.y)
+                        xy_err_mm = math.sqrt(dx * dx + dy * dy) * 1000.0
+                        # Check yaw convergence at timeout — same check as main IBVS path
+                        pqz_to = float(fp.orientation.z)
+                        pqw_to = float(fp.orientation.w)
+                        port_yaw_to = 2.0 * math.atan2(pqz_to, pqw_to)
+                        tcp_yaw_to = self._quat_yaw_rad(cur_at_timeout.orientation)
+                        yaw_err_to = abs(self._angle_wrap(port_yaw_to - tcp_yaw_to))
+                        yaw_ok_to = yaw_err_to <= self.SERVO_YAW_CONVERGED_RAD
+                        send_feedback(
+                            f"mypolicy/servo_timeout_world_xy_err={xy_err_mm:.1f}mm"
+                            f" yaw_err_deg={math.degrees(yaw_err_to):.2f} yaw_ok={yaw_ok_to}"
+                            f" tcp_xyz=({cur_at_timeout.position.x:.3f},{cur_at_timeout.position.y:.3f},{cur_at_timeout.position.z:.3f})"
+                            f" port_xyz=({fp.position.x:.3f},{fp.position.y:.3f},{fp.position.z:.3f})"
+                        )
+                        # Strict gate: same threshold as max-iter path, yaw must also be valid
+                        if xy_err_mm <= 15.0 and yaw_ok_to:
+                            send_feedback("mypolicy/servo_timeout_close_enough proceeding to insertion")
+                            return True
+                        send_feedback(
+                            f"mypolicy/servo_timeout_rejected xy_err={xy_err_mm:.1f}mm (need<=15) yaw_ok={yaw_ok_to}"
+                        )
+                return False
 
             current_pose = self._motion_servo.get_current_pose()
             if current_pose is None:
@@ -730,6 +830,22 @@ class mypolicy(Policy):
                 used_cameras.append(cam)
 
             if J_rows:
+                # Pre-check pixel error before computing velocities.
+                # If ALL cameras show error > SERVO_ABORT_PX, the IBVS detections are
+                # likely misidentified or the robot is far from the port. Fall through
+                # to the world-frame fallback which is more reliable at large distances.
+                avg_px_error_pre = float(sum(per_cam_errors) / len(per_cam_errors))
+                metric_px_error_pre = float(max(per_cam_errors))
+                if metric_px_error_pre > self.SERVO_ABORT_PX:
+                    # Log this skip and fall through to world-frame fallback below
+                    send_feedback(
+                        f"mypolicy/servo_iter_{iteration}"
+                        f" ibvs_skipped_px_too_large px_err_max={metric_px_error_pre:.1f}"
+                        f" (>{self.SERVO_ABORT_PX}) falling_back_to_world"
+                    )
+                    J_rows = []  # Force fall-through to world-frame path
+
+            if J_rows:
                 if len(used_cameras) >= 2:
                     J = np.vstack(J_rows)
                     e = np.vstack(e_rows)
@@ -777,15 +893,69 @@ class mypolicy(Policy):
                 else:
                     stable_count = 0
 
+                # ---- Yaw correction from fused port orientation ----
+                # The pose_base_link.orientation in each fused detection carries a real
+                # board-frame yaw derived from the PnP homography solve — NOT from bbox
+                # axis alignment. We read the latest fused port detection and compute the
+                # yaw error between the port's orientation and the current TCP's yaw.
+                wz = 0.0
+                yaw_err_rad = 0.0
+                port_yaw_deg = float("nan")
+                tcp_yaw_deg = float("nan")
+
+                # For yaw estimation, try the specific port first, then fall back to any sfp_port.
+                # This handles the case where the named port (e.g. sfp_port_0) is not in the
+                # fused topic but a nearby sfp port is — orientation is still valid.
+                fused_for_yaw = self._detection_listener.find_best(
+                    matcher=port_matcher,
+                    require_pose=True,
+                    freshness_sec=3.0,
+                )
+                if fused_for_yaw is None:
+                    fused_for_yaw = self._detection_listener.find_best(
+                        matcher=self._is_sfp_port_detection,
+                        require_pose=True,
+                        freshness_sec=3.0,
+                    )
+                if fused_for_yaw is not None:
+                    port_pose_yaw = self._pose_from_detection(fused_for_yaw["detection"])
+                    if port_pose_yaw is not None:
+                        # Extract port yaw from pose_base_link orientation (pure yaw quaternion: x=0, y=0)
+                        pqz = float(port_pose_yaw.orientation.z)
+                        pqw = float(port_pose_yaw.orientation.w)
+                        port_yaw = 2.0 * math.atan2(pqz, pqw)
+
+                        # Extract current TCP yaw using full Euler formula (stable for any orientation)
+                        tcp_yaw = self._quat_yaw_rad(current_pose.orientation)
+
+                        # Yaw error (target - current), wrapped to [-pi, pi]
+                        yaw_err_rad = self._angle_wrap(port_yaw - tcp_yaw)
+                        port_yaw_deg = math.degrees(port_yaw)
+                        tcp_yaw_deg = math.degrees(tcp_yaw)
+
+                        # Proportional angular correction, clamped
+                        wz_raw = self.SERVO_YAW_GAIN * yaw_err_rad
+                        wz = float(np.clip(wz_raw, -self.SERVO_MAX_YAW_RATE, self.SERVO_MAX_YAW_RATE))
+
+                yaw_converged = abs(yaw_err_rad) <= self.SERVO_YAW_CONVERGED_RAD
+
                 send_feedback(
-                    f"mypolicy/servo_iter_{iteration} cams={used_cameras} "
-                    f"px_err_max={metric_px_error:.1f} px_err_avg={avg_px_error:.1f} "
-                    f"vx={v_xy[0]:.4f} vy={v_xy[1]:.4f} vz={vz:.4f}"
+                    f"mypolicy/servo_iter_{iteration}"
+                    f" cams={used_cameras}"
+                    f" px_err_max={metric_px_error:.1f} px_err_avg={avg_px_error:.1f}"
+                    f" vx={v_xy[0]:.4f} vy={v_xy[1]:.4f} vz={vz:.4f} wz={wz:.4f}"
+                    f" yaw_err_deg={math.degrees(yaw_err_rad):.2f}"
+                    f" port_yaw={port_yaw_deg:.2f} tcp_yaw={tcp_yaw_deg:.2f}"
+                    f" stable={stable_count}/{self.SERVO_CONVERGED_PX_STABLE_COUNT}"
+                    f" yaw_conv={yaw_converged}"
                 )
 
-                if stable_count >= self.SERVO_CONVERGED_PX_STABLE_COUNT:
+                if stable_count >= self.SERVO_CONVERGED_PX_STABLE_COUNT and yaw_converged:
                     self._motion_servo.stop()
-                    send_feedback(f"mypolicy/servo_converged px_err={metric_px_error:.1f}")
+                    send_feedback(
+                        f"mypolicy/servo_converged px_err={metric_px_error:.1f}"
+                        f" yaw_err_deg={math.degrees(yaw_err_rad):.2f}"
+                    )
                     return True
 
                 twist = Twist()
@@ -794,7 +964,7 @@ class mypolicy(Policy):
                 twist.linear.z = float(vz)
                 twist.angular.x = 0.0
                 twist.angular.y = 0.0
-                twist.angular.z = 0.0
+                twist.angular.z = float(wz)
 
                 self._motion_servo.publish_twist_command(twist)
                 self.sleep_for(self.SERVO_STEP_SEC)
@@ -802,42 +972,124 @@ class mypolicy(Policy):
 
             self._motion_servo.stop()
 
-            if best_fallback_port is not None:
-                fallback_pose = self._pose_from_detection(best_fallback_port)
-                if fallback_pose is not None:
-                    world_dx = float(fallback_pose.position.x) - float(current_pose.position.x)
-                    world_dy = float(fallback_pose.position.y) - float(current_pose.position.y)
-                    world_dist = math.sqrt(world_dx * world_dx + world_dy * world_dy)
+            # No valid port+plug pair available from per-camera detections.
+            # Fall back to fused-topic detection (which carries pose_base_link) and
+            # use world-frame XY correction to keep the TCP aligned with the port.
+            # We update the cached port pose only when a fresh detection is available
+            # and is within 50mm of the last known position (to avoid jumping to a wrong port).
+            fused_port = self._detection_listener.find_best(
+                matcher=port_matcher,
+                require_pose=True,
+                freshness_sec=2.0,
+            )
+            live_fallback_pose = self._pose_from_detection(fused_port["detection"]) if fused_port else None
+            if live_fallback_pose is not None:
+                if cached_port_pose is None:
+                    cached_port_pose = live_fallback_pose
+                else:
+                    # Only update cache if the new detection is within 50mm of the cached position
+                    # (prevents large jumps from noisy or wrong detections)
+                    cache_dx = float(live_fallback_pose.position.x) - float(cached_port_pose.position.x)
+                    cache_dy = float(live_fallback_pose.position.y) - float(cached_port_pose.position.y)
+                    cache_dist = math.sqrt(cache_dx * cache_dx + cache_dy * cache_dy)
+                    if cache_dist <= 0.050:
+                        # Smooth update: blend new detection toward cached (EMA with alpha=0.3)
+                        alpha = 0.3
+                        cached_port_pose.position.x = (1.0 - alpha) * float(cached_port_pose.position.x) + alpha * float(live_fallback_pose.position.x)
+                        cached_port_pose.position.y = (1.0 - alpha) * float(cached_port_pose.position.y) + alpha * float(live_fallback_pose.position.y)
+                        cached_port_pose.position.z = float(live_fallback_pose.position.z)
 
-                    send_feedback(f"mypolicy/servo_iter_{iteration} fallback_to_port err={world_dist*1000.0:.1f}mm")
+            fallback_pose = cached_port_pose
+            if fallback_pose is not None:
+                world_dx = float(fallback_pose.position.x) - float(current_pose.position.x)
+                world_dy = float(fallback_pose.position.y) - float(current_pose.position.y)
+                world_dist = math.sqrt(world_dx * world_dx + world_dy * world_dy)
 
-                    if world_dist <= self.SERVO_WORLD_TOLERANCE:
-                        self._motion_servo.stop()
-                        send_feedback(f"mypolicy/servo_converged_fallback err={world_dist*1000.0:.1f}mm")
-                        return True
+                # Compute yaw error from cached port pose orientation for the fallback path
+                fb_pqz = float(fallback_pose.orientation.z)
+                fb_pqw = float(fallback_pose.orientation.w)
+                fb_port_yaw = 2.0 * math.atan2(fb_pqz, fb_pqw)
+                # Use full Euler yaw extraction (stable for downward-facing gripper with x≈1, w≈0)
+                fb_tcp_yaw = self._quat_yaw_rad(current_pose.orientation)
+                fb_yaw_err = self._angle_wrap(fb_port_yaw - fb_tcp_yaw)
+                fb_yaw_converged = abs(fb_yaw_err) <= self.SERVO_YAW_CONVERGED_RAD
+                # Proportional yaw correction even in fallback mode
+                fb_wz_raw = self.SERVO_YAW_GAIN * fb_yaw_err
+                fb_wz = float(np.clip(fb_wz_raw, -self.SERVO_MAX_YAW_RATE, self.SERVO_MAX_YAW_RATE))
 
-                    cmd = np.asarray([world_dx, world_dy], dtype=np.float64) * 0.45
-                    mag = float(np.linalg.norm(cmd))
-                    if mag > self.SERVO_MAX_LINEAR_SPEED_XY:
-                        cmd *= self.SERVO_MAX_LINEAR_SPEED_XY / mag
+                send_feedback(
+                    f"mypolicy/servo_iter_{iteration} fallback_to_port err={world_dist*1000.0:.1f}mm"
+                    f" yaw_err_deg={math.degrees(fb_yaw_err):.2f} yaw_conv={fb_yaw_converged}"
+                    f" wz={fb_wz:.4f} cached={'live' if live_fallback_pose is not None else 'stale'}"
+                )
 
-                    twist = Twist()
-                    twist.linear.x = float(cmd[0])
-                    twist.linear.y = float(cmd[1])
-                    twist.linear.z = 0.0
-                    twist.angular.x = 0.0
-                    twist.angular.y = 0.0
-                    twist.angular.z = 0.0
-                    self._motion_servo.publish_twist_command(twist)
-                    self.sleep_for(self.SERVO_STEP_SEC)
-                    continue
+                # Only allow fallback-based convergence if yaw is also validated
+                if world_dist <= self.SERVO_WORLD_TOLERANCE and fb_yaw_converged:
+                    self._motion_servo.stop()
+                    send_feedback(f"mypolicy/servo_converged_fallback err={world_dist*1000.0:.1f}mm yaw_err_deg={math.degrees(fb_yaw_err):.2f}")
+                    return True
+
+                cmd = np.asarray([world_dx, world_dy], dtype=np.float64) * 0.45
+                mag = float(np.linalg.norm(cmd))
+                if mag > self.SERVO_MAX_LINEAR_SPEED_XY:
+                    cmd *= self.SERVO_MAX_LINEAR_SPEED_XY / mag
+
+                twist = Twist()
+                twist.linear.x = float(cmd[0])
+                twist.linear.y = float(cmd[1])
+                twist.linear.z = 0.0
+                twist.angular.x = 0.0
+                twist.angular.y = 0.0
+                twist.angular.z = float(fb_wz)  # Apply yaw correction in fallback mode too
+                self._motion_servo.publish_twist_command(twist)
+                self.sleep_for(self.SERVO_STEP_SEC)
+                continue
 
             send_feedback(f"mypolicy/servo_iter_{iteration} waiting_for_valid_port_and_plug")
             self.sleep_for(self.SERVO_STEP_SEC)
 
         self._motion_servo.stop()
-        send_feedback(f"mypolicy/servo_max_iterations best_px_err={best_metric_error:.1f}")
-        return best_metric_error <= self.SERVO_CONVERGED_PX
+        send_feedback(
+            f"mypolicy/servo_max_iterations best_px_err={best_metric_error:.1f}"
+            f" converged_px={self.SERVO_CONVERGED_PX}"
+        )
+        if best_metric_error <= self.SERVO_CONVERGED_PX:
+            return True
+        # Allow insertion if world-frame XY is close enough even after max iterations.
+        cur_at_max = self._motion_servo.get_current_pose()
+        fused_at_max = self._detection_listener.find_best(
+            matcher=port_matcher, require_pose=True, freshness_sec=10.0
+        )
+        send_feedback(
+            f"mypolicy/servo_max_iter_fused_found={fused_at_max is not None}"
+            f" cur_found={cur_at_max is not None}"
+        )
+        if cur_at_max is not None and fused_at_max is not None:
+            fp = self._pose_from_detection(fused_at_max["detection"])
+            if fp is not None:
+                dx = float(fp.position.x) - float(cur_at_max.position.x)
+                dy = float(fp.position.y) - float(cur_at_max.position.y)
+                xy_err_mm = math.sqrt(dx * dx + dy * dy) * 1000.0
+                # Check yaw convergence at max-iter — match strict gate
+                pqz_mi = float(fp.orientation.z)
+                pqw_mi = float(fp.orientation.w)
+                port_yaw_mi = 2.0 * math.atan2(pqz_mi, pqw_mi)
+                tcp_yaw_mi = self._quat_yaw_rad(cur_at_max.orientation)
+                yaw_err_mi = abs(self._angle_wrap(port_yaw_mi - tcp_yaw_mi))
+                yaw_ok_mi = yaw_err_mi <= self.SERVO_YAW_CONVERGED_RAD
+                send_feedback(
+                    f"mypolicy/servo_max_iter_world_xy_err={xy_err_mm:.1f}mm"
+                    f" yaw_err_deg={math.degrees(yaw_err_mi):.2f} yaw_ok={yaw_ok_mi}"
+                    f" tcp_xyz=({cur_at_max.position.x:.3f},{cur_at_max.position.y:.3f},{cur_at_max.position.z:.3f})"
+                    f" port_xyz=({fp.position.x:.3f},{fp.position.y:.3f},{fp.position.z:.3f})"
+                )
+                if xy_err_mm <= 15.0 and yaw_ok_mi:
+                    send_feedback("mypolicy/servo_max_iter_close_enough proceeding to insertion")
+                    return True
+                send_feedback(
+                    f"mypolicy/servo_max_iter_rejected xy_err={xy_err_mm:.1f}mm (need<=15) yaw_ok={yaw_ok_mi}"
+                )
+        return False
 
     def _compute_pixel_correction(
         self,
@@ -867,6 +1119,24 @@ class mypolicy(Policy):
         max_step = 0.015  # 15mm max correction per iteration
         mag = math.sqrt(world_dx * world_dx + world_dy * world_dy)
         return world_dx, world_dy
+
+    def _quat_yaw_rad(self, q: Quaternion) -> float:
+        """Extract the Z-axis (yaw) component from a quaternion using the full Euler formula.
+
+        This is numerically stable even for downward-facing orientations (x≈1, w≈0)
+        unlike the simplified 2*atan2(qz, qw) which assumes a pure yaw rotation.
+        """
+        qx = float(q.x)
+        qy = float(q.y)
+        qz = float(q.z)
+        qw = float(q.w)
+        # Normalize
+        n = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if n < 1e-12:
+            return 0.0
+        qx /= n; qy /= n; qz /= n; qw /= n
+        # Full Euler yaw extraction (rotation around Z-axis of fixed frame)
+        return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
     def _feature_uv(self, det: Optional[Dict]) -> Optional[np.ndarray]:
         if det is None:
@@ -1268,12 +1538,21 @@ class mypolicy(Policy):
         get_observation: GetObservationCallback,
         move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
+        port_face_hint_z: Optional[float] = None,
     ) -> bool:
-        """Perform insertion by stepping down using MODE_POSITION via set_pose_target.
-        
-        Uses the official move_robot callback with MODE_POSITION which reliably
-        moves the robot to the commanded pose. Forces are monitored via wrist_wrench
-        with wrench taring to subtract static loads.
+        """Perform insertion by stepping down in velocity mode.
+
+        Contact detection is DEPTH-BASED: the simulation FTS does not reliably register
+        contact forces during plug insertion, so we use TCP Z position to determine when
+        the plug has entered the port.
+
+        Port face is estimated from:
+        1. port_face_hint_z: board-surface Z from initial camera detection (most accurate)
+        2. fused detection Z (also board-surface, from same pipeline)
+        3. hardcoded fallback 0.17927
+
+        'Contact' is declared when TCP descends to within PORT_FACE_APPROACH_MM of port face.
+        Success is declared when 8mm of insertion depth past contact is achieved.
         """
         current_pose = self._motion_servo.get_current_pose()
         if current_pose is None:
@@ -1291,14 +1570,49 @@ class mypolicy(Policy):
             send_feedback(f"mypolicy/insert_tare fx={tare_fx:.2f} fy={tare_fy:.2f} fz={tare_fz:.2f}")
 
         start_z = float(current_pose.position.z)
-        target_z = start_z - self.INSERT_MAX_DEPTH
+        # Max-depth guard: never descend more than INSERT_MAX_DEPTH from the start
+        abs_min_z = start_z - self.INSERT_MAX_DEPTH
         deadline = time.monotonic() + self.INSERT_TIMEOUT_SEC
 
-        send_feedback(f"mypolicy/insert_start z={start_z:.4f} target_z={target_z:.4f}")
+        # Determine PORT_FACE_Z: the Z of the port opening/entry face.
+        # Priority: hint from initial detection > fused detection > hardcoded fallback.
+        # Note: the fused detection hardcodes z=0.17927 for sfp_port (same as fallback),
+        # so we prefer the hint from the board homography which gives the real board-surface Z.
+        PORT_FACE_Z = 0.17927  # fallback hardcoded value
+        port_face_source = "hardcoded"
+
+        if port_face_hint_z is not None and port_face_hint_z > 0.05:
+            PORT_FACE_Z = float(port_face_hint_z)
+            port_face_source = f"initial_detection(z={port_face_hint_z:.4f})"
+        else:
+            fused_port_at_insert = self._detection_listener.find_best(
+                matcher=self._is_sfp_port_detection,
+                require_pose=True,
+                freshness_sec=5.0,
+            )
+            if fused_port_at_insert is not None:
+                fp_insert = self._pose_from_detection(fused_port_at_insert["detection"])
+                # Only use if it looks like a real measurement (not the hardcoded 0.17927 from fused topic)
+                if fp_insert is not None and float(fp_insert.position.z) > 0.19:
+                    PORT_FACE_Z = float(fp_insert.position.z)
+                    port_face_source = f"fused(conf={fused_port_at_insert['confidence']:.2f})"
+
+        # Contact is declared when TCP Z drops below PORT_FACE_Z + approach_margin.
+        # The approach margin of 5mm allows for detection noise while ensuring we
+        # don't declare contact too early (robot still 5mm above port opening).
+        PORT_FACE_APPROACH_MM = 5.0
+        contact_trigger_z = PORT_FACE_Z + (PORT_FACE_APPROACH_MM / 1000.0)
+
+        send_feedback(
+            f"mypolicy/insert_start z={start_z:.4f} abs_min_z={abs_min_z:.4f}"
+            f" port_face_z={PORT_FACE_Z:.4f} port_face_source={port_face_source}"
+            f" contact_trigger_z={contact_trigger_z:.4f}"
+            f" gap_to_port={start_z - PORT_FACE_Z:.4f}m"
+        )
 
         insertion_started = False
+        insertion_started_z = None  # Z at which depth-based contact was declared
         settled_count = 0
-        step_z = start_z  # track commanded Z
 
         while time.monotonic() < deadline:
             current_pose = self._motion_servo.get_current_pose()
@@ -1308,11 +1622,12 @@ class mypolicy(Policy):
 
             current_z = float(current_pose.position.z)
 
-            if step_z <= target_z:
-                send_feedback(f"mypolicy/insert_max_depth_reached z={current_z:.4f}")
+            # Hard max-depth guard using ACTUAL tcp Z (not a stale step_z)
+            if current_z <= abs_min_z:
+                send_feedback(f"mypolicy/insert_max_depth_reached current_z={current_z:.4f} abs_min_z={abs_min_z:.4f}")
                 break
 
-            # Monitor forces
+            # Monitor forces for abort conditions only (not for contact detection)
             observation = get_observation()
             if observation is not None:
                 w = observation.wrist_wrench.wrench
@@ -1326,10 +1641,13 @@ class mypolicy(Policy):
                 lateral_force = math.sqrt(fx * fx + fy * fy)
 
                 send_feedback(
-                    f"mypolicy/insert z={current_z:.4f} cmd_z={step_z:.4f} fz={raw_fz:.2f} "
-                    f"fx={raw_fx:.2f} fy={raw_fy:.2f} lat={lateral_force:.2f}"
+                    f"mypolicy/insert z={current_z:.4f}"
+                    f" dist_to_port={current_z - PORT_FACE_Z:.4f}m"
+                    f" fz={raw_fz:.2f} fx={raw_fx:.2f} fy={raw_fy:.2f} lat={lateral_force:.2f}"
+                    f" ins_started={insertion_started}"
                 )
 
+                # Safety abort on extreme forces
                 if lateral_force > self.INSERT_MAX_LATERAL_FORCE:
                     send_feedback(f"mypolicy/insert_abort lateral_force={lateral_force:.2f}")
                     return False
@@ -1338,26 +1656,45 @@ class mypolicy(Policy):
                     send_feedback(f"mypolicy/insert_abort z_force={fz:.2f}")
                     return False
 
-                if insertion_started and fz < self.INSERT_SETTLED_FORCE:
-                    settled_count += 1
-                    if settled_count >= 5:
-                        send_feedback(f"mypolicy/insert_seated z={current_z:.4f}")
-                        return True
-                else:
-                    settled_count = 0
+            # DEPTH-BASED contact detection: declare contact when TCP reaches contact_trigger_z.
+            # This is the primary contact signal because the simulation FTS does not register
+            # contact forces reliably during plug insertion.
+            if not insertion_started and current_z <= contact_trigger_z:
+                insertion_started = True
+                insertion_started_z = current_z
+                send_feedback(
+                    f"mypolicy/insert_contact_depth z={current_z:.4f}"
+                    f" port_face_z={PORT_FACE_Z:.4f} (depth-based contact)"
+                )
 
-                if fz > 2.0:
-                    insertion_started = True
+            if insertion_started and insertion_started_z is not None:
+                depth_past_contact = insertion_started_z - current_z
+                deep_enough = depth_past_contact >= (self.INSERT_DEEP_SUCCESS_MM / 1000.0)
+                if deep_enough:
+                    send_feedback(
+                        f"mypolicy/insert_seated_deep z={current_z:.4f}"
+                        f" depth_past_contact={depth_past_contact*1000:.1f}mm"
+                        f" (depth-only success, need>={self.INSERT_DEEP_SUCCESS_MM}mm)"
+                    )
+                    return True
 
-            # Step down using pure velocity Twist to avoid impedance position drifting!
+            # Step down using pure velocity Twist
             twist = Twist()
-            twist.linear.z = -0.010  # Descend at 10mm/sec (doubled to fix timeout)
+            twist.linear.z = -0.010  # Descend at 10mm/sec
             self._motion_servo.publish_twist_command(twist)
 
             self.sleep_for(self.INSERT_STEP_SEC)
 
+        self._motion_servo.stop()
         send_feedback("mypolicy/insert_timeout")
-        return insertion_started
+        # Report success if we achieved >= INSERT_DEEP_SUCCESS_MM past contact depth
+        if insertion_started and insertion_started_z is not None:
+            current_pose = self._motion_servo.get_current_pose()
+            final_z = float(current_pose.position.z) if current_pose is not None else start_z
+            depth_achieved = insertion_started_z - final_z
+            send_feedback(f"mypolicy/insert_timeout_depth_achieved={depth_achieved*1000:.1f}mm (need>={self.INSERT_DEEP_SUCCESS_MM}mm)")
+            return depth_achieved >= (self.INSERT_DEEP_SUCCESS_MM / 1000.0)
+        return False
 
     def _retract_z(self, current_pose: Pose, distance: float, orientation: Quaternion) -> None:
         """Retract upward by a small distance after an abort."""
@@ -1560,9 +1897,20 @@ class mypolicy(Policy):
             if path_aborted:
                 # Do not return. Let the outer loop run the sampling phase again.
                 continue
-                
-            # If we exhausted waypoints naturally safely
+
+            # Waypoints exhausted (or total_deadline expired during traversal).
+            # Only return True if the robot actually reached within position tolerance of the target.
             self._motion_servo.stop()
+            current_pose_final = self._motion_servo.get_current_pose()
+            if current_pose_final is not None:
+                final_dist = self._position_distance(current_pose_final, target_pose)
+                if final_dist <= self._motion_servo.position_tolerance:
+                    return True
+                send_feedback(
+                    f"mypolicy/{label}_path_ended_far_from_target dist={final_dist*1000:.1f}mm (threshold={self._motion_servo.position_tolerance*1000:.0f}mm) re-sampling"
+                )
+                # Re-sample if there is time remaining
+                continue
             return True
 
         self._motion_servo.stop()
