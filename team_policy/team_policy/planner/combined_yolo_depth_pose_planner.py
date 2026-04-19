@@ -44,7 +44,7 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         self._preferred_camera_for_fusion = self._tf_camera
         self._force_table_flat = self._env_bool("YOLO_POSE_FORCE_TABLE_FLAT", True)
         self._table_normal_base = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        self._table_constrained_families = {"taskboard", "nic", "sc", "sfp_port", "sfp_module"}
+        self._table_constrained_families = {"taskboard", "nic", "sc", "sfp_port"}
 
         self._tf_broadcaster = TransformBroadcaster(self)
         self._fused_pose_pub = self.create_publisher(PoseArray, "/fused_yolo/poses_base_link", 10)
@@ -376,20 +376,22 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
 
         detections: List[Dict] = []
         boxes = result.boxes
+        seg_geoms = self._extract_segmentation_geometries(result, frame.shape[:2])
         if boxes is not None:
             xyxy = boxes.xyxy.detach().cpu().numpy() if boxes.xyxy is not None else np.zeros((0, 4), dtype=np.float32)
             confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.zeros((0,), dtype=np.float32)
             clss = boxes.cls.detach().cpu().numpy().astype(int) if boxes.cls is not None else np.zeros((0,), dtype=int)
-            for box, conf, cls_idx in zip(xyxy, confs, clss):
+            for idx, (box, conf, cls_idx) in enumerate(zip(xyxy, confs, clss)):
                 cls_name = str(names[int(cls_idx)]) if names is not None else str(int(cls_idx))
-                detections.append(
-                    {
-                        "class_id": int(cls_idx),
-                        "class_name": cls_name,
-                        "confidence": float(conf),
-                        "bbox_xyxy": [float(v) for v in box.tolist()],
-                    }
-                )
+                det = {
+                    "class_id": int(cls_idx),
+                    "class_name": cls_name,
+                    "confidence": float(conf),
+                    "bbox_xyxy": [float(v) for v in box.tolist()],
+                }
+                if idx < len(seg_geoms) and isinstance(seg_geoms[idx], dict):
+                    det.update(seg_geoms[idx])
+                detections.append(det)
 
         detections = self._filter_target_detections(detections)
         mask_overlay, mask_binary, mask_status, projected_rails, fused_targets = self._fit_rails(camera_name, frame, detections, msg)
@@ -404,6 +406,83 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
 
         classes = [str(det.get("instance_name", det.get("class_name", ""))) for det in detections]
         return annotated, detections, classes, mask_overlay, mask_binary, mask_status, None, None, None
+
+    def _extract_segmentation_geometries(self, result, image_shape) -> List[Dict]:
+        h, w = int(image_shape[0]), int(image_shape[1])
+        geoms: List[Dict] = []
+        masks_obj = getattr(result, "masks", None)
+        if masks_obj is None or getattr(masks_obj, "data", None) is None:
+            return geoms
+        try:
+            masks = masks_obj.data.detach().cpu().numpy()
+        except Exception:
+            return geoms
+        for mask in masks:
+            m = np.asarray(mask, dtype=np.float32)
+            if m.ndim != 2:
+                geoms.append({})
+                continue
+            if m.shape[0] != h or m.shape[1] != w:
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+            mb = np.where(m > 0.5, 255, 0).astype(np.uint8)
+            contours, _ = cv2.findContours(mb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                geoms.append({})
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            area = float(cv2.contourArea(contour))
+            if area < 8.0:
+                geoms.append({})
+                continue
+            rect = cv2.minAreaRect(contour)
+            (cx, cy), (rw, rh), angle = rect
+            corners = cv2.boxPoints(rect).astype(np.float32)
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.01 * max(peri, 1.0), True)
+            poly = approx.reshape(-1, 2).astype(np.float32) if approx is not None and len(approx) >= 3 else contour.reshape(-1, 2).astype(np.float32)
+            geoms.append(
+                {
+                    "mask_area_px": area,
+                    "obb_cxcywh_deg": [float(cx), float(cy), float(rw), float(rh), float(angle)],
+                    "obb_corners_uv": [[float(x), float(y)] for x, y in corners.tolist()],
+                    "mask_polygon_uv": [[float(x), float(y)] for x, y in poly.tolist()],
+                }
+            )
+        return geoms
+
+    def _obb_long_axis_uv(self, det: Dict) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        corners = det.get("obb_corners_uv")
+        if not isinstance(corners, list) or len(corners) != 4:
+            return None
+        q = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+        edges = [q[(i + 1) % 4] - q[i] for i in range(4)]
+        lengths = [float(np.linalg.norm(e)) for e in edges]
+        if max(lengths) < 1e-6:
+            return None
+        idx = int(np.argmax(lengths))
+        axis = edges[idx] / max(1e-6, lengths[idx])
+        center = np.mean(q, axis=0).astype(np.float32)
+        return center, axis.astype(np.float32)
+
+    def _obb_long_axis_on_plane(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, det: Dict) -> Optional[np.ndarray]:
+        axis_data = self._obb_long_axis_uv(det)
+        if axis_data is None:
+            return None
+        center_uv, uv_dir = axis_data
+        return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
+
+    def _detection_anchor_point(self, det: Dict, family_key: str) -> np.ndarray:
+        obb = det.get("obb_cxcywh_deg")
+        if isinstance(obb, list) and len(obb) >= 2:
+            cx = float(obb[0])
+            cy = float(obb[1])
+            if family_key == "SC_PORT":
+                corners = det.get("obb_corners_uv")
+                if isinstance(corners, list) and len(corners) == 4:
+                    q = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+                    return np.mean(q[np.argsort(q[:, 1])[-2:]], axis=0).astype(np.float32)
+            return np.array([cx, cy], dtype=np.float32)
+        return super()._detection_anchor_point(det, family_key)
 
     def _estimate_detection_poses(self, camera_name: str, detections: List[Dict]) -> List[Dict]:
         with self._lock:
@@ -446,7 +525,9 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
                 raw_pose = self._cad_estimator.estimate_pose(info, depth, det, mesh_family, init_pose_camera=board_pose_camera)
 
             pose = None
-            if board_pose_camera is not None:
+            if family == "sfp_module" and raw_pose is not None:
+                pose = raw_pose
+            elif board_pose_camera is not None:
                 translation_hint = None if raw_pose is None else np.asarray(raw_pose.get("t", None), dtype=np.float32).reshape(3)
                 pose = self._estimate_component_pose_on_board_plane(
                     info=info,
@@ -846,6 +927,8 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         x_axis = None
         if pts is not None and len(pts) >= 12:
             x_axis = self._principal_axis_from_points_on_plane(pts, normal, raw_axis)
+        if x_axis is None:
+            x_axis = self._obb_long_axis_on_plane(info, t, normal, det)
         if x_axis is None:
             x_axis = self._bbox_long_axis_on_plane(info, t, normal, det)
         if x_axis is None and raw_axis is not None:

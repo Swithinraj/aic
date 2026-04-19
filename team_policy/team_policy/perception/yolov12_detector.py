@@ -60,7 +60,7 @@ class YoloV12MultiCameraDetector(Node):
             os.environ.get("YOLOV12_SFP_PORT_CLASSES", "sfp_port,sfp port,sfp_tip,sfp_plug,sfp_connector")
         )
         self._sfp_module_classes = self._parse_name_set(
-            os.environ.get("YOLOV12_SFP_MODULE_CLASSES", "sfp_module,sfp module,transceiver")
+            os.environ.get("YOLOV12_SFP_MODULE_CLASSES", "sfp_module,sfp module,transceiver,sfp_port_module,sfp port module,sfp-module,sfpmodule,sfp_transceiver")
         )
         self._gripper_classes = self._parse_name_set(
             os.environ.get("YOLOV12_GRIPPER_CLASSES", "gripper,gripper_tip,gripper_tcp")
@@ -363,18 +363,22 @@ class YoloV12MultiCameraDetector(Node):
         classes: List[str] = []
         names = result.names if hasattr(result, "names") else self._model.names
         boxes = result.boxes
+        seg_geoms = self._extract_segmentation_geometries(result, frame.shape[:2])
         if boxes is not None:
             xyxy = boxes.xyxy.detach().cpu().numpy() if boxes.xyxy is not None else np.zeros((0, 4), dtype=np.float32)
             confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.zeros((0,), dtype=np.float32)
             clss = boxes.cls.detach().cpu().numpy().astype(int) if boxes.cls is not None else np.zeros((0,), dtype=int)
-            for box, conf, cls_idx in zip(xyxy, confs, clss):
+            for idx, (box, conf, cls_idx) in enumerate(zip(xyxy, confs, clss)):
                 cls_name = str(names[int(cls_idx)]) if names is not None else str(int(cls_idx))
-                detections.append({
+                det = {
                     "class_id": int(cls_idx),
                     "class_name": cls_name,
                     "confidence": float(conf),
                     "bbox_xyxy": [float(v) for v in box.tolist()],
-                })
+                }
+                if idx < len(seg_geoms) and isinstance(seg_geoms[idx], dict):
+                    det.update(seg_geoms[idx])
+                detections.append(det)
         detections = self._filter_target_detections(detections)
         mask_overlay, mask_binary, mask_status, projected_rails, fused_targets = self._fit_rails(camera_name, frame, detections, msg)
         detections = self._assign_detection_instance_names(detections, projected_rails, fused_targets, camera_name)
@@ -383,6 +387,49 @@ class YoloV12MultiCameraDetector(Node):
         annotated = self._draw_filtered_detections(frame, detections)
         annotated = self._draw_instance_labels(annotated, detections)
         return annotated, detections, classes, mask_overlay, mask_binary, mask_status
+
+    def _extract_segmentation_geometries(self, result, image_shape) -> List[Dict]:
+        h, w = int(image_shape[0]), int(image_shape[1])
+        geoms: List[Dict] = []
+        masks_obj = getattr(result, "masks", None)
+        if masks_obj is None or getattr(masks_obj, "data", None) is None:
+            return geoms
+        try:
+            masks = masks_obj.data.detach().cpu().numpy()
+        except Exception:
+            return geoms
+        for mask in masks:
+            m = np.asarray(mask, dtype=np.float32)
+            if m.ndim != 2:
+                geoms.append({})
+                continue
+            if m.shape[0] != h or m.shape[1] != w:
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+            mb = np.where(m > 0.5, 255, 0).astype(np.uint8)
+            contours, _ = cv2.findContours(mb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                geoms.append({})
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            area = float(cv2.contourArea(contour))
+            if area < 8.0:
+                geoms.append({})
+                continue
+            rect = cv2.minAreaRect(contour)
+            (cx, cy), (rw, rh), angle = rect
+            corners = cv2.boxPoints(rect).astype(np.float32)
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.01 * max(peri, 1.0), True)
+            poly = approx.reshape(-1, 2).astype(np.float32) if approx is not None and len(approx) >= 3 else contour.reshape(-1, 2).astype(np.float32)
+            geoms.append(
+                {
+                    "mask_area_px": area,
+                    "obb_cxcywh_deg": [float(cx), float(cy), float(rw), float(rh), float(angle)],
+                    "obb_corners_uv": [[float(x), float(y)] for x, y in corners.tolist()],
+                    "mask_polygon_uv": [[float(x), float(y)] for x, y in poly.tolist()],
+                }
+            )
+        return geoms
 
     def _keep_highest_conf_per_class(self, detections: List[Dict], key_name: str = "class_name"):
         best = {}
@@ -405,6 +452,11 @@ class YoloV12MultiCameraDetector(Node):
         base = self._strip_numeric_suffix(name)
         if name in allowed_names or base in allowed_names:
             return True
+        if any(name.startswith(f"{allowed}_") for allowed in allowed_names):
+            return True
+        if "sfp_module" in allowed_names:
+            if ("sfp" in name and "module" in name) or ("transceiver" in name):
+                return True
         return False
 
     def _canonical_output_name(self, class_name: str) -> str:
@@ -507,7 +559,13 @@ class YoloV12MultiCameraDetector(Node):
             x1, y1, x2, y2 = [int(round(float(v))) for v in det.get("bbox_xyxy", [0, 0, 0, 0])]
             family = self._detection_family_name(det)
             color = colors.get(family, (0, 255, 0))
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            
+            obb_corners = det.get("obb_corners_uv")
+            if obb_corners is not None and len(obb_corners) == 4:
+                pts = np.array(obb_corners, np.int32).reshape((-1, 1, 2))
+                cv2.polylines(out, [pts], True, color, 2, cv2.LINE_AA)
+            else:
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
             
             anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
             anchor = self._detection_anchor_point(det, anchor_key)
@@ -1134,6 +1192,17 @@ class YoloV12MultiCameraDetector(Node):
         return current
 
     def _detection_anchor_point(self, det: Dict, family_key: str) -> np.ndarray:
+        obb = det.get("obb_cxcywh_deg")
+        if isinstance(obb, list) and len(obb) >= 2:
+            cx = float(obb[0])
+            cy = float(obb[1])
+            if family_key == "SC_PORT":
+                corners = det.get("obb_corners_uv")
+                if isinstance(corners, list) and len(corners) == 4:
+                    q = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+                    return np.mean(q[np.argsort(q[:, 1])[-2:]], axis=0).astype(np.float32)
+            return np.array([cx, cy], dtype=np.float32)
+
         x1, y1, x2, y2 = [float(v) for v in det["bbox_xyxy"]]
         if family_key == "SC_PORT":
             return np.array([(x1 + x2) * 0.5, y2], dtype=np.float32)

@@ -87,6 +87,21 @@ class CadDepthPoseEstimator:
         pca_pose = self._estimate_pose_from_pca(np.asarray(scene_cloud.points))
         if pca_pose is None:
             return None
+        obb_axis = self._obb_axis_hint_camera(camera_info, det)
+        if obb_axis is not None:
+            z_axis = np.asarray(pca_pose["R"], dtype=np.float64)[:, 2]
+            x_axis = np.asarray(obb_axis, dtype=np.float64)
+            x_axis = x_axis - z_axis * float(np.dot(x_axis, z_axis))
+            xn = float(np.linalg.norm(x_axis))
+            if xn > 1e-6:
+                x_axis /= xn
+                y_axis = np.cross(z_axis, x_axis)
+                yn = float(np.linalg.norm(y_axis))
+                if yn > 1e-6:
+                    y_axis /= yn
+                    x_axis = np.cross(y_axis, z_axis)
+                    x_axis /= max(1e-6, float(np.linalg.norm(x_axis)))
+                    pca_pose["R"] = np.column_stack([x_axis, y_axis, z_axis]).astype(np.float64)
 
         result = {
             "R": pca_pose["R"].astype(np.float32),
@@ -122,6 +137,47 @@ class CadDepthPoseEstimator:
         )
         return result
 
+    def _region_mask_from_detection(self, image_shape: tuple[int, int], det: Dict):
+        h, w = int(image_shape[0]), int(image_shape[1])
+        full = np.zeros((h, w), dtype=np.uint8)
+        poly = det.get("mask_polygon_uv")
+        if isinstance(poly, list) and len(poly) >= 3:
+            pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
+            pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+            pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+            cv2.fillPoly(full, [np.round(pts).astype(np.int32)], 255)
+            return full
+        corners = det.get("obb_corners_uv")
+        if isinstance(corners, list) and len(corners) == 4:
+            pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+            pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+            pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+            cv2.fillConvexPoly(full, np.round(pts).astype(np.int32), 255)
+            return full
+        return None
+
+    def _obb_axis_hint_camera(self, camera_info: CameraInfo, det: Dict) -> Optional[np.ndarray]:
+        obb = det.get("obb_cxcywh_deg")
+        if not isinstance(obb, list) or len(obb) < 5:
+            return None
+        cx, cy, rw, rh, angle = [float(v) for v in obb[:5]]
+        if max(rw, rh) < 1e-3:
+            return None
+        if rw >= rh:
+            theta = np.deg2rad(angle)
+        else:
+            theta = np.deg2rad(angle + 90.0)
+        uv_dir = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
+        fx = float(camera_info.k[0]); fy = float(camera_info.k[4])
+        if fx <= 1e-6 or fy <= 1e-6:
+            return None
+        ray = np.array([uv_dir[0] / fx, uv_dir[1] / fy, 0.0], dtype=np.float32)
+        n = float(np.linalg.norm(ray[:2]))
+        if n < 1e-6:
+            return None
+        ray[:2] /= n
+        return ray
+
     def _depth_crop_to_point_cloud(self, camera_info: CameraInfo, depth_image: np.ndarray, det: Dict):
         h, w = depth_image.shape[:2]
         x1, y1, x2, y2 = [float(v) for v in det.get("bbox_xyxy", [0, 0, 0, 0])]
@@ -137,11 +193,15 @@ class CadDepthPoseEstimator:
         if patch.size == 0:
             return None, None
 
+        region_mask_full = self._region_mask_from_detection((h, w), det)
+        region_mask = None if region_mask_full is None else np.asarray(region_mask_full[iy1:iy2, ix1:ix2] > 0, dtype=bool)
+
         valid = np.isfinite(patch) & (patch > 0.05) & (patch < 3.0)
+        if region_mask is not None:
+            valid &= region_mask
         if not np.any(valid):
             return None, None
 
-        # Robustly suppress distant board/background points while keeping the object cluster.
         valid_depths = patch[valid]
         z_med = float(np.median(valid_depths))
         z_mad = float(np.median(np.abs(valid_depths - z_med)))
@@ -151,6 +211,8 @@ class CadDepthPoseEstimator:
         valid &= (patch >= z_min) & (patch <= z_max)
         if np.count_nonzero(valid) < self._min_points:
             valid = np.isfinite(patch) & (patch > 0.05) & (patch < 3.0)
+            if region_mask is not None:
+                valid &= region_mask
 
         ys, xs = np.where(valid)
         if xs.size < self._min_points:

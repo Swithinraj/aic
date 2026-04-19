@@ -70,8 +70,15 @@ class Detection:
         self.class_name: str = str(d.get("class_name", "unknown"))
         self.confidence: float = float(d.get("confidence", 0.0))
         x0, y0, x1, y1 = d.get("bbox_xyxy", [0, 0, 0, 0])
-        self.u: float = (x0 + x1) / 2.0   # pixel column of bbox centre
-        self.v: float = (y0 + y1) / 2.0   # pixel row   of bbox centre
+        obb = d.get("obb_cxcywh_deg", None)
+        if isinstance(obb, list) and len(obb) >= 2:
+            self.u = float(obb[0])
+            self.v = float(obb[1])
+            self.obb = tuple(float(v) for v in obb[:5])
+        else:
+            self.u = (x0 + x1) / 2.0
+            self.v = (y0 + y1) / 2.0
+            self.obb = None
         self.bbox: Tuple[float, float, float, float] = (x0, y0, x1, y1)
 
 
