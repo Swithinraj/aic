@@ -430,48 +430,49 @@ class MotionServoNode(Node):
 
 class mypolicy(Policy):
     SERVO_HOVER_Z = 0.06
-    SERVO_WORLD_TOLERANCE = 0.003
+    # Bug 4 fix: relaxed from 0.003 — 10mm world-frame tolerance is achievable with noisy detections
+    SERVO_WORLD_TOLERANCE = 0.010
     SERVO_MAX_ITERATIONS = 500
     SERVO_GAIN_XY = 1.20
     SERVO_GAIN_Z = 0.35
     SERVO_STEP_SEC = 0.10
-    # Extended to allow world-frame fallback to converge (~50s for 100mm at 3mm/iter*0.1s/iter)
     SERVO_TIMEOUT_SEC = 50.0
 
     SERVO_DLS_DAMPING = 1.5
     SERVO_MAX_LINEAR_SPEED_XY = 0.030
     SERVO_MAX_LINEAR_SPEED_Z = 0.008
     SERVO_MIN_LINEAR_SPEED_XY = 0.0
-    SERVO_CONVERGED_PX = 22.0
+    # Bug 4 fix: relaxed from 22px — 22px = 2.2mm which is impossible with noisy detections
+    # 60px ≈ 6mm at hover height, reliably achievable from the world-frame fallback path
+    SERVO_CONVERGED_PX = 60.0
     SERVO_CONVERGED_PX_STABLE_COUNT = 4
     SERVO_Z_ENABLE_PX = 90.0
     SERVO_ABORT_PX = 120.0
 
     SERVO_MAX_YAW_RATE = 0.20
     SERVO_YAW_GAIN = 0.8
-    SERVO_YAW_CONVERGED_RAD = 0.10
+    # Bug 3 fix: SC port yaw tolerance loosened — SC slot has a mechanical guide
+    # that corrects small angular errors on insertion; 0.10 rad was blocking servo convergence
+    SERVO_YAW_CONVERGED_RAD = 0.10        # kept for SFP
+    SERVO_YAW_CONVERGED_RAD_SC = 0.30     # looser for SC (≈17°)
     SERVO_MIN_CONFIDENCE = 0.20
     SERVO_LAST_VALID_PAIR_SEC = 0.60
 
     INSERT_Z_STEP = 0.001
     INSERT_MAX_LATERAL_FORCE = 15.0
     INSERT_MAX_Z_FORCE = 30.0
-    # Raised from 2.0 to 4.0: during SFP insertion the spring-loaded latch
-    # keeps resistance elevated (3-8N) through most of the stroke.
-    # A 2N threshold means settled_count never accumulates mid-stroke.
     INSERT_SETTLED_FORCE = 4.0
-    # Minimum depth past first contact for a force-settled success.
     INSERT_MIN_DEPTH_FOR_SETTLED_MM = 5.0
-    # Depth-only success threshold: if plug travels >= 8mm past contact,
-    # declare success regardless of force reading (SFP minimum engagement).
     INSERT_DEEP_SUCCESS_MM = 8.0
-    # From observed runs: TCP starts at ~0.299m. Port face at ~0.179m.
-    # Gap = 0.120m to port face + 0.025m insertion depth = 0.145m total.
-    # Use 0.160m to give margin.
     INSERT_MAX_DEPTH = 0.160
+    # SC insertion travels in Y — max travel from standoff to full engagement
+    SC_INSERT_MAX_TRAVEL = 0.080          # 80mm max Y travel
+    SC_INSERT_SPEED = 0.008               # 8mm/s horizontal insertion speed
+    SC_HOVER_Y_STANDOFF = 0.06           # 6cm standoff in +Y before inserting
+    SC_PORT_FACE_Z = 0.25                 # SC ports are higher on the board than SFP
     INSERT_STEP_SEC = 0.15
     INSERT_TIMEOUT_SEC = 45.0
-
+    
     DEFAULT_FX = 600.0
     DEFAULT_FY = 600.0
     DEFAULT_CX = 320.0
@@ -536,40 +537,81 @@ class mypolicy(Policy):
 
         self._motion_servo.ensure_cartesian_mode()
 
-        # Capture the current gripper orientation once — the robot is already
-        # pointing downward in its home pose, so we reuse this for all targets.
         current_pose = self._motion_servo.get_current_pose() or observation.controller_state.tcp_pose
-        gripper_orientation = Quaternion(
-            x=float(current_pose.orientation.x),
-            y=float(current_pose.orientation.y),
-            z=float(current_pose.orientation.z),
-            w=float(current_pose.orientation.w),
-        )
-        send_feedback(
-            f"mypolicy/gripper_orientation x={gripper_orientation.x:.4f} y={gripper_orientation.y:.4f} "
-            f"z={gripper_orientation.z:.4f} w={gripper_orientation.w:.4f}"
-        )
 
-        # Pick the right port detection class based on the task
+        # --- Determine port type and set PER-TYPE config ---
+        # This is the root cause of the orientation slant bug:
+        # SC ports require a HORIZONTAL approach (-Y axis), not a downward -Z approach.
+        # SFP ports face upward on the NIC card and need a vertical -Z approach.
+        # Using the same downward orientation for both causes the SC plug to hit the
+        # top rim of the port housing instead of entering from the side.
         port_type = str(task.port_type).strip().lower()
         target_port_name = str(task.port_name).strip().lower()
-        if port_type == "sfp":
-            port_matcher = lambda det: self._matches_specific_port(det, target_port_name, self._sfp_port_classes)
-            port_label = target_port_name or "sfp_port"
-        elif port_type == "sc":
+
+        if port_type == "sc":
+            # SC port: sc_port_base_link has pose roll=π/2, pitch=π
+            # → insertion axis is horizontal in world frame, approach in -Y
+            # Rotate home orientation 90° around world X to point gripper sideways.
+            # Home pose is roughly pointing down (x≈1,y≈0,z≈0,w≈0).
+            # After 90° rotation around X: gripper Z-axis points in -Y world direction.
+            home_q = [
+                float(current_pose.orientation.x),
+                float(current_pose.orientation.y),
+                float(current_pose.orientation.z),
+                float(current_pose.orientation.w),
+            ]
+            rot_90_x = [math.sin(math.pi / 4), 0.0, 0.0, math.cos(math.pi / 4)]  # 90° around X
+            sc_q = _quat_multiply(home_q, rot_90_x)
+            sc_q = _quat_normalize(sc_q)
+            gripper_orientation = Quaternion(x=sc_q[0], y=sc_q[1], z=sc_q[2], w=sc_q[3])
+            insertion_axis = "y"
+            hover_z_offset = 0.0        # SC: hover at same Z as port, not above it
+            hover_min_z = 0.15
+            yaw_converged_rad = self.SERVO_YAW_CONVERGED_RAD_SC   # Bug 3 fix: loose for SC
             port_matcher = self._is_sc_port_detection
             port_label = "sc_port"
+            # SC fallback stays within SC class — never fall back to SFP
+            fallback_matcher = self._is_sc_port_detection
+        elif port_type == "sfp":
+            # SFP port: faces upward on NIC card, insert straight down (-Z)
+            # Keep home orientation (already pointing down)
+            gripper_orientation = Quaternion(
+                x=float(current_pose.orientation.x),
+                y=float(current_pose.orientation.y),
+                z=float(current_pose.orientation.z),
+                w=float(current_pose.orientation.w),
+            )
+            insertion_axis = "z"
+            hover_z_offset = self.SERVO_HOVER_Z
+            hover_min_z = 0.20
+            yaw_converged_rad = self.SERVO_YAW_CONVERGED_RAD
+            port_matcher = lambda det: self._matches_specific_port(det, target_port_name, self._sfp_port_classes)
+            port_label = target_port_name or "sfp_port"
+            fallback_matcher = self._is_sfp_port_detection
         else:
+            gripper_orientation = Quaternion(
+                x=float(current_pose.orientation.x),
+                y=float(current_pose.orientation.y),
+                z=float(current_pose.orientation.z),
+                w=float(current_pose.orientation.w),
+            )
+            insertion_axis = "z"
+            hover_z_offset = self.SERVO_HOVER_Z
+            hover_min_z = 0.20
+            yaw_converged_rad = self.SERVO_YAW_CONVERGED_RAD
             port_matcher = self._is_nic_detection
             port_label = "nic_card"
+            fallback_matcher = self._is_nic_detection
 
-        send_feedback(f"mypolicy/target_port_type={port_type} target_port_name={target_port_name} matcher={port_label}")
+        send_feedback(
+            f"mypolicy/config port_type={port_type} insertion_axis={insertion_axis} "
+            f"gripper_q=({gripper_orientation.x:.3f},{gripper_orientation.y:.3f},"
+            f"{gripper_orientation.z:.3f},{gripper_orientation.w:.3f}) "
+            f"yaw_tol_deg={math.degrees(yaw_converged_rad):.1f}"
+        )
 
-        # ====== PHASE 1: Coarse approach via YOLO — go directly to port ======
-        send_feedback("mypolicy/phase1_coarse_approach")
-
-        # Detect specific target port
-        send_feedback(f"mypolicy/search_{port_label}")
+        # ====== PHASE 1: Detect port and coarse approach ======
+        send_feedback(f"mypolicy/phase1_search_{port_label}")
         port_result = self._wait_for_detection(
             matcher=port_matcher,
             timeout_sec=12.0,
@@ -577,15 +619,15 @@ class mypolicy(Policy):
             min_update_time=0.0,
         )
         if port_result is None:
-            # Fallback: try generic sfp_port matcher
-            send_feedback(f"mypolicy/{port_label}_not_found, fallback to generic sfp_port")
+            # Bug 1 fix: fallback stays within the correct cable family
+            send_feedback(f"mypolicy/{port_label}_not_found, fallback within same type")
             port_result = self._wait_for_detection(
-                matcher=self._is_sfp_port_detection,
+                matcher=fallback_matcher,
                 timeout_sec=8.0,
                 preferred_camera=None,
                 min_update_time=0.0,
             )
-            port_label = "sfp_port_fallback"
+            port_label = f"{port_label}_fallback"
 
         if port_result is None:
             send_feedback("mypolicy/fail port_not_found")
@@ -598,17 +640,17 @@ class mypolicy(Policy):
 
         send_feedback(
             f"mypolicy/port_detected class={port_result['detection'].get('class_name', '')} "
-            f"conf={port_result['confidence']:.3f} xyz=({port_pose_raw.position.x:.3f},{port_pose_raw.position.y:.3f},{port_pose_raw.position.z:.3f})"
+            f"conf={port_result['confidence']:.3f} "
+            f"xyz=({port_pose_raw.position.x:.3f},{port_pose_raw.position.y:.3f},{port_pose_raw.position.z:.3f})"
         )
 
-        # Sample position accurately for 15s, plan static path, and monitor pixel alignment
         send_feedback("mypolicy/phase1_sample_and_verify")
         if not self._execute_sample_and_verify_goal(
             label="hover_above_port",
             matcher=port_matcher,
             gripper_orientation=gripper_orientation,
-            z_offset=self.SERVO_HOVER_Z,
-            min_z=0.20,
+            z_offset=hover_z_offset,
+            min_z=hover_min_z,
             get_observation=get_observation,
             send_feedback=send_feedback,
             timeout_sec=60.0,
@@ -625,6 +667,7 @@ class mypolicy(Policy):
             port_label=port_label,
             gripper_orientation=gripper_orientation,
             send_feedback=send_feedback,
+            yaw_converged_rad=yaw_converged_rad,   # Bug 3 fix: pass per-type tolerance
         )
         if not servo_ok:
             send_feedback("mypolicy/phase2_servo_failed (stopping before insertion)")
@@ -633,19 +676,28 @@ class mypolicy(Policy):
 
         self.sleep_for(0.5)
 
-        # ====== PHASE 3: Force-feedback insertion ======
-        send_feedback("mypolicy/phase3_force_insertion_start")
-        # Use the initial port detection Z as the port face hint.
-        # port_pose_raw.position.z is the board-surface Z from the camera homography
-        # (real measured depth, not the hardcoded fused-detection value).
-        port_face_hint_z = float(port_pose_raw.position.z) if port_pose_raw is not None else None
-        insert_ok = self._sfp_force_insert(
-            gripper_orientation=gripper_orientation,
-            get_observation=get_observation,
-            move_robot=move_robot,
-            send_feedback=send_feedback,
-            port_face_hint_z=port_face_hint_z,
-        )
+        # ====== PHASE 3: Insertion ======
+        send_feedback(f"mypolicy/phase3_insertion_start axis={insertion_axis}")
+
+        if insertion_axis == "y":
+            # SC cable: horizontal insertion in -Y direction
+            insert_ok = self._sc_force_insert(
+                port_matcher=port_matcher,
+                gripper_orientation=gripper_orientation,
+                get_observation=get_observation,
+                send_feedback=send_feedback,
+            )
+        else:
+            # SFP/NIC cable: vertical insertion in -Z direction
+            port_face_hint_z = float(port_pose_raw.position.z) if port_pose_raw is not None else None
+            insert_ok = self._sfp_force_insert(
+                gripper_orientation=gripper_orientation,
+                get_observation=get_observation,
+                move_robot=move_robot,
+                send_feedback=send_feedback,
+                port_face_hint_z=port_face_hint_z,
+                port_matcher=port_matcher,    # Bug 5 fix: passed through for live XY hold
+            )
 
         self._motion_servo.stop()
 
@@ -665,7 +717,12 @@ class mypolicy(Policy):
         port_label: str,
         gripper_orientation: Quaternion,
         send_feedback: SendFeedbackCallback,
+        yaw_converged_rad: float = None,    # Bug 3 fix: per-type yaw tolerance
     ) -> bool:
+        # Use the passed tolerance, or fall back to the class default
+        if yaw_converged_rad is None:
+            yaw_converged_rad = self.SERVO_YAW_CONVERGED_RAD
+
         deadline = time.monotonic() + self.SERVO_TIMEOUT_SEC
         best_metric_error = float("inf")
         stable_count = 0
@@ -681,13 +738,23 @@ class mypolicy(Policy):
             matcher=port_matcher, require_pose=True, freshness_sec=2.0
         )
         if initial_fused is None:
+            # Bug 1 fix: fall back within the same matcher, not always sfp_port
             initial_fused = self._detection_listener.find_best(
-                matcher=self._is_sfp_port_detection, require_pose=True, freshness_sec=2.0
+                matcher=port_matcher, require_pose=True, freshness_sec=5.0
             )
+            
         if initial_fused is not None:
             ip = self._pose_from_detection(initial_fused["detection"])
             if ip is not None:
-                cached_port_pose = ip
+                # Make a copy, not a reference, to avoid mutations
+                cached_port_pose = Pose()
+                cached_port_pose.position.x = float(ip.position.x)
+                cached_port_pose.position.y = float(ip.position.y)
+                cached_port_pose.position.z = float(ip.position.z)
+                cached_port_pose.orientation.x = float(ip.orientation.x)
+                cached_port_pose.orientation.y = float(ip.orientation.y)
+                cached_port_pose.orientation.z = float(ip.orientation.z)
+                cached_port_pose.orientation.w = float(ip.orientation.w)
                 port_yaw_init = math.degrees(2.0 * math.atan2(float(ip.orientation.z), float(ip.orientation.w)))
                 send_feedback(
                     f"mypolicy/servo_entry"
@@ -742,7 +809,7 @@ class mypolicy(Policy):
                         port_yaw_to = 2.0 * math.atan2(pqz_to, pqw_to)
                         tcp_yaw_to = self._quat_yaw_rad(cur_at_timeout.orientation)
                         yaw_err_to = abs(self._angle_wrap(port_yaw_to - tcp_yaw_to))
-                        yaw_ok_to = yaw_err_to <= self.SERVO_YAW_CONVERGED_RAD
+                        yaw_ok_to = yaw_err_to <= yaw_converged_rad
                         send_feedback(
                             f"mypolicy/servo_timeout_world_xy_err={xy_err_mm:.1f}mm"
                             f" yaw_err_deg={math.degrees(yaw_err_to):.2f} yaw_ok={yaw_ok_to}"
@@ -911,11 +978,12 @@ class mypolicy(Policy):
                     require_pose=True,
                     freshness_sec=3.0,
                 )
+                # Bug 1 fix: fallback uses port_matcher, not hardcoded sfp_port
                 if fused_for_yaw is None:
                     fused_for_yaw = self._detection_listener.find_best(
-                        matcher=self._is_sfp_port_detection,
+                        matcher=port_matcher,
                         require_pose=True,
-                        freshness_sec=3.0,
+                        freshness_sec=8.0,
                     )
                 if fused_for_yaw is not None:
                     port_pose_yaw = self._pose_from_detection(fused_for_yaw["detection"])
@@ -937,7 +1005,7 @@ class mypolicy(Policy):
                         wz_raw = self.SERVO_YAW_GAIN * yaw_err_rad
                         wz = float(np.clip(wz_raw, -self.SERVO_MAX_YAW_RATE, self.SERVO_MAX_YAW_RATE))
 
-                yaw_converged = abs(yaw_err_rad) <= self.SERVO_YAW_CONVERGED_RAD
+                yaw_converged = abs(yaw_err_rad) <= yaw_converged_rad
 
                 send_feedback(
                     f"mypolicy/servo_iter_{iteration}"
@@ -985,7 +1053,15 @@ class mypolicy(Policy):
             live_fallback_pose = self._pose_from_detection(fused_port["detection"]) if fused_port else None
             if live_fallback_pose is not None:
                 if cached_port_pose is None:
-                    cached_port_pose = live_fallback_pose
+                    # Make a copy, not a reference, to avoid mutations of the original
+                    cached_port_pose = Pose()
+                    cached_port_pose.position.x = float(live_fallback_pose.position.x)
+                    cached_port_pose.position.y = float(live_fallback_pose.position.y)
+                    cached_port_pose.position.z = float(live_fallback_pose.position.z)
+                    cached_port_pose.orientation.x = float(live_fallback_pose.orientation.x)
+                    cached_port_pose.orientation.y = float(live_fallback_pose.orientation.y)
+                    cached_port_pose.orientation.z = float(live_fallback_pose.orientation.z)
+                    cached_port_pose.orientation.w = float(live_fallback_pose.orientation.w)
                 else:
                     # Only update cache if the new detection is within 50mm of the cached position
                     # (prevents large jumps from noisy or wrong detections)
@@ -993,11 +1069,11 @@ class mypolicy(Policy):
                     cache_dy = float(live_fallback_pose.position.y) - float(cached_port_pose.position.y)
                     cache_dist = math.sqrt(cache_dx * cache_dx + cache_dy * cache_dy)
                     if cache_dist <= 0.050:
-                        # Smooth update: blend new detection toward cached (EMA with alpha=0.3)
+                        # Smooth update: blend new detection toward cached (EMA with alpha=0.3) for all axes
                         alpha = 0.3
                         cached_port_pose.position.x = (1.0 - alpha) * float(cached_port_pose.position.x) + alpha * float(live_fallback_pose.position.x)
                         cached_port_pose.position.y = (1.0 - alpha) * float(cached_port_pose.position.y) + alpha * float(live_fallback_pose.position.y)
-                        cached_port_pose.position.z = float(live_fallback_pose.position.z)
+                        cached_port_pose.position.z = (1.0 - alpha) * float(cached_port_pose.position.z) + alpha * float(live_fallback_pose.position.z)
 
             fallback_pose = cached_port_pose
             if fallback_pose is not None:
@@ -1012,7 +1088,7 @@ class mypolicy(Policy):
                 # Use full Euler yaw extraction (stable for downward-facing gripper with x≈1, w≈0)
                 fb_tcp_yaw = self._quat_yaw_rad(current_pose.orientation)
                 fb_yaw_err = self._angle_wrap(fb_port_yaw - fb_tcp_yaw)
-                fb_yaw_converged = abs(fb_yaw_err) <= self.SERVO_YAW_CONVERGED_RAD
+                fb_yaw_converged = abs(fb_yaw_err) <= yaw_converged_rad
                 # Proportional yaw correction even in fallback mode
                 fb_wz_raw = self.SERVO_YAW_GAIN * fb_yaw_err
                 fb_wz = float(np.clip(fb_wz_raw, -self.SERVO_MAX_YAW_RATE, self.SERVO_MAX_YAW_RATE))
@@ -1076,7 +1152,7 @@ class mypolicy(Policy):
                 port_yaw_mi = 2.0 * math.atan2(pqz_mi, pqw_mi)
                 tcp_yaw_mi = self._quat_yaw_rad(cur_at_max.orientation)
                 yaw_err_mi = abs(self._angle_wrap(port_yaw_mi - tcp_yaw_mi))
-                yaw_ok_mi = yaw_err_mi <= self.SERVO_YAW_CONVERGED_RAD
+                yaw_ok_mi = yaw_err_mi <= yaw_converged_rad
                 send_feedback(
                     f"mypolicy/servo_max_iter_world_xy_err={xy_err_mm:.1f}mm"
                     f" yaw_err_deg={math.degrees(yaw_err_mi):.2f} yaw_ok={yaw_ok_mi}"
@@ -1539,6 +1615,7 @@ class mypolicy(Policy):
         move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
         port_face_hint_z: Optional[float] = None,
+        port_matcher: Callable[[Dict], bool] = None,   # Bug 5 fix: for live XY hold
     ) -> bool:
         """Perform insertion by stepping down in velocity mode.
 
@@ -1679,8 +1756,30 @@ class mypolicy(Policy):
                     return True
 
             # Step down using pure velocity Twist
+            # Step down with live XY correction to hold alignment during descent.
+            # Bug 5 fix: pure -Z descent drifts off-center from cable drag / compliance.
+            # We read the latest fused port detection and apply a small proportional
+            # correction in X and Y each step to keep the plug centered on the port.
             twist = Twist()
             twist.linear.z = -0.010  # Descend at 10mm/sec
+
+            if port_matcher is not None:
+                fused_xy = self._detection_listener.find_best(
+                    matcher=port_matcher, require_pose=True, freshness_sec=1.0
+                )
+                if fused_xy is not None:
+                    fp_xy = self._pose_from_detection(fused_xy["detection"])
+                    if fp_xy is not None:
+                        # Proportional XY correction capped at ±5mm/s
+                        twist.linear.x = float(np.clip(
+                            (float(fp_xy.position.x) - float(current_pose.position.x)) * 2.0,
+                            -0.005, 0.005
+                        ))
+                        twist.linear.y = float(np.clip(
+                            (float(fp_xy.position.y) - float(current_pose.position.y)) * 2.0,
+                            -0.005, 0.005
+                        ))
+
             self._motion_servo.publish_twist_command(twist)
 
             self.sleep_for(self.INSERT_STEP_SEC)
@@ -1693,6 +1792,152 @@ class mypolicy(Policy):
             final_z = float(current_pose.position.z) if current_pose is not None else start_z
             depth_achieved = insertion_started_z - final_z
             send_feedback(f"mypolicy/insert_timeout_depth_achieved={depth_achieved*1000:.1f}mm (need>={self.INSERT_DEEP_SUCCESS_MM}mm)")
+            return depth_achieved >= (self.INSERT_DEEP_SUCCESS_MM / 1000.0)
+        return False
+
+    def _sc_force_insert(
+        self,
+        port_matcher: Callable[[Dict], bool],
+        gripper_orientation: Quaternion,
+        get_observation: GetObservationCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        """Horizontal insertion for SC cables.
+
+        SC ports face outward from the taskboard rail with insertion axis along world -Y.
+        The sc_port_base_link has pose (roll=π/2, pitch=π) meaning the port Z-axis
+        (insertion direction) points horizontally. We move the gripper in -Y world direction.
+
+        The gripper was already reoriented in insert_cable() so its tool-Z points in -Y.
+        Here we just step in -Y and use depth-based contact detection on the Y axis.
+        """
+        current_pose = self._motion_servo.get_current_pose()
+        if current_pose is None:
+            send_feedback("mypolicy/sc_insert_fail no_pose")
+            return False
+
+        # Tare wrench
+        tare_fx, tare_fy, tare_fz = 0.0, 0.0, 0.0
+        tare_obs = get_observation()
+        if tare_obs is not None:
+            w = tare_obs.wrist_wrench.wrench
+            tare_fx = float(w.force.x)
+            tare_fy = float(w.force.y)
+            tare_fz = float(w.force.z)
+            send_feedback(f"mypolicy/sc_insert_tare fx={tare_fx:.2f} fy={tare_fy:.2f} fz={tare_fz:.2f}")
+
+        start_y = float(current_pose.position.y)
+        # SC port entrance is 15.64mm from base_link along port axis.
+        # We approach from SC_HOVER_Y_STANDOFF cm away and travel at most SC_INSERT_MAX_TRAVEL.
+        abs_min_y = start_y - self.SC_INSERT_MAX_TRAVEL
+        deadline = time.monotonic() + self.INSERT_TIMEOUT_SEC
+
+        # Determine port face Y from fused detection
+        PORT_FACE_Y = start_y - 0.030   # default: 30mm ahead
+        port_face_source = "default_offset"
+        fused_port = self._detection_listener.find_best(
+            matcher=port_matcher, require_pose=True, freshness_sec=5.0
+        )
+        if fused_port is not None:
+            fp = self._pose_from_detection(fused_port["detection"])
+            if fp is not None:
+                PORT_FACE_Y = float(fp.position.y)
+                port_face_source = f"fused(conf={fused_port['confidence']:.2f})"
+
+        contact_trigger_y = PORT_FACE_Y + 0.005   # 5mm before port face
+        insertion_started = False
+        insertion_started_y = None
+
+        send_feedback(
+            f"mypolicy/sc_insert_start start_y={start_y:.4f} abs_min_y={abs_min_y:.4f} "
+            f"port_face_y={PORT_FACE_Y:.4f} source={port_face_source} "
+            f"contact_trigger_y={contact_trigger_y:.4f}"
+        )
+
+        while time.monotonic() < deadline:
+            current_pose = self._motion_servo.get_current_pose()
+            if current_pose is None:
+                self.sleep_for(self.INSERT_STEP_SEC)
+                continue
+
+            current_y = float(current_pose.position.y)
+
+            if current_y <= abs_min_y:
+                send_feedback(f"mypolicy/sc_insert_max_travel current_y={current_y:.4f}")
+                break
+
+            # Force monitoring for safety abort
+            observation = get_observation()
+            if observation is not None:
+                w = observation.wrist_wrench.wrench
+                raw_fx = float(w.force.x) - tare_fx
+                raw_fy = float(w.force.y) - tare_fy
+                raw_fz = float(w.force.z) - tare_fz
+                lateral_force = math.sqrt(raw_fx**2 + raw_fz**2)   # X and Z are lateral for SC
+                insert_force = abs(raw_fy)                           # Y is the insertion axis
+
+                send_feedback(
+                    f"mypolicy/sc_insert y={current_y:.4f} dist_to_port={current_y - PORT_FACE_Y:.4f}m "
+                    f"fy={raw_fy:.2f} lat={lateral_force:.2f} ins_started={insertion_started}"
+                )
+
+                if lateral_force > self.INSERT_MAX_LATERAL_FORCE:
+                    send_feedback(f"mypolicy/sc_insert_abort lateral_force={lateral_force:.2f}")
+                    return False
+                if insert_force > self.INSERT_MAX_Z_FORCE:
+                    send_feedback(f"mypolicy/sc_insert_abort insert_force={insert_force:.2f}")
+                    return False
+
+            # Depth-based contact detection on Y axis
+            if not insertion_started and current_y <= contact_trigger_y:
+                insertion_started = True
+                insertion_started_y = current_y
+                send_feedback(
+                    f"mypolicy/sc_insert_contact y={current_y:.4f} port_face_y={PORT_FACE_Y:.4f}"
+                )
+
+            if insertion_started and insertion_started_y is not None:
+                depth = insertion_started_y - current_y
+                if depth >= (self.INSERT_DEEP_SUCCESS_MM / 1000.0):
+                    send_feedback(
+                        f"mypolicy/sc_insert_success y={current_y:.4f} "
+                        f"depth={depth*1000:.1f}mm"
+                    )
+                    return True
+
+            # Move in -Y with live XZ hold (keep plug centered on port during insertion)
+            twist = Twist()
+            twist.linear.y = -self.SC_INSERT_SPEED
+
+            fused_xy = self._detection_listener.find_best(
+                matcher=port_matcher, require_pose=True, freshness_sec=1.0
+            )
+            if fused_xy is not None:
+                fp_xy = self._pose_from_detection(fused_xy["detection"])
+                if fp_xy is not None:
+                    twist.linear.x = float(np.clip(
+                        (float(fp_xy.position.x) - float(current_pose.position.x)) * 2.0,
+                        -0.005, 0.005
+                    ))
+                    twist.linear.z = float(np.clip(
+                        (float(fp_xy.position.z) - float(current_pose.position.z)) * 2.0,
+                        -0.005, 0.005
+                    ))
+
+            self._motion_servo.publish_twist_command(twist)
+            self.sleep_for(self.INSERT_STEP_SEC)
+
+        self._motion_servo.stop()
+        send_feedback("mypolicy/sc_insert_timeout")
+
+        if insertion_started and insertion_started_y is not None:
+            final_pose = self._motion_servo.get_current_pose()
+            final_y = float(final_pose.position.y) if final_pose is not None else start_y
+            depth_achieved = insertion_started_y - final_y
+            send_feedback(
+                f"mypolicy/sc_insert_timeout_depth={depth_achieved*1000:.1f}mm "
+                f"(need>={self.INSERT_DEEP_SUCCESS_MM}mm)"
+            )
             return depth_achieved >= (self.INSERT_DEEP_SUCCESS_MM / 1000.0)
         return False
 
