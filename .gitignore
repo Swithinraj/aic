@@ -22,3 +22,8 @@ team_policy/models/depth_anything_v2_small/
 team_policy/models/Depth-Anything-V2-Metric-Indoor-Base-hf/*.safetensors
 
 team_policy/models/Depth-Anything-V2-Metric-Indoor-Base-hf/*
+
+# training data outputs
+team_policy/team_policy/training_robot/episodes/
+team_policy/team_policy/training_robot/lerobot_datasets/
+team_policy/team_policy/training_robot/dataset/

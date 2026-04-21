@@ -1,0 +1,291 @@
+"""
+Buffers one episode of (observation, action) pairs and saves to HDF5.
+
+Action stored here is the absolute TCP pose commanded by CheatCode at each step.
+During convert_to_lerobot.py those are turned into delta poses (position diff +
+axis-angle rotation diff) which match the 6-D twist action space that RunACT uses.
+"""
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+
+# HDF5 file locking fails on tmpfs (/tmp) — disable it globally
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+CONTACT_FORCE_THRESHOLD_N = 0.5
+SCHEMA_VERSION = "2"
+
+
+def _quat_normalize(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-9:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    return q / norm
+
+
+def _quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ax, ay, az, aw = _quat_normalize(a)
+    bx, by, bz, bw = _quat_normalize(b)
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _quat_inverse(q: np.ndarray) -> np.ndarray:
+    x, y, z, w = _quat_normalize(q)
+    return np.array([-x, -y, -z, w], dtype=np.float32)
+
+
+def _quat_to_axis_angle(q: np.ndarray) -> np.ndarray:
+    x, y, z, w = _quat_normalize(q)
+    if w < 0.0:
+        x, y, z, w = -x, -y, -z, -w
+    sin_half = float(np.linalg.norm([x, y, z]))
+    if sin_half < 1e-9:
+        return np.zeros(3, dtype=np.float32)
+    angle = 2.0 * np.arctan2(sin_half, max(abs(float(w)), 1e-12))
+    return np.array([x / sin_half * angle, y / sin_half * angle, z / sin_half * angle], dtype=np.float32)
+
+
+def _pose_delta(current_pose: np.ndarray, target_pose: np.ndarray) -> np.ndarray:
+    """Return 6D delta [dx, dy, dz, rx, ry, rz] from current pose to target pose."""
+    if not np.any(target_pose):
+        return np.zeros(6, dtype=np.float32)
+    dp = np.asarray(target_pose[:3] - current_pose[:3], dtype=np.float32)
+    dq = _quat_multiply(target_pose[3:], _quat_inverse(current_pose[3:]))
+    dr = _quat_to_axis_angle(dq)
+    return np.concatenate([dp, dr]).astype(np.float32)
+
+
+def _compute_target_velocity_actions(cmd_poses: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+    """Finite-difference expert commanded poses into 6D velocity-like actions."""
+    T = cmd_poses.shape[0]
+    velocities = np.zeros((T, 6), dtype=np.float32)
+    valid = np.any(cmd_poses, axis=1)
+
+    for i in range(T - 1):
+        if not (valid[i] and valid[i + 1]):
+            continue
+        dt = float(timestamps[i + 1] - timestamps[i])
+        if dt <= 1e-6:
+            continue
+        delta = _pose_delta(cmd_poses[i], cmd_poses[i + 1])
+        velocities[i] = delta / dt
+
+    if T > 1:
+        velocities[-1] = velocities[-2]
+    return velocities
+
+
+@dataclass
+class Frame:
+    timestamp: float
+    task_id: str
+    left_image: np.ndarray       # (H, W, 3) uint8
+    center_image: np.ndarray
+    right_image: np.ndarray
+    tcp_pose: np.ndarray         # (7,) x y z qx qy qz qw
+    tcp_velocity: np.ndarray     # (6,) vx vy vz wx wy wz
+    tcp_error: np.ndarray        # (6,)
+    joint_positions: np.ndarray  # (7,)
+    wrist_force: np.ndarray      # (6,) fx fy fz tx ty tz
+    relative_pose: Optional[np.ndarray] = None  # (7,) target port pose in plug-tip frame
+    commanded_pose: Optional[np.ndarray] = None  # (7,) — set when CheatCode issues a command
+
+
+@dataclass
+class Episode:
+    episode_id: int
+    task_id: str
+    port_type: str
+    port_name: str
+    frames: List[Frame] = field(default_factory=list)
+    success: bool = False
+    start_time: float = 0.0
+    end_time: float = 0.0
+
+
+class EpisodeRecorder:
+    def __init__(self, output_dir: str):
+        self._output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self._current: Optional[Episode] = None
+        self._last_commanded_pose: Optional[np.ndarray] = None
+
+    def start_episode(self, episode_id: int, task_id: str, port_type: str, port_name: str) -> None:
+        self._current = Episode(
+            episode_id=episode_id,
+            task_id=task_id,
+            port_type=port_type,
+            port_name=port_name,
+            start_time=time.time(),
+        )
+        self._last_commanded_pose = None
+
+    def update_commanded_pose(self, pose: np.ndarray) -> None:
+        """Call this every time CheatCode sends a move_robot command."""
+        self._last_commanded_pose = pose.copy()
+
+    def record_frame(self, obs, relative_pose: Optional[np.ndarray] = None) -> None:
+        """
+        obs is an aic_model_interfaces/msg/Observation.
+        Called at ~20 Hz inside insert_cable while the episode is running.
+        """
+        if self._current is None:
+            return
+
+        def img_to_np(img_msg):
+            arr = np.frombuffer(img_msg.data, dtype=np.uint8)
+            return arr.reshape(img_msg.height, img_msg.width, 3).copy()
+
+        cs = obs.controller_state
+        tcp = cs.tcp_pose
+        vel = cs.tcp_velocity
+        js = obs.joint_states
+        w = obs.wrist_wrench.wrench
+
+        frame = Frame(
+            timestamp=time.time(),
+            task_id=self._current.task_id,
+            left_image=img_to_np(obs.left_image),
+            center_image=img_to_np(obs.center_image),
+            right_image=img_to_np(obs.right_image),
+            tcp_pose=np.array([
+                tcp.position.x, tcp.position.y, tcp.position.z,
+                tcp.orientation.x, tcp.orientation.y, tcp.orientation.z, tcp.orientation.w,
+            ], dtype=np.float32),
+            tcp_velocity=np.array([
+                vel.linear.x, vel.linear.y, vel.linear.z,
+                vel.angular.x, vel.angular.y, vel.angular.z,
+            ], dtype=np.float32),
+            tcp_error=np.array(list(cs.tcp_error), dtype=np.float32),
+            joint_positions=np.array(list(js.position[:7]), dtype=np.float32),
+            wrist_force=np.array([
+                w.force.x, w.force.y, w.force.z,
+                w.torque.x, w.torque.y, w.torque.z,
+            ], dtype=np.float32),
+            relative_pose=None if relative_pose is None else np.asarray(relative_pose, dtype=np.float32).copy(),
+            commanded_pose=self._last_commanded_pose,
+        )
+        self._current.frames.append(frame)
+
+    def end_episode(self, success: bool) -> Optional[str]:
+        """Finalise, save to HDF5, return path or None if too short."""
+        if self._current is None:
+            return None
+
+        ep = self._current
+        self._current = None
+        ep.success = success
+        ep.end_time = time.time()
+
+        if len(ep.frames) < 10:
+            return None
+
+        return self._save(ep)
+
+    def _save(self, ep: Episode) -> str:
+        try:
+            import h5py
+        except ImportError:
+            raise RuntimeError("h5py is required — add it to pixi.toml pypi-dependencies")
+
+        path = os.path.join(self._output_dir, f"episode_{ep.episode_id:05d}.hdf5")
+        T = len(ep.frames)
+
+        # Stack arrays
+        left   = np.stack([f.left_image   for f in ep.frames])
+        center = np.stack([f.center_image for f in ep.frames])
+        right  = np.stack([f.right_image  for f in ep.frames])
+        tcp_poses    = np.stack([f.tcp_pose         for f in ep.frames])
+        tcp_vels     = np.stack([f.tcp_velocity      for f in ep.frames])
+        tcp_errors   = np.stack([f.tcp_error         for f in ep.frames])
+        joint_pos    = np.stack([f.joint_positions   for f in ep.frames])
+        wrist_forces = np.stack([f.wrist_force       for f in ep.frames])
+        timestamps   = np.array([f.timestamp         for f in ep.frames], dtype=np.float64)
+        task_ids     = [f.task_id for f in ep.frames]
+
+        # commanded_pose may be None for early frames before CheatCode first commands
+        cmd_poses = np.stack([
+            f.commanded_pose if f.commanded_pose is not None else np.zeros(7, dtype=np.float32)
+            for f in ep.frames
+        ])
+        relative_valid = np.array([f.relative_pose is not None for f in ep.frames], dtype=np.bool_)
+        relative_poses = np.stack([
+            f.relative_pose if f.relative_pose is not None else np.zeros(7, dtype=np.float32)
+            for f in ep.frames
+        ])
+        delta_actions = np.stack([
+            _pose_delta(f.tcp_pose, cmd_poses[i])
+            for i, f in enumerate(ep.frames)
+        ])
+        velocity_actions = _compute_target_velocity_actions(cmd_poses, timestamps)
+
+        force_mag = np.linalg.norm(wrist_forces[:, :3], axis=1)
+        max_force = float(force_mag.max()) if T else 0.0
+        if T > 1:
+            dt = np.diff(timestamps)
+            median_dt = float(np.median(dt)) if dt.size else 0.0
+            frame_dt = np.concatenate([dt, np.array([median_dt], dtype=np.float64)])
+            insertion_time = float(timestamps[-1] - timestamps[0])
+        else:
+            frame_dt = np.zeros(T, dtype=np.float64)
+            insertion_time = 0.0
+        contact_mask = force_mag > CONTACT_FORCE_THRESHOLD_N
+        contact_duration = float(frame_dt[contact_mask].sum()) if T else 0.0
+        valid_rel_indices = np.flatnonzero(relative_valid)
+        final_error = (
+            float(np.linalg.norm(relative_poses[valid_rel_indices[-1], :3]))
+            if valid_rel_indices.size
+            else float("nan")
+        )
+
+        with h5py.File(path, "w") as hf:
+            obs = hf.create_group("observations")
+            img = obs.create_group("images")
+            img.create_dataset("left",   data=left,   compression="gzip", compression_opts=4)
+            img.create_dataset("center", data=center, compression="gzip", compression_opts=4)
+            img.create_dataset("right",  data=right,  compression="gzip", compression_opts=4)
+            obs.create_dataset("task_id", data=np.asarray(task_ids, dtype=h5py.string_dtype(encoding="utf-8")))
+            obs.create_dataset("tcp_pose",        data=tcp_poses)
+            obs.create_dataset("tcp_velocity",    data=tcp_vels)
+            obs.create_dataset("tcp_error",       data=tcp_errors)
+            obs.create_dataset("joint_positions", data=joint_pos)
+            obs.create_dataset("wrist_force",     data=wrist_forces)
+            obs.create_dataset("timestamps",      data=timestamps)
+            obs.create_dataset("relative_pose",   data=relative_poses)
+            obs.create_dataset("relative_pose_valid", data=relative_valid)
+
+            act = hf.create_group("actions")
+            act.create_dataset("commanded_pose", data=cmd_poses)
+            act.create_dataset("delta_pose", data=delta_actions)
+            act.create_dataset("velocity", data=velocity_actions)
+
+            meta = hf.create_group("metadata")
+            meta.attrs["schema_version"] = SCHEMA_VERSION
+            meta.attrs["episode_id"] = ep.episode_id
+            meta.attrs["task_id"]    = ep.task_id
+            meta.attrs["port_type"]  = ep.port_type
+            meta.attrs["port_name"]  = ep.port_name
+            meta.attrs["success"]    = int(ep.success)
+            meta.attrs["num_frames"] = T
+            meta.attrs["duration_s"] = ep.end_time - ep.start_time
+            meta.attrs["max_force"] = max_force
+            meta.attrs["final_error"] = final_error
+            meta.attrs["insertion_time"] = insertion_time
+            meta.attrs["contact_duration"] = contact_duration
+            meta.attrs["contact_force_threshold_n"] = CONTACT_FORCE_THRESHOLD_N
+
+        return path

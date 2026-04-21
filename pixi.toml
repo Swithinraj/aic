@@ -53,6 +53,8 @@ ultralytics = "*"
 pyrender = "*"
 pyglet = "*"
 PyOpenGL= "*"
+h5py = "*"
+pandas = "*"
 
 
 [activation]
