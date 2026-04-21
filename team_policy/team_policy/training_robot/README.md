@@ -132,6 +132,87 @@ run_003 -> about 3 episodes
 For 150 episodes, you need about 50 of these 3-trial runs, or a larger engine
 YAML with more trials.
 
+## Collect Another Batch With Different Task-Board Poses
+
+The engine reads task-board pose from the YAML file when Terminal 1 starts. If
+you want a new pose/orientation for the next collection batch:
+
+1. Edit `configs/orientation_sweep_3_trials.yaml`.
+2. Change the pose under the specific trial you want, for example
+   `trials -> trial_2 -> scene -> task_board -> pose`.
+3. Restart Terminal 1 so `aic_engine` reloads the YAML.
+4. Start Terminal 2 with a new `RUN_ID`.
+
+For example, to change **trial 2**, edit this block:
+
+```yaml
+trials:
+  trial_2:
+    scene:
+      task_board:
+        pose:
+          x: 0.14
+          y: -0.22
+          z: 1.14
+          roll: 0.04
+          pitch: -0.03
+          yaw: 3.35
+```
+
+Only the values inside this `pose` block control the task-board pose for
+`trial_2`:
+
+```yaml
+pose:
+  x: 0.14
+  y: -0.22
+  z: 1.14
+  roll: 0.04
+  pitch: -0.03
+  yaw: 3.35
+```
+
+To change `trial_1`, edit `trials.trial_1.scene.task_board.pose`. To change
+`trial_3`, edit `trials.trial_3.scene.task_board.pose`.
+
+After editing the YAML, run Terminal 1 again:
+
+```bash
+cd ~/ros2_ws/src/aic
+
+export AIC_ROOT="$(pwd)"
+export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
+export DBX_CONTAINER_MANAGER=docker
+
+distrobox enter -r aic_eval -- /entrypoint.sh \
+  ground_truth:=true \
+  start_aic_engine:=true \
+  gazebo_gui:=false \
+  launch_rviz:=false \
+  aic_engine_config_file:="$TRAIN_ROOT/configs/orientation_sweep_3_trials.yaml"
+```
+
+Then run Terminal 2 with a new output folder:
+
+```bash
+cd ~/ros2_ws/src/aic
+
+export AIC_ROOT="$(pwd)"
+export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
+export RUN_ID="run_002"
+export OUTPUT_DIR="$TRAIN_ROOT/episodes/orientation_sweep/$RUN_ID"
+
+pixi run ros2 run aic_model aic_model --ros-args \
+  -p use_sim_time:=true \
+  -p policy:=team_policy.training_robot.cheatcode_collector \
+  -p output_dir:="$OUTPUT_DIR" \
+  -p num_episodes:=3 \
+  -p success_only:=true
+```
+
+Do not reuse the same `RUN_ID` unless you intentionally want to overwrite
+existing `episode_00000.hdf5`, `episode_00001.hdf5`, and `episode_00002.hdf5`.
+
 ## Count Episodes
 
 ```bash
