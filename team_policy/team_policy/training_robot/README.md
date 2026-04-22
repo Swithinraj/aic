@@ -1,7 +1,6 @@
 # CheatCode Training Data Pipeline
 
-This folder contains the full imitation-learning data pipeline:
-collect expert demonstrations → validate → convert → train an ACT policy.
+Full imitation-learning pipeline: collect expert demos → validate → convert → train ACT → deploy.
 
 ```
 aic_engine runs N trials
@@ -9,13 +8,13 @@ aic_engine runs N trials
     → CheatCode (ground-truth oracle) executes each trial
       → EpisodeRecorder saves observations + expert actions → episode_XXXXX.hdf5
         → validate_episode.py checks every file
-          → convert_to_lerobot.py converts HDF5 → parquet + MP4 videos
+          → convert_to_lerobot.py converts HDF5 → LeRobot v3.0 dataset
             → lerobot-train trains an ACT neural network policy
+              → team_policy.run_act deploys the checkpoint
 ```
 
 > **Important:** `CheatCode` requires `ground_truth:=true`.
-> Ground truth is only allowed for training data collection.
-> The final learned policy must rely only on sensors and robot state — no hidden TF frames.
+> The final deployed policy (`run_act.py`) uses only cameras + robot state — no hidden TF frames.
 
 ---
 
@@ -23,49 +22,49 @@ aic_engine runs N trials
 
 | File | Purpose |
 |---|---|
-| `cheatcode_collector.py` | Policy wrapper used by `aic_model` to collect data |
+| `cheatcode_collector.py` | Policy wrapper — records expert demos via CheatCode |
 | `episode_recorder.py` | Buffers and saves one episode as HDF5 (schema v4) |
-| `validate_episode.py` | Validates one HDF5 episode |
-| `convert_to_lerobot.py` | Converts HDF5 episodes to LeRobot parquet + MP4 videos |
-| `configs/orientation_sweep_50_trials.yaml` | **50-trial engine config** (40 SFP + 10 SC, 10 varied poses) |
-| `configs/test_5_trials.yaml` | **5-trial smoke test config** — use this first to verify the pipeline |
-| `configs/orientation_sweep_3_trials.yaml` | Original 3-trial config (legacy, kept for reference) |
-| `configs/generate_50_trials.py` | Script that regenerates the 50-trial YAML |
+| `validate_episode.py` | Validates one HDF5 episode file |
+| `convert_to_lerobot.py` | Converts HDF5 episodes → LeRobot v3.0 parquet + MP4 videos |
+| `configs/orientation_sweep_50_trials.yaml` | **50-trial engine config** — fully populated board |
+| `configs/test_5_trials.yaml` | 5-trial smoke test config |
+| `configs/generate_50_trials.py` | Regenerates the 50-trial YAML |
+| `../run_act.py` | **Deployment policy** — loads local ACT checkpoint, runs at 20 Hz |
 
 Generated data is git-ignored:
-
 ```
 training_robot/episodes/
 training_robot/lerobot_datasets/
 training_robot/dataset/
+outputs/
 ```
 
 ---
 
-## What Each Output Means
+## Scene Configuration — Fully Populated Board
 
-The pipeline creates three different kinds of files. They are not interchangeable:
+Every trial in `orientation_sweep_50_trials.yaml` spawns **all components simultaneously**:
 
-| Stage | Output | Meaning |
+| Component | Count | Varied per trial |
 |---|---|---|
-| Collection | `episodes/.../episode_XXXXX.hdf5` | One raw expert demonstration per file |
-| Conversion | `lerobot_datasets/.../` | The trainable LeRobot dataset built from selected HDF5 demos |
-| Training | `outputs/train/.../checkpoints/*/pretrained_model/` | The learned ACT policy checkpoint to deploy |
+| NIC cards (nic_rail_0 … nic_rail_4) | **5** (all present) | Each card's rail translation |
+| SC mounts (sc_rail_0, sc_rail_1) | **2** (both present) | Each SC rail's translation |
+| Task board pose | 10 different (x, y, yaw) | Cycles through positions A–J |
+| Background mounts | 3 arrangements | Varied with mount_set 1–3 |
 
-In practice:
-1. Keep collecting `.hdf5` episodes until there are enough good demonstrations.
-2. Convert only the good demonstrations into one LeRobot dataset.
-3. Train ACT on that dataset.
-4. Deploy the final `pretrained_model/` folder with `RunACT.py`.
+The **task** still targets one specific port per trial (40 SFP + 10 SC), so the robot learns to find the correct port on a realistically crowded board.
 
-The `training_state/` folder inside a checkpoint is only for resuming training. The robot
-policy runner needs the sibling `pretrained_model/` folder.
+To regenerate the YAML after editing parameters in the generator:
+```bash
+cd ~/ros2_ws/src/aic
+.pixi/envs/default/bin/python team_policy/team_policy/training_robot/configs/generate_50_trials.py
+```
 
 ---
 
-## What Gets Recorded (HDF5 Schema v4)
+## HDF5 Schema v4 — What Gets Recorded
 
-Each episode saves at 20 Hz:
+Each episode is saved at 20 Hz:
 
 | Field | Shape | Description |
 |---|---|---|
@@ -74,16 +73,13 @@ Each episode saves at 20 Hz:
 | `observations/tcp_velocity` | `(T, 6)` | Cartesian tool velocity (linear + angular) |
 | `observations/tcp_error` | `(T, 6)` | Pose error to current target |
 | `observations/joint_positions` | `(T, 7)` | Joint angles (rad) |
-| `observations/joint_velocity` | `(T, 7)` | Per-joint velocity (rad/s) — **added in v4** |
+| `observations/joint_velocity` | `(T, 7)` | Per-joint velocity (rad/s) |
 | `observations/wrist_force` | `(T, 6)` | F/T sensor readings |
 | `observations/relative_pose` | `(T, 7)` | Target port pose in plug-tip frame |
-| `observations/privileged_tf/transforms` | `(T, N, 7)` | Selected TF snapshots (debug/analysis only) |
+| `observations/privileged_tf/transforms` | `(T, 5, 7)` | TF snapshots (debug only) |
 | `actions/commanded_pose` | `(T, 7)` | Absolute TCP target commanded by CheatCode |
 | `actions/delta_pose` | `(T, 6)` | Position delta + axis-angle rotation delta |
 | `actions/velocity` | `(T, 6)` | Finite-difference velocity of commanded pose |
-
-**Why `joint_velocity` matters:**
-`tcp_velocity` only tells you how the tool tip moves in Cartesian space — it cannot tell you *which joints* are moving or how fast. For example, a fast wrist-3 rotation and a slow shoulder rotation can produce the same TCP velocity but require completely different motor commands. Including `joint_velocity` gives the policy full observability of the robot's dynamic state.
 
 **Robot state vector for training (33D):**
 ```
@@ -94,13 +90,10 @@ tcp_pose (7) + tcp_velocity (6) + tcp_error (6) + joint_positions (7) + joint_ve
 
 ## Complete Workflow
 
-### Step 0 — One-Time Setup
-
-Run this in every shell before using any of the commands below:
+### Step 0 — Shell Environment (run this in every terminal)
 
 ```bash
 cd ~/ros2_ws/src/aic
-
 export AIC_ROOT="$(pwd)"
 export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
 export CONFIG="$TRAIN_ROOT/configs/orientation_sweep_50_trials.yaml"
@@ -108,117 +101,23 @@ export EPISODES="$TRAIN_ROOT/episodes/orientation_sweep"
 export LEROBOT="$TRAIN_ROOT/lerobot_datasets"
 ```
 
-After any code change to `episode_recorder.py`, `cheatcode_collector.py`, `validate_episode.py`, or `convert_to_lerobot.py`:
-
+After any code change to `episode_recorder.py`, `cheatcode_collector.py`, or `run_act.py`:
 ```bash
 pixi reinstall ros-kilted-team-policy
 ```
 
 ---
 
-### Step 1A — Quick Smoke Test (5 Trials) — **Do This First**
+### Step 1 — Collect Episodes
 
-Before committing to a full 50-episode run, use the 5-trial config to verify the entire pipeline
-end-to-end: collection → validation → conversion → training.
+Each run of the 50-trial config produces up to 50 episodes.
+You already have `run_001` (6 episodes). **Start from `run_002`.**
 
-#### Terminal 1 — Start Simulation + Engine (5 trials)
-
-```bash
-cd ~/ros2_ws/src/aic
-export AIC_ROOT="$(pwd)"
-export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
-export DBX_CONTAINER_MANAGER=docker
-
-distrobox enter -r aic_eval -- /entrypoint.sh \
-  ground_truth:=true \
-  start_aic_engine:=true \
-  gazebo_gui:=false \
-  launch_rviz:=false \
-  aic_engine_config_file:="$TRAIN_ROOT/configs/test_5_trials.yaml"
-```
-
-Wait until you see:
-```
-[aic_engine] Waiting for model...
-```
-
-#### Terminal 2 — Start Collector (5 trials)
+#### Terminal 1 — Start Simulation + Engine
 
 ```bash
 cd ~/ros2_ws/src/aic
-export AIC_ROOT="$(pwd)"
-export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
-export RUN_ID="test_run_001"
-export OUTPUT_DIR="$TRAIN_ROOT/episodes/test/$RUN_ID"
-
-pixi run ros2 run aic_model aic_model --ros-args \
-  -p use_sim_time:=true \
-  -p policy:=team_policy.training_robot.cheatcode_collector \
-  -p output_dir:="$OUTPUT_DIR" \
-  -p num_episodes:=5 \
-  -p success_only:=true
-```
-
-Expected output:
-```
-DataCollectionPolicy ready — target=5 episodes, output=.../test_run_001, success_only=True
-collector/episode=0 port=sfp/sfp_port_0
-[1/5] Saved .../episode_00000.hdf5
-...
-[5/5] Saved .../episode_00004.hdf5
-on_shutdown(...)
-```
-
-#### Validate the 5 test episodes
-
-```bash
-cd ~/ros2_ws/src/aic
-export AIC_ROOT="$(pwd)"
-export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
-
-for f in $TRAIN_ROOT/episodes/test/test_run_001/episode_*.hdf5; do
-  echo "Validating $f"
-  pixi run python -m team_policy.training_robot.validate_episode --file "$f" || break
-done
-```
-
-#### Convert the 5 test episodes
-
-```bash
-pixi run python -m team_policy.training_robot.convert_to_lerobot \
-  --input  $TRAIN_ROOT/episodes/test/test_run_001 \
-  --output $TRAIN_ROOT/lerobot_datasets/test_run_001 \
-  --success_only
-```
-
-#### Train on the 5 test episodes (smoke test only)
-
-```bash
-pixi run lerobot-train \
-  --dataset.repo_id=local/test_run_001 \
-  --policy.type=act \
-  --output_dir=outputs/train/aic_act_test \
-  --job_name=aic_act_test \
-  --policy.device=cuda \
-  --wandb.enable=false
-```
-
-If all 5 steps complete without errors, the pipeline is working. Proceed to Step 1B.
-
----
-
-### Step 1B — Collect 50 Episodes (Full Run)
-
-**This is the main data collection step.**
-The engine runs 50 trials back-to-back; CheatCode completes each one using ground-truth TF frames;
-the collector records everything to HDF5.
-
-#### Terminal 1 — Start Simulation + Engine (50 trials)
-
-```bash
-cd ~/ros2_ws/src/aic
-export AIC_ROOT="$(pwd)"
-export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
+export TRAIN_ROOT="$(pwd)/team_policy/team_policy/training_robot"
 export DBX_CONTAINER_MANAGER=docker
 
 distrobox enter -r aic_eval -- /entrypoint.sh \
@@ -229,19 +128,17 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
   aic_engine_config_file:="$TRAIN_ROOT/configs/orientation_sweep_50_trials.yaml"
 ```
 
-Wait until you see:
-```
-[aic_engine] Waiting for model...
-```
+Wait until you see `[aic_engine] Waiting for model...` before starting Terminal 2.
 
-#### Terminal 2 — Start Collector (50 trials)
+#### Terminal 2 — Start Collector
 
 ```bash
 cd ~/ros2_ws/src/aic
-export AIC_ROOT="$(pwd)"
-export TRAIN_ROOT="$AIC_ROOT/team_policy/team_policy/training_robot"
-export RUN_ID="run_001"
+export TRAIN_ROOT="$(pwd)/team_policy/team_policy/training_robot"
+export RUN_ID="run_002"                                   # increment each new run
 export OUTPUT_DIR="$TRAIN_ROOT/episodes/orientation_sweep/$RUN_ID"
+
+pixi reinstall ros-kilted-team-policy
 
 pixi run ros2 run aic_model aic_model --ros-args \
   -p use_sim_time:=true \
@@ -251,134 +148,85 @@ pixi run ros2 run aic_model aic_model --ros-args \
   -p success_only:=true
 ```
 
-Expected output (one line per successful episode):
+Expected output per episode:
 ```
-DataCollectionPolicy ready — target=50 episodes, output=.../run_001, success_only=True
+DataCollectionPolicy ready — target=50 episodes, output=.../run_002, success_only=True
 collector/episode=0 port=sfp/sfp_port_0
 [1/50] Saved .../episode_00000.hdf5
-[2/50] Saved .../episode_00001.hdf5
 ...
 [50/50] Saved .../episode_00049.hdf5
 on_shutdown(...)
 ```
 
-After all 50 trials finish, Terminal 1 will exit on its own (or press Ctrl+C).
+Both terminals exit automatically when all 50 trials finish.
 
----
+#### Collecting more batches
 
-### Step 2 — Collect More Data (Additional Batches)
-
-Each run of the 50-trial config produces up to 50 episodes.
-To collect more, rerun both terminals with a new `RUN_ID`:
-
+Use a new `RUN_ID` each time — **never reuse**, the recorder overwrites from `episode_00000.hdf5`:
 ```bash
-export RUN_ID="run_002"
+export RUN_ID="run_003"
 export OUTPUT_DIR="$TRAIN_ROOT/episodes/orientation_sweep/$RUN_ID"
-# ... then run Terminal 1 and Terminal 2 again
-```
-
-**Do not reuse the same `RUN_ID`** — it will silently overwrite `episode_00000.hdf5` through `episode_00049.hdf5`.
-
-To also vary the task board poses between batches:
-1. Edit `configs/orientation_sweep_50_trials.yaml` (or edit parameters in `configs/generate_50_trials.py` and regenerate)
-2. Restart Terminal 1 so the engine reloads the config
-3. Start Terminal 2 with a new `RUN_ID`
-
-To regenerate the YAML after changing parameters in the generator:
-```bash
-.pixi/envs/default/bin/python $TRAIN_ROOT/configs/generate_50_trials.py
+# then run Terminal 1 and Terminal 2 again
 ```
 
 ---
 
-### Step 3 — Count and Validate Episodes
+### Step 2 — Count and Validate
 
-Count all collected episodes:
+Count all collected episodes across all runs:
 ```bash
 find $TRAIN_ROOT/episodes/orientation_sweep -name 'episode_*.hdf5' | wc -l
-```
-
-Validate a single episode:
-```bash
-pixi run python -m team_policy.training_robot.validate_episode \
-  --file $TRAIN_ROOT/episodes/orientation_sweep/run_001/episode_00000.hdf5
 ```
 
 Validate all episodes (stops on first failure):
 ```bash
 for f in $TRAIN_ROOT/episodes/orientation_sweep/run_*/episode_*.hdf5; do
-  echo "Validating $f"
+  echo "--- $f ---"
   pixi run python -m team_policy.training_robot.validate_episode --file "$f" || break
 done
 ```
 
-Expected ending for a good episode:
+Validate a single episode:
+```bash
+pixi run python -m team_policy.training_robot.validate_episode \
+  --file $TRAIN_ROOT/episodes/orientation_sweep/run_002/episode_00000.hdf5
 ```
---- Schema v4 keys ---
-  [OK ] key exists: observations/joint_velocity
-Schema v4 keys — joint_velocity present
-...
+
+A good episode ends with:
+```
 PASS — episode looks valid (N frames, Xs, success=True)
 ```
 
-#### Good vs Bad Demonstrations
+#### Episode quality thresholds
 
-You do not label every frame manually. Each HDF5 episode already stores metadata under
-`metadata`, including:
-
-| Metadata | Use |
+| Quality | Rule |
 |---|---|
-| `success` | Whether the expert run reported success |
-| `final_error` | Final plug-to-port distance in metres |
-| `max_force` | Peak contact force |
-| `num_frames` / `duration_s` | Episode length and timing |
-
-For training, use `success` plus `final_error` as the first quality filter:
-
-| Quality | Suggested rule |
-|---|---|
-| Excellent | `success == 1` and `final_error <= 0.005` |
-| Good | `success == 1` and `final_error <= 0.02` |
-| Suspicious / bad | `success == 0` or `final_error > 0.02` |
-
-The converter applies this filter with `--success_only` and `--max_final_error`.
-For example, this trains only on demos that ended within 2 cm:
-
-```bash
-pixi run python -m team_policy.training_robot.convert_to_lerobot \
-  --input  $TRAIN_ROOT/episodes/orientation_sweep/run_001 \
-  --output $LEROBOT/orientation_sweep_run_001 \
-  --success_only \
-  --max_final_error 0.02
-```
-
-Use a stricter threshold such as `0.005` for very clean data. Only use a looser threshold
-such as `0.05` after visually checking that those episodes are actually useful.
+| Excellent | `success == 1` and `final_error <= 0.005` m |
+| Good | `success == 1` and `final_error <= 0.02` m |
+| Skip | `success == 0` or `final_error > 0.02` m |
 
 ---
 
-### Step 4 — Convert to LeRobot Format
+### Step 3 — Convert to LeRobot Format
 
-Convert one run:
-```bash
-pixi run python -m team_policy.training_robot.convert_to_lerobot \
-  --input  $TRAIN_ROOT/episodes/orientation_sweep/run_001 \
-  --output $LEROBOT/orientation_sweep_run_001 \
-  --success_only \
-  --max_final_error 0.02
-```
+Merge all runs into one folder, then convert:
 
-Convert all runs together into one dataset:
 ```bash
-# Merge all episodes into a single folder first
+cd ~/ros2_ws/src/aic
+export TRAIN_ROOT="$(pwd)/team_policy/team_policy/training_robot"
+export LEROBOT="$TRAIN_ROOT/lerobot_datasets"
+
+# Merge all runs into one folder (renumber episode files)
 MERGED="$TRAIN_ROOT/episodes/orientation_sweep/merged"
-mkdir -p "$MERGED"
+rm -rf "$MERGED" && mkdir -p "$MERGED"
 idx=0
 for f in $TRAIN_ROOT/episodes/orientation_sweep/run_*/episode_*.hdf5; do
   cp "$f" "$MERGED/episode_$(printf '%05d' $idx).hdf5"
   idx=$((idx + 1))
 done
+echo "Merged $idx episodes"
 
+# Convert
 pixi run python -m team_policy.training_robot.convert_to_lerobot \
   --input  "$MERGED" \
   --output "$LEROBOT/orientation_sweep_all" \
@@ -386,316 +234,223 @@ pixi run python -m team_policy.training_robot.convert_to_lerobot \
   --max_final_error 0.02
 ```
 
-Expected output structure:
+Output structure:
 ```
-lerobot_datasets/orientation_sweep_run_001/
+lerobot_datasets/orientation_sweep_all/
   meta/
-    info.json         (dataset metadata, 33D state, features schema)
-    stats.json        (mean/std/min/max for normalization)
-    tasks.parquet     (task definitions)
+    info.json           (33D state, 6D action, video feature schema)
+    stats.json          (mean/std/min/max for normalisation)
+    tasks.parquet
     episodes/chunk-000/file-000.parquet
   data/chunk-000/
-    file-000.parquet  (all selected frames)
-  videos/observation.images.left/chunk-000/file-000.mp4
-  videos/observation.images.center/chunk-000/file-000.mp4
-  videos/observation.images.right/chunk-000/file-000.mp4
+    file-000.parquet
+  videos/
+    observation.images.left/chunk-000/file-000.mp4
+    observation.images.center/chunk-000/file-000.mp4
+    observation.images.right/chunk-000/file-000.mp4
 ```
 
 ---
 
-### Step 5 — Train ACT Policy
+### Step 4 — Train ACT Policy
 
 ```bash
+cd ~/ros2_ws/src/aic
+export TRAIN_ROOT="$(pwd)/team_policy/team_policy/training_robot"
+export LEROBOT="$TRAIN_ROOT/lerobot_datasets"
+
 pixi run lerobot-train \
-  --dataset.repo_id=local/aic_orientation_sweep \
+  --dataset.repo_id=local/orientation_sweep_all \
   --dataset.root="$LEROBOT/orientation_sweep_all" \
   --policy.type=act \
-  --output_dir=outputs/train/aic_act_orientation_sweep \
-  --job_name=aic_act_orientation_sweep \
+  --output_dir=outputs/train/aic_act_run_001 \
+  --job_name=aic_act_run_001 \
   --policy.device=cuda \
   --wandb.enable=false \
   --steps=100000 \
   --save_freq=20000
 ```
 
-For CPU-only machines:
+For CPU-only machines replace `--policy.device=cuda` with `--policy.device=cpu`.
+
+Training writes checkpoints every 20 000 steps:
+```
+outputs/train/aic_act_run_001/checkpoints/
+  020000/pretrained_model/   ← deploy this folder
+    config.json
+    model.safetensors
+    policy_preprocessor_step_3_normalizer_processor.safetensors
+    policy_postprocessor_step_0_unnormalizer_processor.safetensors
+  020000/training_state/     ← resume training only
+```
+
+Resume training from a checkpoint:
 ```bash
 pixi run lerobot-train \
-  --dataset.repo_id=local/aic_orientation_sweep \
-  --dataset.root="$LEROBOT/orientation_sweep_all" \
-  --policy.type=act \
-  --output_dir=outputs/train/aic_act_orientation_sweep \
-  --job_name=aic_act_orientation_sweep \
-  --policy.device=cpu \
-  --wandb.enable=false \
-  --steps=100000 \
-  --save_freq=20000
-```
-
-Training writes checkpoints like:
-
-```
-outputs/train/aic_act_orientation_sweep/
-  checkpoints/
-    020000/
-      pretrained_model/
-        config.json
-        model.safetensors
-        policy_preprocessor.json
-        policy_postprocessor.json
-        policy_preprocessor_step_3_normalizer_processor.safetensors
-        policy_postprocessor_step_0_unnormalizer_processor.safetensors
-      training_state/
-        optimizer_state.safetensors
-        training_step.json
-```
-
-Use `pretrained_model/` for deployment. Use `training_state/` only when resuming training.
-
-To resume from a checkpoint:
-
-```bash
-pixi run lerobot-train \
-  --config_path=outputs/train/aic_act_orientation_sweep/checkpoints/020000/pretrained_model/train_config.json \
+  --config_path=outputs/train/aic_act_run_001/checkpoints/020000/pretrained_model/train_config.json \
   --resume=true \
   --steps=100000
 ```
 
 ---
 
-### Step 6 — Deploy the Trained Checkpoint
+### Step 5 — Deploy and Test the Trained Policy
 
-After training, update the ACT runner to load your local checkpoint, for example:
+#### Terminal 1 — Start Simulation (no ground_truth needed)
 
-```
-outputs/train/aic_act_orientation_sweep/checkpoints/100000/pretrained_model
-```
+```bash
+cd ~/ros2_ws/src/aic
+export TRAIN_ROOT="$(pwd)/team_policy/team_policy/training_robot"
+export DBX_CONTAINER_MANAGER=docker
 
-The current public Hugging Face example policy is not shape-compatible with this training pipeline.
-This dataset trains:
-
-```
-inputs:
-  observation.images.left
-  observation.images.center
-  observation.images.right
-  observation.state   (33D)
-
-output:
-  action              (6D delta TCP: dx, dy, dz, drx, dry, drz)
+distrobox enter -r aic_eval -- /entrypoint.sh \
+  ground_truth:=false \
+  start_aic_engine:=true \
+  gazebo_gui:=true \
+  launch_rviz:=true \
+  aic_engine_config_file:="$TRAIN_ROOT/configs/orientation_sweep_50_trials.yaml"
 ```
 
-So `RunACT.py` / `runact_hugging.py` must use the same image keys, the same 33D state
-construction, and a 6D action output. Do not keep loading `grkw/aic_act_policy` unless
-you intentionally want to run the old public demo policy.
+#### Terminal 2 — Run the Trained Policy
 
-The action represents one 20 Hz training timestep. In deployment, call the policy at a
-matching control rate or deliberately scale/clip the predicted deltas before sending them
-to the controller.
+```bash
+cd ~/ros2_ws/src/aic
+export CKPT="$(pwd)/outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model"
+
+pixi reinstall ros-kilted-team-policy
+
+pixi run ros2 run aic_model aic_model --ros-args \
+  -p use_sim_time:=true \
+  -p policy:=team_policy.run_act \
+  -p checkpoint_path:="$CKPT"
+```
+
+The robot will attempt cable insertion using only cameras and robot state.
+Watch Gazebo/RViz to see whether it succeeds.
 
 ---
 
-## What is ACT? (Action Chunking with Transformers)
+## How Many Episodes You Need
 
-ACT is the neural network architecture we train to become the final cable-insertion policy.
-It is an imitation learning model — it learns to copy the expert behavior recorded by CheatCode,
-but using only sensors (cameras + robot state), not the hidden TF frames CheatCode used.
-
-### The Core Idea: Action Chunking
-
-A naive policy predicts **one action per step**: at each 20 Hz tick, it looks at the current
-image and state and outputs the next 6D delta move. This works but is brittle — any single
-bad prediction propagates immediately.
-
-ACT instead predicts a **chunk of K future actions at once** (default K=100, i.e. 5 seconds).
-At each step it outputs the next 100 moves, executes them one by one, then re-plans.
-This has two benefits:
-1. **Temporal smoothness** — the chunk is generated by a single forward pass through the
-   transformer, so consecutive actions are internally consistent and smooth.
-2. **Robustness to compounding errors** — replanning every K steps lets the policy correct
-   drift before it accumulates.
-
-### Architecture
-
-```
-Inputs at each step:
-  ├─ 3× camera images (left, center, right)   → ResNet-18 visual encoder → image tokens
-  └─ 33D robot state (tcp_pose + velocities + joints)  → linear projection → state token
-
-Transformer encoder:
-  Takes image tokens + state token → context representation
-
-Transformer decoder:
-  Attends to context → predicts K=100 future actions (6D delta TCP each)
-
-Output:
-  100 × [dx, dy, dz, drx, dry, drz]   (position delta + axis-angle rotation delta)
-  Executed at 20 Hz → ~5 seconds of planned motion per inference call
-```
-
-### Why ACT Works for Cable Insertion
-
-Cable insertion requires **sub-millimetre precision** and **smooth, continuous motion**.
-The standard imitation learning failure mode is "compounding errors" — small prediction
-mistakes stack up and the robot drifts off course. ACT's chunking directly addresses this:
-
-- **Chunking reduces error compounding** — instead of 100 independent 1-step decisions,
-  you make 1 coherent 100-step plan, so errors don't compound within the chunk.
-- **Re-planning every 5 seconds** — if the robot drifts slightly, the next chunk corrects it
-  before the drift becomes unrecoverable.
-- **Transformer attention over image + state** — the model can attend to the exact pixel
-  region of the port in the camera image simultaneously with the robot's joint configuration,
-  giving it the spatial precision needed for insertion.
-
-### Training vs Deployment
-
-| | Training (CheatCode) | Deployment (ACT) |
-|---|---|---|
-| Expert source | CheatCode oracle with ground-truth TF | None — learned from demonstrations |
-| Inputs used | ground-truth TF frames + all sensors | cameras + robot state only |
-| `ground_truth:=true` required | Yes | No |
-| Raw expert command | absolute TCP target from CheatCode | none |
-| Training/deployment action | 6D delta TCP label built from the expert command | 6D delta TCP prediction |
-
-At deployment, RunACT.py loads the trained checkpoint and calls it as a standard `aic_model`
-policy — it receives the same `Observation` message and returns a `MotionUpdate`, exactly like
-any other policy in the system.
-
-### How Many Demos You Need
-
-| Episodes | Expected Outcome |
+| Episodes | Expected outcome |
 |---|---|
-| 5 | Smoke test only — model will overfit, not generalise |
-| 50 | Minimum viable — works for narrow pose distribution |
-| 200–500 | Recommended for robust generalisation across varied board poses |
-| 1000+ | Research-grade; covers full pose distribution reliably |
+| 5 | Smoke test only — overfits, does not generalise |
+| 50 | Minimum viable — works on seen board poses |
+| 200–500 | Recommended for robust generalisation |
+| 1000+ | Research-grade, covers full pose distribution |
 
-The 50-trial config provides visual diversity across 10 board poses and 5 NIC rails to make
-50 episodes more useful than 50 identical insertions would be.
-
----
-
-## Complete Flow Explained
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  TERMINAL 1: aic_eval container                                     │
-│                                                                     │
-│  Gazebo simulation + aic_engine                                     │
-│    - Spawns robot, task board, cable per trial                      │
-│    - Uses orientation_sweep_50_trials.yaml (50 varied scenes)       │
-│    - ground_truth:=true  → publishes hidden TF frames               │
-│      (task_board/nic_card_mount_0/sfp_port_0_link etc.)             │
-│    - Calls insert_cable() on the model for each trial               │
-└────────────────────────┬────────────────────────────────────────────┘
-                         │ ROS 2 topics + services
-┌────────────────────────▼────────────────────────────────────────────┐
-│  TERMINAL 2: cheatcode_collector (aic_model)                        │
-│                                                                     │
-│  DataCollectionPolicy.insert_cable() called once per trial          │
-│    │                                                                │
-│    ├─ Wraps move_robot() to capture CheatCode's commanded poses     │
-│    │                                                                │
-│    ├─ Spawns background thread recording at ~20 Hz:                 │
-│    │    • 3× camera images (left, center, right)                    │
-│    │    • tcp_pose, tcp_velocity, tcp_error                         │
-│    │    • joint_positions, joint_velocity  ← per-joint motion       │
-│    │    • wrist_force (F/T sensor)                                  │
-│    │    • relative_pose (plug → port, from ground truth TF)         │
-│    │    • privileged_tf snapshots (5 TF pairs, debug use only)      │
-│    │                                                                │
-│    └─ Runs CheatCode.insert_cable() as the expert                   │
-│         CheatCode looks up ground-truth TF frames to navigate       │
-│         precisely to the port and insert the cable                  │
-│                                                                     │
-│  On success → EpisodeRecorder.end_episode() → episode_XXXXX.hdf5   │
-└────────────────────────┬────────────────────────────────────────────┘
-                         │ HDF5 files
-┌────────────────────────▼────────────────────────────────────────────┐
-│  validate_episode.py                                                │
-│    Checks shapes, quaternion norms, image quality, timing,         │
-│    joint_velocity non-zero, relative_pose valid, etc.              │
-└────────────────────────┬────────────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────────────┐
-│  convert_to_lerobot.py                                              │
-│                                                                     │
-│  Per episode:                                                       │
-│    • Reads HDF5 images → writes MP4 videos (20 FPS, mp4v)          │
-│    • Builds 33D robot state:                                        │
-│        tcp_pose(7) + tcp_vel(6) + tcp_err(6)                       │
-│        + joint_pos(7) + joint_vel(7)                               │
-│    • Reads actions/delta_pose (6D) as expert action labels          │
-│    • Writes parquet row per frame                                   │
-│                                                                     │
-│  Across all episodes:                                               │
-│    • Computes mean/std/min/max → stats.json (for normalization)     │
-│    • Writes info.json, stats.json, tasks.parquet, episodes parquet │
-└────────────────────────┬────────────────────────────────────────────┘
-                         │ LeRobot dataset
-┌────────────────────────▼────────────────────────────────────────────┐
-│  lerobot-train (ACT policy)                                         │
-│                                                                     │
-│  Input:  3× camera images + 33D robot state                         │
-│  Output: chunk of 100 × 6D delta TCP actions                        │
-│                                                                     │
-│  Trains ResNet-18 image encoder + Transformer (encoder-decoder)     │
-│  Loss: action error between predicted and expert delta actions      │
-│                                                                     │
-│  Result: a checkpoint deployed via RunACT.py as the live policy     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The fully-populated board config gives richer visual diversity per episode (robot sees all 5 NIC cards + both SC ports simultaneously) so fewer episodes are needed compared to a sparse board.
 
 ---
 
-## Why 50 Trials in One Config
+## Architecture Summary (ACT)
 
-The original 3-trial config required running the two-terminal setup ~17 times to collect 50 episodes.
-The 50-trial config covers:
-- **10 different task board positions and yaw angles** — robot sees the board from many viewpoints
-- **5 NIC rails × 8 positions = 40 SFP trials** — varied port location in image space
-- **2 SC rails × 5 positions = 10 SC trials** — different cable type and connector
-- **3 background mount arrangements** — varied visual clutter
+```
+Inputs at each 20 Hz step:
+  ├─ 3× camera images (left, center, right)  → ResNet-18 encoder → image tokens
+  └─ 33D robot state                         → linear projection → state token
 
-More visual diversity → better generalization of the trained policy.
+Transformer encoder-decoder:
+  Attends over tokens → predicts chunk of K=100 future 6D actions
+
+Output per step:
+  100 × [dx, dy, dz, drx, dry, drz]   applied at 20 Hz = 5 s of planned motion
+```
+
+Action chunking reduces compounding errors: instead of 100 independent predictions,
+one coherent 100-step plan is generated. The policy replans every 5 seconds to correct drift.
+
+---
+
+## Complete Data Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  TERMINAL 1 — aic_eval container                                     │
+│                                                                      │
+│  Gazebo + aic_engine                                                 │
+│    • Spawns: robot + task board (all 5 NIC cards + 2 SC ports)       │
+│    • Config: orientation_sweep_50_trials.yaml                        │
+│    • ground_truth:=true → publishes hidden TF frames                 │
+│    • Calls insert_cable() once per trial                             │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │ ROS 2 topics + services
+┌─────────────────────────────▼────────────────────────────────────────┐
+│  TERMINAL 2 — cheatcode_collector (aic_model)                        │
+│                                                                      │
+│  DataCollectionPolicy.insert_cable():                                │
+│    • Wraps move_robot() to capture commanded poses                   │
+│    • Records at 20 Hz in background thread:                          │
+│        3× camera images, tcp_pose, tcp_vel, tcp_err                  │
+│        joint_positions, joint_velocity, wrist_force                  │
+│        relative_pose (plug→port), privileged_tf snapshots            │
+│    • Runs CheatCode as the expert (uses ground-truth TF)             │
+│    • On success → episode_XXXXX.hdf5                                 │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────────────────┐
+│  validate_episode.py  — checks shapes, quaternions, timing, etc.     │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────────────────┐
+│  convert_to_lerobot.py                                               │
+│    • HDF5 images → MP4 videos                                        │
+│    • Builds 33D state + 6D delta action per frame                    │
+│    • Writes parquet + stats.json + info.json                         │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────────────────┐
+│  lerobot-train (ACT)                                                 │
+│    Input:  3× images + 33D state                                     │
+│    Output: 100 × 6D delta TCP actions                                │
+│    Result: pretrained_model/ checkpoint                              │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────────────────┐
+│  team_policy.run_act  (deployment)                                   │
+│    • Loads local checkpoint via checkpoint_path ROS param            │
+│    • Runs at 20 Hz: image + state → 6D delta → MODE_POSITION command │
+│    • No ground_truth required                                        │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Common Issues
 
-### `on_shutdown` appears but fewer than 50 episodes saved
+### Fewer than 50 episodes saved after a run
 
-Some trials failed (CheatCode returned `False`). This is normal for difficult poses.
-Run again with a new `RUN_ID` — the engine will replay all 50 trials from scratch.
-Increase diversity by editing pose values in the YAML and regenerating.
+Some trials failed (CheatCode returned `False`). Normal for difficult poses.
+Start a new run with an incremented `RUN_ID` — the engine replays all 50 trials fresh.
 
 ### `Collector cannot find ground truth TF`
 
-Terminal 1 must have `ground_truth:=true`. The collector depends on these TF frames
-for `relative_pose` and `privileged_tf` snapshots. Without them, those fields save as zeros
-and the episode is flagged during validation.
+Terminal 1 must have `ground_truth:=true`. Without it, `relative_pose` and `privileged_tf`
+save as zeros and validation will flag the episode.
 
 ### `joint_velocity` is all zeros after validation
 
-This means the episode was recorded with schema v3 (before this update) or `js.velocity`
-was not yet populated by the controller. Re-collect with the updated package installed:
+Episode was recorded before schema v4 or the controller wasn't publishing joint velocities.
+Re-collect after running:
 ```bash
 pixi reinstall ros-kilted-team-policy
 ```
 
-### `success=1` but `final_error` is still large
+### `success=1` but `final_error` is large (e.g. 0.045 m)
 
-Treat the episode as suspicious. Some runs can be marked successful but still finish several
-centimetres from the target, for example `final_error≈0.045`. By default, keep the converter
-threshold at `--max_final_error 0.02` so those episodes are skipped. Only raise the threshold
-after visually inspecting the demo and deciding that it is useful for the behavior you want.
+Episode is suspicious. Keep `--max_final_error 0.02` in the converter to skip it.
+Only raise the threshold after visually inspecting that the demo is genuinely useful.
 
 ### Reusing the same `RUN_ID`
 
-Do not reuse `output_dir` between runs. The recorder always starts numbering from
-`episode_00000.hdf5` and will silently overwrite existing files.
+Don't. The recorder always starts from `episode_00000.hdf5` and will silently overwrite
+existing files. Always increment `RUN_ID` for each new collection run.
 
-### Merging runs for conversion
+### `checkpoint_path` parameter not set
 
-Pass `--input` to a folder that contains only `episode_XXXXX.hdf5` files.
-If mixing runs, copy them into a single folder and renumber as shown in Step 4.
+`team_policy.run_act` requires the parameter:
+```bash
+-p checkpoint_path:=/absolute/path/to/pretrained_model
+```
+The path must point to the `pretrained_model/` subfolder inside a checkpoint directory,
+not the checkpoint root or the `training_state/` folder.

@@ -2,19 +2,24 @@
 """
 Generate orientation_sweep_50_trials.yaml.
 
+Every trial spawns a FULLY POPULATED board:
+  - All 5 NIC rails occupied (nic_card_0 … nic_card_4)
+  - Both SC rails occupied (sc_mount_0 and sc_mount_1)
+
+The task still targets one specific port per trial so the robot learns
+to navigate to the correct port among many visible connectors.
+
 Run from repo root:
     python team_policy/team_policy/training_robot/configs/generate_50_trials.py
 """
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Diversity parameters
+# Board pose diversity (10 positions)
 # ---------------------------------------------------------------------------
 
-# 10 task-board positions (x, y, roll, pitch, yaw).  z is always 1.14.
 POSITIONS = {
     "A": dict(x=0.160, y=-0.180, roll= 0.00, pitch= 0.00, yaw=2.80),
     "B": dict(x=0.140, y=-0.220, roll= 0.04, pitch=-0.03, yaw=3.35),
@@ -28,18 +33,48 @@ POSITIONS = {
     "J": dict(x=0.135, y=-0.125, roll= 0.04, pitch=-0.04, yaw=2.45),
 }
 
-# Background mount translations (sfp_mount_rail_0, sc_mount_rail_0,
-# lc_mount_rail_0, lc_mount_rail_1).  Varied for visual diversity.
+# ---------------------------------------------------------------------------
+# Background mount sets (visual clutter variety)
+# ---------------------------------------------------------------------------
+
 MOUNT_SETS = {
     1: dict(sfp_t= 0.03, sc_t=-0.02, lc0_t= 0.02, lc1_t=-0.01),
     2: dict(sfp_t= 0.05, sc_t= 0.04, lc0_t= 0.04, lc1_t= 0.03),
     3: dict(sfp_t=-0.03, sc_t=-0.05, lc0_t=-0.01, lc1_t=-0.03),
 }
 
-# 50 trial specs: (position_key, rail_spec, translation, mount_set)
-# rail_spec is "NIC0"–"NIC4" or "SC0"/"SC1"
+# ---------------------------------------------------------------------------
+# Per-rail translations for ALL NIC cards and SC mounts when fully populated.
+# Each mount_set gets a different layout so the board looks different each time.
+#   Index: [rail_0, rail_1, rail_2, rail_3, rail_4]
+# ---------------------------------------------------------------------------
+
+NIC_TRANSLATIONS = {
+    # mount_set: translations for nic_rail_0 … nic_rail_4
+    1: [ 0.010, -0.015,  0.020, -0.010,  0.005],
+    2: [-0.010,  0.020, -0.015,  0.015, -0.005],
+    3: [ 0.015, -0.005,  0.010, -0.020,  0.010],
+}
+
+SC_TRANSLATIONS = {
+    # mount_set: [sc_rail_0_t, sc_rail_1_t]
+    1: [-0.030,  0.030],
+    2: [ 0.042, -0.042],
+    3: [-0.050,  0.050],
+}
+
+# ---------------------------------------------------------------------------
+# 50 trial specs: (position_key, rail_spec, target_translation, mount_set)
+#
+# rail_spec "NIC0"–"NIC4": SFP insertion on that NIC card's sfp_port_0
+# rail_spec "SC0"/"SC1":   SC insertion on that SC port
+#
+# target_translation overrides the corresponding rail's entry in NIC_TRANSLATIONS
+# or SC_TRANSLATIONS so the target port is at a known varied position.
+# ---------------------------------------------------------------------------
+
 TRIALS = [
-    # --- 40 SFP/NIC trials (8 per rail, cycling through all 10 positions) ---
+    # --- 40 SFP/NIC trials (8 per rail, cycling through all 10 board poses) ---
     ("A", "NIC0",  0.015, 1), ("B", "NIC1",  0.020, 2), ("C", "NIC2", -0.010, 3),
     ("D", "NIC3",  0.000, 1), ("E", "NIC4", -0.015, 2), ("F", "NIC0", -0.015, 3),
     ("G", "NIC1",  0.015, 1), ("H", "NIC2",  0.000, 2), ("I", "NIC3", -0.020, 3),
@@ -65,7 +100,7 @@ assert len(TRIALS) == 50, f"Expected 50 trials, got {len(TRIALS)}"
 
 
 # ---------------------------------------------------------------------------
-# YAML builders
+# YAML block builders
 # ---------------------------------------------------------------------------
 
 def _pose_block(pos: dict, indent: int = 10) -> str:
@@ -81,38 +116,34 @@ def _pose_block(pos: dict, indent: int = 10) -> str:
     )
 
 
-def _nic_rail_block(rail_idx: int, active_rail: int | None, nic_trans: float, indent: int = 10) -> str:
+def _nic_rail_block(rail_idx: int, translation: float, indent: int = 10) -> str:
+    """Always present — every trial has all 5 NIC cards."""
     pad = " " * indent
-    present = (rail_idx == active_rail)
-    lines = [f"{pad}nic_rail_{rail_idx}:"]
-    lines.append(f"{pad}  entity_present: {str(present)}")
-    if present:
-        lines += [
-            f"{pad}  entity_name: \"nic_card_{rail_idx}\"",
-            f"{pad}  entity_pose:",
-            f"{pad}    translation: {nic_trans:.3f}",
-            f"{pad}    roll: 0.0",
-            f"{pad}    pitch: 0.0",
-            f"{pad}    yaw: 0.0",
-        ]
-    return "\n".join(lines) + "\n"
+    return "\n".join([
+        f"{pad}nic_rail_{rail_idx}:",
+        f"{pad}  entity_present: True",
+        f"{pad}  entity_name: \"nic_card_{rail_idx}\"",
+        f"{pad}  entity_pose:",
+        f"{pad}    translation: {translation:.3f}",
+        f"{pad}    roll: 0.0",
+        f"{pad}    pitch: 0.0",
+        f"{pad}    yaw: 0.0",
+    ]) + "\n"
 
 
-def _sc_rail_block(rail_idx: int, active_rail: int | None, sc_trans: float, indent: int = 10) -> str:
+def _sc_rail_block(rail_idx: int, translation: float, indent: int = 10) -> str:
+    """Always present — every trial has both SC ports."""
     pad = " " * indent
-    present = (rail_idx == active_rail)
-    lines = [f"{pad}sc_rail_{rail_idx}:"]
-    lines.append(f"{pad}  entity_present: {str(present)}")
-    if present:
-        lines += [
-            f"{pad}  entity_name: \"sc_mount_{rail_idx}\"",
-            f"{pad}  entity_pose:",
-            f"{pad}    translation: {sc_trans:.3f}",
-            f"{pad}    roll: 0.0",
-            f"{pad}    pitch: 0.0",
-            f"{pad}    yaw: 0.0",
-        ]
-    return "\n".join(lines) + "\n"
+    return "\n".join([
+        f"{pad}sc_rail_{rail_idx}:",
+        f"{pad}  entity_present: True",
+        f"{pad}  entity_name: \"sc_mount_{rail_idx}\"",
+        f"{pad}  entity_pose:",
+        f"{pad}    translation: {translation:.3f}",
+        f"{pad}    roll: 0.0",
+        f"{pad}    pitch: 0.0",
+        f"{pad}    yaw: 0.0",
+    ]) + "\n"
 
 
 def _background_mounts(mounts: dict, indent: int = 10) -> str:
@@ -225,51 +256,70 @@ def _sc_task_block(sc_rail_idx: int, indent: int = 4) -> str:
     )
 
 
-def build_trial(trial_num: int, pos_key: str, rail_spec: str, translation: float, mount_set: int) -> str:
-    pos = POSITIONS[pos_key]
+# ---------------------------------------------------------------------------
+# Trial builder
+# ---------------------------------------------------------------------------
+
+def build_trial(trial_num: int, pos_key: str, rail_spec: str,
+                target_translation: float, mount_set: int) -> str:
+    pos    = POSITIONS[pos_key]
     mounts = MOUNT_SETS[mount_set]
-    is_sc = rail_spec.startswith("SC")
-    prefix_len = 2 if is_sc else 3   # "SC0" -> idx 2, "NIC0" -> idx 3
-    rail_idx = int(rail_spec[prefix_len:])
+    is_sc  = rail_spec.startswith("SC")
+    prefix_len = 2 if is_sc else 3
+    rail_idx   = int(rail_spec[prefix_len:])
+
+    # Build per-rail translation tables; override the target rail with the
+    # trial-specific translation for targeted diversity.
+    nic_trans = list(NIC_TRANSLATIONS[mount_set])
+    nic_trans[rail_idx if not is_sc else 0] = (
+        nic_trans[rail_idx if not is_sc else 0] if is_sc else target_translation
+    )
+
+    sc_trans = list(SC_TRANSLATIONS[mount_set])
+    if is_sc:
+        sc_trans[rail_idx] = target_translation
 
     lines = [f"  trial_{trial_num}:"]
     lines.append("    scene:")
     lines.append("        task_board:")
     lines.append(_pose_block(pos, indent=10).rstrip())
 
-    if is_sc:
-        # No NIC cards
-        for i in range(5):
-            lines.append(f"          nic_rail_{i}:")
-            lines.append(f"            entity_present: False")
-        # SC rails
-        for i in range(2):
-            lines.append(_sc_rail_block(i, rail_idx if is_sc else None, translation, indent=10).rstrip())
-    else:
-        # NIC rails
-        for i in range(5):
-            lines.append(_nic_rail_block(i, rail_idx, translation, indent=10).rstrip())
-        # No SC ports
-        for i in range(2):
-            lines.append(f"          sc_rail_{i}:")
-            lines.append(f"            entity_present: False")
+    # All 5 NIC rails — always present
+    for i in range(5):
+        lines.append(_nic_rail_block(i, nic_trans[i], indent=10).rstrip())
+
+    # Both SC rails — always present
+    for i in range(2):
+        lines.append(_sc_rail_block(i, sc_trans[i], indent=10).rstrip())
 
     lines.append(_background_mounts(mounts, indent=10).rstrip())
-    lines.append(_sfp_cable_block(indent=8).rstrip() if not is_sc else _sc_cable_block(indent=8).rstrip())
-    lines.append(_sfp_task_block(rail_idx, indent=4).rstrip() if not is_sc else _sc_task_block(rail_idx, indent=4).rstrip())
+    lines.append(
+        _sfp_cable_block(indent=8).rstrip()
+        if not is_sc else
+        _sc_cable_block(indent=8).rstrip()
+    )
+    lines.append(
+        _sfp_task_block(rail_idx, indent=4).rstrip()
+        if not is_sc else
+        _sc_task_block(rail_idx, indent=4).rstrip()
+    )
     return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# File header (scoring, limits)
+# File header / footer
 # ---------------------------------------------------------------------------
 
 HEADER = """\
-# Training data collection config — 50 trials.
+# Training data collection config — 50 trials, fully populated board.
 #
-# 40 SFP/NIC trials (NIC rails 0-4 × 8 positions each) and
-# 10 SC trials (SC rails 0-1 × 5 positions each).
-# Every trial uses a different task-board pose for visual diversity.
+# Every trial spawns ALL components:
+#   - 5 NIC cards (nic_rail_0 … nic_rail_4), each at a varied translation
+#   - 2 SC ports  (sc_rail_0 and sc_rail_1),  each at a varied translation
+#
+# The task still targets one specific port per trial:
+#   - 40 SFP trials: insert into sfp_port_0 on the target NIC card
+#   - 10 SC  trials: insert into sc_port_base on the target SC mount
 #
 # Pass with:
 #   aic_engine_config_file:=/path/to/orientation_sweep_50_trials.yaml
@@ -342,11 +392,11 @@ def main() -> None:
     content = HEADER
     for i, (pos_key, rail_spec, translation, mount_set) in enumerate(TRIALS, start=1):
         content += build_trial(i, pos_key, rail_spec, translation, mount_set)
-
     content += FOOTER
 
     out_path.write_text(content)
     print(f"Written {len(TRIALS)} trials → {out_path}")
+    print("Every trial: 5 NIC cards + 2 SC ports, all present simultaneously.")
 
 
 if __name__ == "__main__":
