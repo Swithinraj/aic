@@ -29,6 +29,7 @@ team_policy/models/Depth-Anything-V2-Metric-Indoor-Base-hf/*
 team_policy/team_policy/training_robot/episodes/
 team_policy/team_policy/training_robot/lerobot_datasets/
 team_policy/team_policy/training_robot/dataset/
+team_policy/team_policy/training_robot/configs/sessions/
 outputs/
 
 outputs/
