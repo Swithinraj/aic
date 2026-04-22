@@ -4,8 +4,8 @@ __pycache__/
 build/
 files.txt
 .codex
-.claude
-
+.claude 
+.vscode/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
