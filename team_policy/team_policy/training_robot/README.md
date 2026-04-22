@@ -42,6 +42,27 @@ training_robot/dataset/
 
 ---
 
+## What Each Output Means
+
+The pipeline creates three different kinds of files. They are not interchangeable:
+
+| Stage | Output | Meaning |
+|---|---|---|
+| Collection | `episodes/.../episode_XXXXX.hdf5` | One raw expert demonstration per file |
+| Conversion | `lerobot_datasets/.../` | The trainable LeRobot dataset built from selected HDF5 demos |
+| Training | `outputs/train/.../checkpoints/*/pretrained_model/` | The learned ACT policy checkpoint to deploy |
+
+In practice:
+1. Keep collecting `.hdf5` episodes until there are enough good demonstrations.
+2. Convert only the good demonstrations into one LeRobot dataset.
+3. Train ACT on that dataset.
+4. Deploy the final `pretrained_model/` folder with `RunACT.py`.
+
+The `training_state/` folder inside a checkpoint is only for resuming training. The robot
+policy runner needs the sibling `pretrained_model/` folder.
+
+---
+
 ## What Gets Recorded (HDF5 Schema v4)
 
 Each episode saves at 20 Hz:
@@ -300,6 +321,40 @@ Schema v4 keys — joint_velocity present
 PASS — episode looks valid (N frames, Xs, success=True)
 ```
 
+#### Good vs Bad Demonstrations
+
+You do not label every frame manually. Each HDF5 episode already stores metadata under
+`metadata`, including:
+
+| Metadata | Use |
+|---|---|
+| `success` | Whether the expert run reported success |
+| `final_error` | Final plug-to-port distance in metres |
+| `max_force` | Peak contact force |
+| `num_frames` / `duration_s` | Episode length and timing |
+
+For training, use `success` plus `final_error` as the first quality filter:
+
+| Quality | Suggested rule |
+|---|---|
+| Excellent | `success == 1` and `final_error <= 0.005` |
+| Good | `success == 1` and `final_error <= 0.02` |
+| Suspicious / bad | `success == 0` or `final_error > 0.02` |
+
+The converter applies this filter with `--success_only` and `--max_final_error`.
+For example, this trains only on demos that ended within 2 cm:
+
+```bash
+pixi run python -m team_policy.training_robot.convert_to_lerobot \
+  --input  $TRAIN_ROOT/episodes/orientation_sweep/run_001 \
+  --output $LEROBOT/orientation_sweep_run_001 \
+  --success_only \
+  --max_final_error 0.02
+```
+
+Use a stricter threshold such as `0.005` for very clean data. Only use a looser threshold
+such as `0.05` after visually checking that those episodes are actually useful.
+
 ---
 
 ### Step 4 — Convert to LeRobot Format
@@ -309,7 +364,8 @@ Convert one run:
 pixi run python -m team_policy.training_robot.convert_to_lerobot \
   --input  $TRAIN_ROOT/episodes/orientation_sweep/run_001 \
   --output $LEROBOT/orientation_sweep_run_001 \
-  --success_only
+  --success_only \
+  --max_final_error 0.02
 ```
 
 Convert all runs together into one dataset:
@@ -326,7 +382,8 @@ done
 pixi run python -m team_policy.training_robot.convert_to_lerobot \
   --input  "$MERGED" \
   --output "$LEROBOT/orientation_sweep_all" \
-  --success_only
+  --success_only \
+  --max_final_error 0.02
 ```
 
 Expected output structure:
@@ -335,17 +392,13 @@ lerobot_datasets/orientation_sweep_run_001/
   meta/
     info.json         (dataset metadata, 33D state, features schema)
     stats.json        (mean/std/min/max for normalization)
-    episodes.jsonl    (per-episode metadata)
-    tasks.jsonl       (task definitions)
+    tasks.parquet     (task definitions)
+    episodes/chunk-000/file-000.parquet
   data/chunk-000/
-    episode_000000.parquet
-    episode_000001.parquet
-    ...
-  videos/chunk-000/
-    observation.images.left/episode_000000.mp4
-    observation.images.center/episode_000000.mp4
-    observation.images.right/episode_000000.mp4
-    ...
+    file-000.parquet  (all selected frames)
+  videos/observation.images.left/chunk-000/file-000.mp4
+  videos/observation.images.center/chunk-000/file-000.mp4
+  videos/observation.images.right/chunk-000/file-000.mp4
 ```
 
 ---
@@ -355,23 +408,90 @@ lerobot_datasets/orientation_sweep_run_001/
 ```bash
 pixi run lerobot-train \
   --dataset.repo_id=local/aic_orientation_sweep \
+  --dataset.root="$LEROBOT/orientation_sweep_all" \
   --policy.type=act \
   --output_dir=outputs/train/aic_act_orientation_sweep \
   --job_name=aic_act_orientation_sweep \
   --policy.device=cuda \
-  --wandb.enable=false
+  --wandb.enable=false \
+  --steps=100000 \
+  --save_freq=20000
 ```
 
 For CPU-only machines:
 ```bash
 pixi run lerobot-train \
   --dataset.repo_id=local/aic_orientation_sweep \
+  --dataset.root="$LEROBOT/orientation_sweep_all" \
   --policy.type=act \
   --output_dir=outputs/train/aic_act_orientation_sweep \
   --job_name=aic_act_orientation_sweep \
   --policy.device=cpu \
-  --wandb.enable=false
+  --wandb.enable=false \
+  --steps=100000 \
+  --save_freq=20000
 ```
+
+Training writes checkpoints like:
+
+```
+outputs/train/aic_act_orientation_sweep/
+  checkpoints/
+    020000/
+      pretrained_model/
+        config.json
+        model.safetensors
+        policy_preprocessor.json
+        policy_postprocessor.json
+        policy_preprocessor_step_3_normalizer_processor.safetensors
+        policy_postprocessor_step_0_unnormalizer_processor.safetensors
+      training_state/
+        optimizer_state.safetensors
+        training_step.json
+```
+
+Use `pretrained_model/` for deployment. Use `training_state/` only when resuming training.
+
+To resume from a checkpoint:
+
+```bash
+pixi run lerobot-train \
+  --config_path=outputs/train/aic_act_orientation_sweep/checkpoints/020000/pretrained_model/train_config.json \
+  --resume=true \
+  --steps=100000
+```
+
+---
+
+### Step 6 — Deploy the Trained Checkpoint
+
+After training, update the ACT runner to load your local checkpoint, for example:
+
+```
+outputs/train/aic_act_orientation_sweep/checkpoints/100000/pretrained_model
+```
+
+The current public Hugging Face example policy is not shape-compatible with this training pipeline.
+This dataset trains:
+
+```
+inputs:
+  observation.images.left
+  observation.images.center
+  observation.images.right
+  observation.state   (33D)
+
+output:
+  action              (6D delta TCP: dx, dy, dz, drx, dry, drz)
+```
+
+So `RunACT.py` / `runact_hugging.py` must use the same image keys, the same 33D state
+construction, and a 6D action output. Do not keep loading `grkw/aic_act_policy` unless
+you intentionally want to run the old public demo policy.
+
+The action represents one 20 Hz training timestep. In deployment, call the policy at a
+matching control rate or deliberately scale/clip the predicted deltas before sending them
+to the controller.
 
 ---
 
@@ -434,7 +554,8 @@ mistakes stack up and the robot drifts off course. ACT's chunking directly addre
 | Expert source | CheatCode oracle with ground-truth TF | None — learned from demonstrations |
 | Inputs used | ground-truth TF frames + all sensors | cameras + robot state only |
 | `ground_truth:=true` required | Yes | No |
-| Action type | absolute TCP targets | 6D delta TCP (position + axis-angle) |
+| Raw expert command | absolute TCP target from CheatCode | none |
+| Training/deployment action | 6D delta TCP label built from the expert command | 6D delta TCP prediction |
 
 At deployment, RunACT.py loads the trained checkpoint and calls it as a standard `aic_model`
 policy — it receives the same `Observation` message and returns a `MotionUpdate`, exactly like
@@ -509,7 +630,7 @@ The 50-trial config provides visual diversity across 10 board poses and 5 NIC ra
 │                                                                     │
 │  Across all episodes:                                               │
 │    • Computes mean/std/min/max → stats.json (for normalization)     │
-│    • Writes info.json, episodes.jsonl, tasks.jsonl                  │
+│    • Writes info.json, stats.json, tasks.parquet, episodes parquet │
 └────────────────────────┬────────────────────────────────────────────┘
                          │ LeRobot dataset
 ┌────────────────────────▼────────────────────────────────────────────┐
@@ -519,7 +640,7 @@ The 50-trial config provides visual diversity across 10 board poses and 5 NIC ra
 │  Output: chunk of 100 × 6D delta TCP actions                        │
 │                                                                     │
 │  Trains ResNet-18 image encoder + Transformer (encoder-decoder)     │
-│  Loss: MSE between predicted and expert delta actions               │
+│  Loss: action error between predicted and expert delta actions      │
 │                                                                     │
 │  Result: a checkpoint deployed via RunACT.py as the live policy     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -561,6 +682,13 @@ was not yet populated by the controller. Re-collect with the updated package ins
 ```bash
 pixi reinstall ros-kilted-team-policy
 ```
+
+### `success=1` but `final_error` is still large
+
+Treat the episode as suspicious. Some runs can be marked successful but still finish several
+centimetres from the target, for example `final_error≈0.045`. By default, keep the converter
+threshold at `--max_final_error 0.02` so those episodes are skipped. Only raise the threshold
+after visually inspecting the demo and deciding that it is useful for the behavior you want.
 
 ### Reusing the same `RUN_ID`
 

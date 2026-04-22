@@ -553,67 +553,30 @@ class MotionServoNode(Node):
 
 
 class mypolicy(Policy):
-    PIXEL_CORRECTION_ENABLED = True
-    SERVO_HOVER_Z = 0.0
-    PATH_SETTLE_SEC = 1.0
-    SERVO_WORLD_TOLERANCE = 0.003
-    SERVO_MAX_ITERATIONS = 600
-    SERVO_STEP_SEC = 0.10
-    SERVO_TIMEOUT_SEC = 30.0
+    # ---- Visual servo tuning constants ----
+    SERVO_HOVER_Z = 0.06              # Hover height above port for visual servo (m)
+    SERVO_PIXEL_TOLERANCE = 5.0       # Pixel error threshold for alignment convergence
+    SERVO_MAX_ITERATIONS = 80         # Max visual servo correction iterations
+    SERVO_GAIN = 0.4                  # Proportional gain for pixel→Cartesian correction
+    SERVO_STEP_SEC = 0.10             # Sleep between servo iterations
+    SERVO_TIMEOUT_SEC = 15.0          # Total visual servo timeout
 
-    SERVO_DLS_DAMPING = 1.2
-    SERVO_GAIN_XY = 0.012
-    SERVO_GAIN_Z = 0.008
-    SERVO_MAX_LINEAR_SPEED_XY = 0.0014
-    SERVO_MAX_LINEAR_SPEED_Z = 0.0003
-    SERVO_MIN_LINEAR_SPEED_XY = 0.0008
-    SERVO_CMD_SMOOTHING = 0.60
-    SERVO_CONVERGED_PX = 160.0
-    SERVO_CONVERGED_PX_STABLE_COUNT = 5
-    SERVO_Z_ENABLE_PX = 80.0
-    SERVO_ABORT_PX = 120.0
+    # ---- Force insertion tuning constants ----
+    INSERT_Z_STEP = 0.002             # Step down increment per iteration (m)
+    INSERT_Z_FORCE = 3.0              # Downward feedforward force (N). Positive is DOWN in tip frame!
+    INSERT_Z_STIFFNESS = 20.0         # Reduced Z stiffness during insertion
+    INSERT_MAX_LATERAL_FORCE = 8.0    # Max FX/FY before declaring misalignment (N)
+    INSERT_MAX_Z_FORCE = 15.0         # Max FZ before declaring jam (N)
+    INSERT_SETTLED_FORCE = 1.5        # Z force threshold to detect plug seated (N)
+    INSERT_MAX_DEPTH = 0.04           # Maximum insertion travel (m)
+    INSERT_STEP_SEC = 0.08            # Sleep between insertion steps
+    INSERT_TIMEOUT_SEC = 12.0         # Total insertion timeout
+    
+    _gripper_classes = {"gripper", "sfp_module", "plug"}
 
-    SERVO_MAX_YAW_RATE = 0.10
-    SERVO_MIN_CONFIDENCE = 0.20
-    SERVO_LAST_VALID_PAIR_SEC = 0.60
-
-    PITCH_GROUND_TIMEOUT_SEC = 20.0
-    PITCH_GROUND_PITCH_TOL_RAD = 0.015
-    PITCH_GROUND_STABLE_COUNT = 6
-    PITCH_GROUND_MAX_RATE = 0.18
-    PITCH_GROUND_MIN_RATE = 0.03
-    PITCH_GROUND_KP = 1.6
-    PITCH_GROUND_FORWARD_AXIS_LOCAL = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    PITCH_GROUND_AXIS_LOCAL = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    PITCH_GROUND_BASE_DIRECTION = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-
-    EDGE_ALIGN_TIMEOUT_SEC = 45.0
-    EDGE_ALIGN_DLS_DAMPING = 3.5
-    EDGE_ALIGN_GAIN_XY = 0.0010
-    EDGE_ALIGN_MAX_LINEAR_SPEED_XY = 0.0005
-    EDGE_ALIGN_CONVERGED_PX = 14.0
-    EDGE_ALIGN_STABLE_COUNT = 8
-    EDGE_ALIGN_MAX_PITCH_RATE = 0.030
-    EDGE_ALIGN_PITCH_RATE_COARSE = 0.020
-    EDGE_ALIGN_PITCH_RATE_FINE = 0.008
-    EDGE_ALIGN_SIGN_FLIP_PATIENCE = 10
-    EDGE_ALIGN_AXIAL_CONVERGED_PX = 8.0
-    EDGE_ALIGN_SMOOTHING = 0.55
-
-    SAMPLE_VERIFY_GOAL_LOST_MAX_COUNT = 4
-    SAMPLE_VERIFY_GOAL_VISIBILITY_FRESHNESS_SEC = 1.0
-    SAMPLE_VERIFY_IMAGE_MARGIN_PX = 2.0
-
-    INSERT_Z_STEP = 0.001
-    INSERT_MAX_LATERAL_FORCE = 15.0
-    INSERT_MAX_Z_FORCE = 30.0
-    INSERT_SETTLED_FORCE = 2.0
-    INSERT_MAX_DEPTH = 0.04
-    INSERT_STEP_SEC = 0.15
-    INSERT_TIMEOUT_SEC = 20.0
-
-    DEFAULT_FX = 600.0
-    DEFAULT_FY = 600.0
+    # ---- Camera intrinsic defaults (overridden from camera_info) ----
+    DEFAULT_FX = 450.0
+    DEFAULT_FY = 450.0
     DEFAULT_CX = 320.0
     DEFAULT_CY = 240.0
 

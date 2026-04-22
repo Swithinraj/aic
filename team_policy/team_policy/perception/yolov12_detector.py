@@ -1207,7 +1207,9 @@ class YoloV12MultiCameraDetector(Node):
         if family_key == "SC_PORT":
             return np.array([(x1 + x2) * 0.5, y2], dtype=np.float32)
         if family_key == "NIC_CARD":
-            return np.array([(x1 + x2) * 0.5, y1 + 0.72 * (y2 - y1)], dtype=np.float32)
+            frac = float(os.environ.get("YOLOV12_NIC_ANCHOR_Y_FRAC", "0.72"))
+            x_frac = float(os.environ.get("YOLOV12_NIC_ANCHOR_X_FRAC", "0.5"))
+            return np.array([x1 + x_frac * (x2 - x1), y1 + frac * (y2 - y1)], dtype=np.float32)
         return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
 
     def _invert_affine(self, M: np.ndarray) -> np.ndarray:
