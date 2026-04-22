@@ -33,6 +33,23 @@ def check(condition: bool, label: str, detail: str = "") -> bool:
     return condition
 
 
+def _schema_version_number(schema_version: str) -> int:
+    try:
+        return int(str(schema_version).split(".", maxsplit=1)[0])
+    except (TypeError, ValueError):
+        return 1
+
+
+def _decode_strings(values) -> list[str]:
+    decoded = []
+    for item in values:
+        if isinstance(item, bytes):
+            decoded.append(item.decode("utf-8"))
+        else:
+            decoded.append(str(item))
+    return decoded
+
+
 def validate(path: str) -> bool:
     try:
         import h5py
@@ -48,6 +65,10 @@ def validate(path: str) -> bool:
         print("--- Metadata ---")
         meta = hf["metadata"]
         schema_version = str(meta.attrs.get("schema_version", "1"))
+        schema_version_num = _schema_version_number(schema_version)
+        has_v2_schema = schema_version_num >= 2
+        has_v3_schema = schema_version_num >= 3
+        has_v4_schema = schema_version_num >= 4
         for key in (
             "schema_version",
             "episode_id",
@@ -92,13 +113,48 @@ def validate(path: str) -> bool:
             "actions/velocity",
         ]
         print("\n--- Schema v2 keys ---")
-        has_new_schema = schema_version == "2"
         for key in new_required:
             exists = key in hf
-            if has_new_schema:
+            if has_v2_schema:
                 all_ok &= check(exists, f"key exists: {key}")
             else:
-                check(exists, f"key exists: {key}", "optional for older episodes")
+                check(
+                    True,
+                    f"optional key: {key}",
+                    "present" if exists else "not present in older episode",
+                )
+
+        v3_required = [
+            "observations/privileged_tf/transforms",
+            "observations/privileged_tf/valid",
+            "observations/privileged_tf/frame_pairs",
+        ]
+        print("\n--- Schema v3 TF keys ---")
+        for key in v3_required:
+            exists = key in hf
+            if has_v3_schema:
+                all_ok &= check(exists, f"key exists: {key}")
+            else:
+                check(
+                    True,
+                    f"optional key: {key}",
+                    "present" if exists else "not present in older episode",
+                )
+
+        v4_required = ["observations/joint_velocity"]
+        print("\n--- Schema v4 keys ---")
+        for key in v4_required:
+            exists = key in hf
+            if has_v4_schema:
+                all_ok &= check(exists, f"key exists: {key}")
+            else:
+                check(
+                    True,
+                    f"optional key: {key}",
+                    "present" if exists else "not present in older episode",
+                )
+        if has_v4_schema and all(key in hf for key in v4_required):
+            print("Schema v4 keys — joint_velocity present")
 
         if not all_ok:
             print("\nMissing keys — cannot continue.")
@@ -112,6 +168,11 @@ def validate(path: str) -> bool:
         vel    = hf["observations/tcp_velocity"][:]
         err    = hf["observations/tcp_error"][:]
         joints = hf["observations/joint_positions"][:]
+        joint_vel = (
+            hf["observations/joint_velocity"][:]
+            if "observations/joint_velocity" in hf
+            else None
+        )
         wrench = hf["observations/wrist_force"][:]
         stamps = hf["observations/timestamps"][:]
         cmd    = hf["actions/commanded_pose"][:]
@@ -124,6 +185,21 @@ def validate(path: str) -> bool:
         )
         delta = hf["actions/delta_pose"][:] if "actions/delta_pose" in hf else None
         vel_action = hf["actions/velocity"][:] if "actions/velocity" in hf else None
+        privileged_tf = (
+            hf["observations/privileged_tf/transforms"][:]
+            if "observations/privileged_tf/transforms" in hf
+            else None
+        )
+        privileged_tf_valid = (
+            hf["observations/privileged_tf/valid"][:]
+            if "observations/privileged_tf/valid" in hf
+            else None
+        )
+        privileged_tf_frame_pairs = (
+            _decode_strings(hf["observations/privileged_tf/frame_pairs"][:])
+            if "observations/privileged_tf/frame_pairs" in hf
+            else []
+        )
 
         T = tcp.shape[0]
 
@@ -141,6 +217,8 @@ def validate(path: str) -> bool:
             (stamps.shape, (T,),               "timestamps    (T,)"),
             (cmd.shape,    (T, 7),             "commanded_pose(T,7)"),
         ]
+        if joint_vel is not None:
+            shape_checks.append((joint_vel.shape, (T, 7), "joint_velocity(T,7)"))
         if task_ids is not None:
             shape_checks.append((task_ids.shape, (T,), "task_id       (T,)"))
         if rel is not None:
@@ -157,6 +235,24 @@ def validate(path: str) -> bool:
                 match = actual[1] == expected[1]
             detail = f"got {actual}"
             all_ok &= check(match, label, detail)
+
+        if privileged_tf is not None and privileged_tf_valid is not None:
+            tf_count = privileged_tf.shape[1] if privileged_tf.ndim >= 2 else -1
+            all_ok &= check(
+                privileged_tf.ndim == 3 and privileged_tf.shape == (T, tf_count, 7),
+                "privileged_tf transforms (T,N,7)",
+                f"got {privileged_tf.shape}",
+            )
+            all_ok &= check(
+                privileged_tf_valid.shape == (T, tf_count),
+                "privileged_tf valid mask (T,N)",
+                f"got {privileged_tf_valid.shape}",
+            )
+            all_ok &= check(
+                len(privileged_tf_frame_pairs) == tf_count,
+                "privileged_tf frame pair labels (N)",
+                f"{len(privileged_tf_frame_pairs)} labels for {tf_count} transforms",
+            )
 
         # ---- Frame count vs metadata ----
         all_ok &= check(T == T_meta, f"frame count matches metadata ({T} == {T_meta})")
@@ -187,6 +283,20 @@ def validate(path: str) -> bool:
         print(f"  position range  x:[{tcp[:,0].min():.3f},{tcp[:,0].max():.3f}] "
               f"y:[{tcp[:,1].min():.3f},{tcp[:,1].max():.3f}] "
               f"z:[{tcp[:,2].min():.3f},{tcp[:,2].max():.3f}]")
+
+        if joint_vel is not None:
+            print("\n--- Joint velocity ---")
+            all_ok &= check(
+                not np.any(np.isnan(joint_vel)) and not np.any(np.isinf(joint_vel)),
+                "joint_velocity has no NaN/Inf",
+            )
+            nonzero_joint_vel = int(np.count_nonzero(np.abs(joint_vel) > 1e-8))
+            all_ok &= check(
+                nonzero_joint_vel > 0,
+                "joint_velocity is not all zeros",
+                f"{nonzero_joint_vel}/{joint_vel.size} non-zero values",
+            )
+            print(f"  velocity range: [{joint_vel.min():.6f}, {joint_vel.max():.6f}] rad/s")
 
         # ---- Commanded pose sanity ----
         print("\n--- Commanded pose (CheatCode actions) ---")
@@ -233,6 +343,26 @@ def validate(path: str) -> bool:
                     f"mean={quat_norms_rel.mean():.4f}",
                 )
 
+        if privileged_tf is not None and privileged_tf_valid is not None:
+            print("\n--- Privileged TF snapshots ---")
+            tf_valid_mask = np.asarray(privileged_tf_valid, dtype=bool)
+            for idx, label in enumerate(privileged_tf_frame_pairs):
+                valid_count = int(tf_valid_mask[:, idx].sum())
+                print(f"  {idx}: {label} valid={valid_count}/{T}")
+
+            valid_tf = privileged_tf[tf_valid_mask]
+            all_ok &= check(
+                not np.any(np.isnan(valid_tf)) and not np.any(np.isinf(valid_tf)),
+                "valid privileged_tf transforms have no NaN/Inf",
+            )
+            if valid_tf.shape[0]:
+                tf_quat_norms = np.linalg.norm(valid_tf[:, 3:], axis=1)
+                all_ok &= check(
+                    np.allclose(tf_quat_norms, 1.0, atol=0.05),
+                    "privileged_tf quaternion norms ≈ 1.0",
+                    f"mean={tf_quat_norms.mean():.4f}",
+                )
+
         # ---- Wrench sanity ----
         print("\n--- Wrist force ---")
         print(f"  Fz range: [{wrench[:,2].min():.2f}, {wrench[:,2].max():.2f}] N")
@@ -244,7 +374,7 @@ def validate(path: str) -> bool:
         for key in ("max_force", "final_error", "insertion_time", "contact_duration"):
             value = float(meta.attrs.get(key, float("nan")))
             print(f"  {key}: {value:.6g}")
-            if has_new_schema:
+            if has_v2_schema:
                 if key == "final_error":
                     all_ok &= check(np.isfinite(value), f"{key} is finite")
                 else:

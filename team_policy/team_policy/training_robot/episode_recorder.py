@@ -3,7 +3,7 @@ Buffers one episode of (observation, action) pairs and saves to HDF5.
 
 Action stored here is the absolute TCP pose commanded by CheatCode at each step.
 During convert_to_lerobot.py those are turned into delta poses (position diff +
-axis-angle rotation diff) which match the 6-D twist action space that RunACT uses.
+axis-angle rotation diff) for the 6-D Cartesian twist action space.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import numpy as np
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 CONTACT_FORCE_THRESHOLD_N = 0.5
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
 
 
 def _quat_normalize(q: np.ndarray) -> np.ndarray:
@@ -100,8 +100,11 @@ class Frame:
     tcp_velocity: np.ndarray     # (6,) vx vy vz wx wy wz
     tcp_error: np.ndarray        # (6,)
     joint_positions: np.ndarray  # (7,)
+    joint_velocity: np.ndarray   # (7,) — measured per-joint velocity from JointState
     wrist_force: np.ndarray      # (6,) fx fy fz tx ty tz
     relative_pose: Optional[np.ndarray] = None  # (7,) target port pose in plug-tip frame
+    privileged_tf: Optional[np.ndarray] = None  # (N, 7) selected TF snapshot
+    privileged_tf_valid: Optional[np.ndarray] = None  # (N,)
     commanded_pose: Optional[np.ndarray] = None  # (7,) — set when CheatCode issues a command
 
 
@@ -111,6 +114,7 @@ class Episode:
     task_id: str
     port_type: str
     port_name: str
+    privileged_tf_frame_pairs: List[str] = field(default_factory=list)
     frames: List[Frame] = field(default_factory=list)
     success: bool = False
     start_time: float = 0.0
@@ -138,7 +142,18 @@ class EpisodeRecorder:
         """Call this every time CheatCode sends a move_robot command."""
         self._last_commanded_pose = pose.copy()
 
-    def record_frame(self, obs, relative_pose: Optional[np.ndarray] = None) -> None:
+    def set_privileged_tf_frame_pairs(self, frame_pairs: List[str]) -> None:
+        """Declare the selected TF snapshot fields for the current episode."""
+        if self._current is not None:
+            self._current.privileged_tf_frame_pairs = list(frame_pairs)
+
+    def record_frame(
+        self,
+        obs,
+        relative_pose: Optional[np.ndarray] = None,
+        privileged_tf: Optional[np.ndarray] = None,
+        privileged_tf_valid: Optional[np.ndarray] = None,
+    ) -> None:
         """
         obs is an aic_model_interfaces/msg/Observation.
         Called at ~20 Hz inside insert_cable while the episode is running.
@@ -172,11 +187,14 @@ class EpisodeRecorder:
             ], dtype=np.float32),
             tcp_error=np.array(list(cs.tcp_error), dtype=np.float32),
             joint_positions=np.array(list(js.position[:7]), dtype=np.float32),
+            joint_velocity=np.array(list(js.velocity[:7]), dtype=np.float32),
             wrist_force=np.array([
                 w.force.x, w.force.y, w.force.z,
                 w.torque.x, w.torque.y, w.torque.z,
             ], dtype=np.float32),
             relative_pose=None if relative_pose is None else np.asarray(relative_pose, dtype=np.float32).copy(),
+            privileged_tf=None if privileged_tf is None else np.asarray(privileged_tf, dtype=np.float32).copy(),
+            privileged_tf_valid=None if privileged_tf_valid is None else np.asarray(privileged_tf_valid, dtype=np.bool_).copy(),
             commanded_pose=self._last_commanded_pose,
         )
         self._current.frames.append(frame)
@@ -213,6 +231,7 @@ class EpisodeRecorder:
         tcp_vels     = np.stack([f.tcp_velocity      for f in ep.frames])
         tcp_errors   = np.stack([f.tcp_error         for f in ep.frames])
         joint_pos    = np.stack([f.joint_positions   for f in ep.frames])
+        joint_vel    = np.stack([f.joint_velocity    for f in ep.frames])
         wrist_forces = np.stack([f.wrist_force       for f in ep.frames])
         timestamps   = np.array([f.timestamp         for f in ep.frames], dtype=np.float64)
         task_ids     = [f.task_id for f in ep.frames]
@@ -227,6 +246,20 @@ class EpisodeRecorder:
             f.relative_pose if f.relative_pose is not None else np.zeros(7, dtype=np.float32)
             for f in ep.frames
         ])
+        tf_frame_pairs = list(ep.privileged_tf_frame_pairs)
+        tf_count = len(tf_frame_pairs)
+        if tf_count:
+            privileged_tf = np.stack([
+                f.privileged_tf if f.privileged_tf is not None else np.zeros((tf_count, 7), dtype=np.float32)
+                for f in ep.frames
+            ])
+            privileged_tf_valid = np.stack([
+                f.privileged_tf_valid if f.privileged_tf_valid is not None else np.zeros(tf_count, dtype=np.bool_)
+                for f in ep.frames
+            ])
+        else:
+            privileged_tf = np.zeros((T, 0, 7), dtype=np.float32)
+            privileged_tf_valid = np.zeros((T, 0), dtype=np.bool_)
         delta_actions = np.stack([
             _pose_delta(f.tcp_pose, cmd_poses[i])
             for i, f in enumerate(ep.frames)
@@ -263,10 +296,18 @@ class EpisodeRecorder:
             obs.create_dataset("tcp_velocity",    data=tcp_vels)
             obs.create_dataset("tcp_error",       data=tcp_errors)
             obs.create_dataset("joint_positions", data=joint_pos)
+            obs.create_dataset("joint_velocity",  data=joint_vel)
             obs.create_dataset("wrist_force",     data=wrist_forces)
             obs.create_dataset("timestamps",      data=timestamps)
             obs.create_dataset("relative_pose",   data=relative_poses)
             obs.create_dataset("relative_pose_valid", data=relative_valid)
+            tf_group = obs.create_group("privileged_tf")
+            tf_group.create_dataset("transforms", data=privileged_tf)
+            tf_group.create_dataset("valid", data=privileged_tf_valid)
+            tf_group.create_dataset(
+                "frame_pairs",
+                data=np.asarray(tf_frame_pairs, dtype=h5py.string_dtype(encoding="utf-8")),
+            )
 
             act = hf.create_group("actions")
             act.create_dataset("commanded_pose", data=cmd_poses)

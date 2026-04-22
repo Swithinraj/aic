@@ -58,14 +58,23 @@ class DataCollectionPolicy(Policy):
             f"output={self._output_dir}, success_only={self._success_only}"
         )
 
-    def _relative_pose_plug_to_target(self, task: Task) -> np.ndarray | None:
-        """Return target port pose in the plug-tip frame as [x,y,z,qx,qy,qz,qw]."""
+    @staticmethod
+    def _task_frames(task: Task) -> tuple[str, str, str]:
         port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
         plug_frame = f"{task.cable_name}/{task.plug_name}_link"
+        task_board_frame = "task_board/task_board_base_link"
+        return port_frame, plug_frame, task_board_frame
+
+    @staticmethod
+    def _format_tf_pair(target_frame: str, source_frame: str) -> str:
+        return f"{target_frame}<-{source_frame}"
+
+    def _lookup_pose_array(self, target_frame: str, source_frame: str) -> np.ndarray | None:
+        """Return source-frame pose in target-frame coordinates as [x,y,z,qx,qy,qz,qw]."""
         try:
             tf_msg = self._parent_node._tf_buffer.lookup_transform(
-                plug_frame,
-                port_frame,
+                target_frame,
+                source_frame,
                 Time(),
             ).transform
         except TransformException:
@@ -83,6 +92,36 @@ class DataCollectionPolicy(Policy):
             ],
             dtype=np.float32,
         )
+
+    def _relative_pose_plug_to_target(self, task: Task) -> np.ndarray | None:
+        """Return target port pose in the plug-tip frame as [x,y,z,qx,qy,qz,qw]."""
+        port_frame, plug_frame, _ = self._task_frames(task)
+        return self._lookup_pose_array(plug_frame, port_frame)
+
+    def _privileged_tf_pairs(self, task: Task) -> list[tuple[str, str]]:
+        """Selected TFs saved for offline debugging/training analysis."""
+        port_frame, plug_frame, task_board_frame = self._task_frames(task)
+        return [
+            ("base_link", task_board_frame),
+            ("base_link", port_frame),
+            ("base_link", plug_frame),
+            ("base_link", "gripper/tcp"),
+            (plug_frame, port_frame),
+        ]
+
+    def _privileged_tf_snapshot(
+        self,
+        frame_pairs: list[tuple[str, str]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        transforms = np.zeros((len(frame_pairs), 7), dtype=np.float32)
+        valid = np.zeros(len(frame_pairs), dtype=np.bool_)
+        for idx, (target_frame, source_frame) in enumerate(frame_pairs):
+            pose = self._lookup_pose_array(target_frame, source_frame)
+            if pose is None:
+                continue
+            transforms[idx] = pose
+            valid[idx] = True
+        return transforms, valid
 
     # ------------------------------------------------------------------
     # Policy entry point — called once per trial by aic_engine
@@ -112,6 +151,10 @@ class DataCollectionPolicy(Policy):
 
         send_feedback(f"collector/episode={episode_id} port={port_type}/{port_name}")
         self._recorder.start_episode(episode_id, task_id, port_type, port_name)
+        tf_pairs = self._privileged_tf_pairs(task)
+        self._recorder.set_privileged_tf_frame_pairs(
+            [self._format_tf_pair(target, source) for target, source in tf_pairs]
+        )
 
         # Wrap move_robot to capture CheatCode's commanded target pose.
         # CheatCode uses set_pose_target() which puts the goal in motion_update.pose
@@ -141,7 +184,13 @@ class DataCollectionPolicy(Policy):
                 obs = get_observation()
                 if obs is not None:
                     relative_pose = self._relative_pose_plug_to_target(task)
-                    self._recorder.record_frame(obs, relative_pose=relative_pose)
+                    privileged_tf, privileged_tf_valid = self._privileged_tf_snapshot(tf_pairs)
+                    self._recorder.record_frame(
+                        obs,
+                        relative_pose=relative_pose,
+                        privileged_tf=privileged_tf,
+                        privileged_tf_valid=privileged_tf_valid,
+                    )
                 time.sleep(0.05)
 
         obs_thread = threading.Thread(target=obs_loop, daemon=True)
