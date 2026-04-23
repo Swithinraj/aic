@@ -384,9 +384,9 @@ def validate(path: str) -> bool:
         print("\n--- Timing ---")
         if T > 1:
             dt = np.diff(stamps)
-            print(f"  mean dt: {dt.mean()*1000:.1f}ms  (target ~50ms for 20Hz)")
+            print(f"  mean dt: {dt.mean()*1000:.1f}ms  (target ~100ms for 10Hz, or downsampled later)")
             print(f"  max dt:  {dt.max()*1000:.1f}ms")
-            all_ok &= check(dt.mean() < 0.15, "mean frame interval < 150ms", f"{dt.mean()*1000:.1f}ms")
+            all_ok &= check(dt.mean() < 0.20, "mean frame interval < 200ms", f"{dt.mean()*1000:.1f}ms")
 
         # ---- Summary ----
         print(f"\n{'='*45}")

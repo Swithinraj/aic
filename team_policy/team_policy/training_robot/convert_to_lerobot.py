@@ -145,7 +145,7 @@ def _decode_strings(raw_values) -> List[str]:
 # Video helpers
 # ---------------------------------------------------------------------------
 
-def _write_video(frames: np.ndarray, path: Path, fps: int = 20,
+def _write_video(frames: np.ndarray, path: Path, fps: int = 10,
                  target_hw: tuple[int, int] | None = None) -> None:
     """Write (T, H, W, 3) uint8 RGB frames as an MP4 file.
 
@@ -218,7 +218,8 @@ def compute_stats(all_states: List[np.ndarray], all_actions: List[np.ndarray]) -
 
 def convert(input_dir: str, output_dir: str, success_only: bool,
             max_final_error: float = 0.02,
-            image_height: int = 480, image_width: int = 640) -> None:
+            image_height: int = 480, image_width: int = 640,
+            target_hz: float = 10.0) -> None:
     try:
         import h5py
         import pandas as pd
@@ -264,27 +265,39 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 print(f"  skip {ep_file.name} (final_error={final_error:.3f}m > {max_final_error}m)")
                 continue
 
-            tcp_poses  = hf["observations/tcp_pose"][:]
-            tcp_vels   = hf["observations/tcp_velocity"][:]
-            tcp_errors = hf["observations/tcp_error"][:]
-            joint_pos  = hf["observations/joint_positions"][:]
+            T_full = int(meta.attrs.get("num_frames", hf["observations/tcp_pose"].shape[0]))
+            ts_full = hf["observations/timestamps"][:]
+
+            if T_full > 1:
+                median_dt = float(np.median(np.diff(ts_full)))
+                actual_hz = 1.0 / median_dt if median_dt > 0 else target_hz
+            else:
+                actual_hz = target_hz
+
+            step = max(1, round(actual_hz / target_hz))
+            indices = np.arange(0, T_full, step)
+
+            tcp_poses  = hf["observations/tcp_pose"][:][indices]
+            tcp_vels   = hf["observations/tcp_velocity"][:][indices]
+            tcp_errors = hf["observations/tcp_error"][:][indices]
+            joint_pos  = hf["observations/joint_positions"][:][indices]
             joint_vel  = (
-                hf["observations/joint_velocity"][:]
+                hf["observations/joint_velocity"][:][indices]
                 if "observations/joint_velocity" in hf
-                else np.zeros_like(joint_pos)
+                else np.zeros((len(indices), 7), dtype=np.float32)
             )
             T = tcp_poses.shape[0]
 
             task_id = str(meta.attrs.get("task_id", "insert_cable"))
             task_ids = _decode_task_ids(
-                hf["observations/task_id"][:] if "observations/task_id" in hf else None,
+                hf["observations/task_id"][:][indices] if "observations/task_id" in hf else None,
                 fallback=task_id,
                 count=T,
             )
             if "observations/relative_pose" in hf:
-                relative_pose = hf["observations/relative_pose"][:]
+                relative_pose = hf["observations/relative_pose"][:][indices]
                 relative_valid = (
-                    hf["observations/relative_pose_valid"][:].astype(bool)
+                    hf["observations/relative_pose_valid"][:][indices].astype(bool)
                     if "observations/relative_pose_valid" in hf
                     else np.ones(T, dtype=bool)
                 )
@@ -293,10 +306,10 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 relative_valid = np.zeros(T, dtype=bool)
 
             if "observations/privileged_tf/transforms" in hf:
-                privileged_tf = hf["observations/privileged_tf/transforms"][:]
+                privileged_tf = hf["observations/privileged_tf/transforms"][:][indices]
                 tf_count = privileged_tf.shape[1]
                 privileged_tf_valid = (
-                    hf["observations/privileged_tf/valid"][:].astype(bool)
+                    hf["observations/privileged_tf/valid"][:][indices].astype(bool)
                     if "observations/privileged_tf/valid" in hf
                     else np.ones((T, tf_count), dtype=bool)
                 )
@@ -315,11 +328,11 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
             state = np.concatenate([tcp_poses, tcp_vels, tcp_errors, joint_pos, joint_vel], axis=1)
 
             if "actions/delta_pose" in hf:
-                action = hf["actions/delta_pose"][:]
+                action = hf["actions/delta_pose"][:][indices]
             else:
                 action = compute_delta_actions(tcp_poses)
             velocity_action = (
-                hf["actions/velocity"][:]
+                hf["actions/velocity"][:][indices]
                 if "actions/velocity" in hf
                 else np.zeros_like(action)
             )
@@ -329,7 +342,7 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 img_key = f"observations/images/{cam}"
                 vk = f"observation.images.{cam}"
                 if img_key in hf:
-                    images = hf[img_key][:]
+                    images = hf[img_key][:][indices]
                     if not video_shape:
                         _, H, W, _ = images.shape
                         video_shape = {
@@ -355,7 +368,7 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 "index":             np.arange(ep_start, ep_end, dtype=np.int64),
                 "episode_index":     np.full(T, lerobot_idx, dtype=np.int64),
                 "frame_index":       np.arange(T, dtype=np.int64),
-                "timestamp":         (np.arange(T, dtype=np.float32) * 0.05),
+                "timestamp":         (np.arange(T, dtype=np.float32) * 0.10),
                 "task_index":        np.zeros(T, dtype=np.int64),
                 "observation.state": state.astype(np.float32),
                 "action":            action.astype(np.float32),
@@ -375,8 +388,8 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 # video timestamps (all episodes in file-000, sequential timestamps)
                 **{f"videos/{vk}/chunk_index": 0 for vk in VIDEO_KEYS},
                 **{f"videos/{vk}/file_index": 0 for vk in VIDEO_KEYS},
-                **{f"videos/{vk}/from_timestamp": ep_start * 0.05 for vk in VIDEO_KEYS},
-                **{f"videos/{vk}/to_timestamp": ep_end * 0.05 for vk in VIDEO_KEYS},
+                **{f"videos/{vk}/from_timestamp": ep_start * 0.10 for vk in VIDEO_KEYS},
+                **{f"videos/{vk}/to_timestamp": ep_end * 0.10 for vk in VIDEO_KEYS},
             })
 
             total_frames += T
@@ -471,13 +484,13 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
     # Only include features that are tensorizeable (no strings, no privileged debug data).
     # Standard lerobot frame metadata (DEFAULT_FEATURES) is merged in at load time.
     info_features: dict = {
-        "observation.state": {"dtype": "float32", "shape": [33], "fps": 20},
-        "action":            {"dtype": "float32", "shape": [6],  "fps": 20},
-        "timestamp":         {"dtype": "float32", "shape": [1],  "fps": 20},
-        "frame_index":       {"dtype": "int64",   "shape": [1],  "fps": 20},
-        "episode_index":     {"dtype": "int64",   "shape": [1],  "fps": 20},
-        "index":             {"dtype": "int64",   "shape": [1],  "fps": 20},
-        "task_index":        {"dtype": "int64",   "shape": [1],  "fps": 20},
+        "observation.state": {"dtype": "float32", "shape": [33], "fps": 10},
+        "action":            {"dtype": "float32", "shape": [6],  "fps": 10},
+        "timestamp":         {"dtype": "float32", "shape": [1],  "fps": 10},
+        "frame_index":       {"dtype": "int64",   "shape": [1],  "fps": 10},
+        "episode_index":     {"dtype": "int64",   "shape": [1],  "fps": 10},
+        "index":             {"dtype": "int64",   "shape": [1],  "fps": 10},
+        "task_index":        {"dtype": "int64",   "shape": [1],  "fps": 10},
     }
 
     if has_video:
@@ -489,13 +502,13 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 "shape": [H, W, 3],
                 "names": ["height", "width", "channel"],
                 "video_info": {
-                    "video.fps": 20.0,
+                    "video.fps": 10.0,
                     "video.codec": "mp4v",
                     "video.pix_fmt": "yuv420p",
                     "video.is_depth_map": False,
                     "has_audio": False,
                 },
-                "fps": 20,
+                "fps": 10,
             }
 
     info: dict = {
@@ -503,7 +516,7 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
         "robot_type": "aic_ur5e",
         "total_episodes": lerobot_idx,
         "total_frames": total_frames,
-        "fps": 20,
+        "fps": 10,
         "data_path": DEFAULT_DATA_PATH,
         "video_path": DEFAULT_VIDEO_PATH if has_video else None,
         "features": info_features,
@@ -531,9 +544,11 @@ def main():
                         help="Resize images to this height (default: 480). Set 0 to keep original.")
     parser.add_argument("--image_width", type=int, default=640,
                         help="Resize images to this width (default: 640). Set 0 to keep original.")
+    parser.add_argument("--target_hz", type=float, default=10.0,
+                        help="Target Hz to downsample episodes to (default: 10.0)")
     args = parser.parse_args()
     convert(args.input, args.output, args.success_only, args.max_final_error,
-            args.image_height, args.image_width)
+            args.image_height, args.image_width, args.target_hz)
 
 
 if __name__ == "__main__":

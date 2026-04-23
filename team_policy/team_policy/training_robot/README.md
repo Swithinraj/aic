@@ -61,6 +61,7 @@ The board must stay flat on the table. Changing `z` would float or sink it throu
 ```bash
 export AIC_ROOT=$(git rev-parse --show-toplevel)
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 ```
 **Generating the session YAMLs:**
 
@@ -86,7 +87,7 @@ python3 team_policy/team_policy/training_robot/configs/generate_competition_sess
 
 ### What gets recorded per episode
 
-At 20 Hz, for every timestep:
+At 10 Hz, for every timestep:
 
 | Data | Shape | What it is |
 |------|-------|------------|
@@ -107,7 +108,7 @@ tcp_pose(7) + tcp_velocity(6) + tcp_error(6) + joint_positions(7) + joint_veloci
 ### The policy: ACT (Action Chunking with Transformers)
 
 ```
-At each 20 Hz step:
+At each 10 Hz step:
 
   Inputs
   ------
@@ -117,12 +118,12 @@ At each 20 Hz step:
   Transformer encoder-decoder
   ---------------------------
   Attends over all tokens
-  Predicts a CHUNK of 100 future actions at once
+  Predicts a CHUNK of 50 future actions at once
 
   Output
   ------
-  100 x [dx, dy, dz, drx, dry, drz]   (6D delta TCP pose)
-  Applied at 20 Hz = 5 seconds of planned motion
+  50 x [dx, dy, dz, drx, dry, drz]   (6D delta TCP pose)
+  Applied at 10 Hz = 5 seconds of planned motion
 ```
 
 **Why action chunking?** Predicting one action at a time compounds errors — small mistakes at step 1 corrupt step 2. Predicting 100 steps as one coherent plan is much more stable. The policy replans every 5 seconds to correct any drift.
@@ -135,7 +136,7 @@ At each 20 Hz step:
 Gazebo simulation (ground_truth:=true)
   |
   |  CheatCode executes insertions using hidden TF frames
-  |  EpisodeRecorder captures images + state + actions at 20 Hz
+  |  EpisodeRecorder captures images + state + actions at 10 Hz
   v
 episodes/run_001/ ... run_050/
   150 HDF5 files  (50 sessions x 3 trials)
@@ -157,7 +158,7 @@ lerobot_datasets/aic_dataset_v1/
 outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model/
   |
   |  team_policy.run_act  (deployed in competition)
-  |  Runs at 20 Hz using only cameras + robot state
+  |  Runs at 10 Hz using only cameras + robot state
   v
 Robot inserts cable autonomously
 ```
@@ -171,9 +172,10 @@ Robot inserts cable autonomously
 ```bash
 export AIC_ROOT=$(git rev-parse --show-toplevel)
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 ```
 
-`git rev-parse --show-toplevel` finds the repo root automatically — works for any username and any clone location. **Paste these two lines at the top of every terminal you open for this pipeline.**
+`git rev-parse --show-toplevel` finds the repo root automatically — works for any username and any clone location. The FastDDS profile disables shared memory to prevent htop from showing inflated real RAM usage for aic_model on 16GB machines. **Paste these three lines at the top of every terminal you open for this pipeline.**
 
 ### Step B — Build after any code change
 
@@ -189,7 +191,7 @@ cd $AIC_ROOT && pixi reinstall ros-kilted-team-policy
 |------|-------------|
 | [1. Collect](#step-1----collect-episodes-50-sessions--3-trials--150-episodes) | Run 50 Gazebo sessions × 3 trials → 150 HDF5 episode files |
 | [2. Validate](#step-2----count-and-validate) | Check every HDF5 file passes quality thresholds |
-| [3. Convert](#step-3----convert-to-lerobot-format) | Merge + convert HDF5 → LeRobot parquet + MP4 dataset |
+| [3. Convert](#step-3----convert-to-lerobot-format) | Merge + convert HDF5 (auto-downsamples ~20 Hz to 10 Hz) → LeRobot parquet + MP4 dataset |
 | [4. Train](#step-4----train-act-policy) | Train ACT neural network on the dataset |
 | [5. Deploy](#step-5----deploy-and-test-the-trained-policy) | Load checkpoint, run policy in simulation |
 
@@ -207,6 +209,7 @@ Run one session at a time. Each session takes ~10–15 minutes.
 ```bash
 export AIC_ROOT=$(git rev-parse --show-toplevel)
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 
 distrobox enter -r aic_eval -- /entrypoint.sh \
   ground_truth:=true \
@@ -224,6 +227,7 @@ No node with name 'aic_model' found. Retrying...
 ```bash
 export AIC_ROOT=$(git rev-parse --show-toplevel)
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 export RUN_ID=run_001
 export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
 
@@ -368,7 +372,8 @@ pixi run python -m team_policy.training_robot.convert_to_lerobot \
   --input  "$MERGED" \
   --output "$LEROBOT/aic_dataset_v1" \
   --success_only \
-  --max_final_error 0.02
+  --max_final_error 0.02 \
+  --target_hz 10
 ```
 
 Output structure:
@@ -438,6 +443,7 @@ pixi run lerobot-train \
 ```bash
 export AIC_ROOT=$(git rev-parse --show-toplevel)
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 
 distrobox enter -r aic_eval -- /entrypoint.sh \
   ground_truth:=false \
@@ -449,6 +455,7 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
 
 ```bash
 export AIC_ROOT=$(git rev-parse --show-toplevel)
+export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 export CKPT=$AIC_ROOT/outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model
 
 cd $AIC_ROOT

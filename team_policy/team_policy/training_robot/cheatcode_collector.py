@@ -175,7 +175,7 @@ class DataCollectionPolicy(Policy):
             elif joint_motion_update is not None:
                 move_robot(joint_motion_update=joint_motion_update)
 
-        # Background thread records observations at ~20 Hz while CheatCode runs.
+        # Background thread records observations at ~10 Hz while CheatCode runs.
         recording_active = threading.Event()
         recording_active.set()
 
@@ -191,7 +191,7 @@ class DataCollectionPolicy(Policy):
                         privileged_tf=privileged_tf,
                         privileged_tf_valid=privileged_tf_valid,
                     )
-                time.sleep(0.05)
+                time.sleep(0.10)
 
         obs_thread = threading.Thread(target=obs_loop, daemon=True)
         obs_thread.start()

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS profile — disables shared memory transport.
+
+  WHY THIS EXISTS
+  ───────────────
+  By default, FastDDS (the ROS2 middleware used locally) routes large messages
+  such as camera images through a shared memory segment.  Every process that
+  subscribes to those images maps the same segment into its own address space.
+  Linux's htop counts that shared mapping as part of each process's RES column,
+  making aic_model appear to use 10–14 GB when the actual private heap is only
+  ~300 MB.  This causes confusion and alarm on 16 GB machines.
+
+  This profile forces FastDDS to fall back to UDP instead of shared memory.
+  htop will then show the real per-process RSS, and perceived RAM usage drops
+  dramatically.
+
+  USAGE (add to ~/.bashrc or your session launch script)
+  ───────────────────────────────────────────────────────
+      export FASTRTPS_DEFAULT_PROFILES_FILE=~/ros2_ws/src/aic/team_policy/fastdds_no_shm.xml
+
+  COMPETITION IMPACT
+  ──────────────────
+  None.  The competition evaluation runs rmw_zenoh_cpp, not FastDDS.
+  This file is only active when FASTRTPS_DEFAULT_PROFILES_FILE points to it
+  on your local machine during training / data collection.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>udp_only</transport_id>
+            <type>UDPv4</type>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="disable_shm" is_default_profile="true">
+        <rtps>
+            <!-- Replace the default transports (SHM + UDPv4) with UDP only -->
+            <userTransports>
+                <transport_id>udp_only</transport_id>
+            </userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+        </rtps>
+    </participant>
+
+</profiles>
