@@ -1,107 +1,81 @@
+# Training Robot — Imitation Learning Pipeline
 
-
-Full imitation-learning pipeline: collect expert demos → validate → convert → train ACT → deploy.
-
-```
-aic_engine runs 3 trials per session (fixed board pose)
-  → aic_model loads cheatcode_collector
-    → CheatCode (ground-truth oracle) executes each trial
-      → EpisodeRecorder saves observations + expert actions → episode_XXXXX.hdf5
-        → validate_episode.py checks every file
-          → convert_to_lerobot.py converts HDF5 → LeRobot v3.0 dataset
-            → lerobot-train trains an ACT neural network policy
-              → team_policy.run_act deploys the checkpoint
-```
-
-> **Important:** `CheatCode` requires `ground_truth:=true` on the eval side.
-> The final deployed policy (`run_act.py`) uses only cameras + robot state — no hidden TF frames.
+Collect expert demos → validate → convert → train ACT → deploy.
 
 ---
 
-## Why Competition Sessions (not the old 50-trial config)
+## What We're Building
 
-The old `orientation_sweep_50_trials.yaml` ran 50 trials in one Gazebo session with all 5 NIC
-cards + 2 SC mounts spawned simultaneously every trial. This caused two problems:
+### The goal
 
-- **RAM fills up** → PC freezes mid-run as Gazebo accumulates 50 × 7+ entities
-- **Score drops to ~30 after trial 1** → The board pose (x/y/yaw) jumped to a completely
-  different position every trial. CheatCode's TF lookups got stale during entity respawn,
-  causing it to move to the wrong position and miss the insertion
+Train a robot arm to autonomously insert cables into a server task board — specifically:
+- **NIC cards** (SFP plugs) into 5 rails on the board
+- **SC fiber mounts** into 2 rails on the board
 
-The fix is **competition-format sessions**:
+The trained policy must work using only what the robot can see at competition time: **3 cameras + robot joint/force state**. No ground-truth positions, no hidden TF frames.
 
-| | Old 50-trial config | Competition sessions |
-|---|---|---|
-| Trials per Gazebo launch | 50 | **3** |
-| Board pose within session | Changes every trial | **Fixed** — same for all 3 trials |
-| Entities spawned per trial | All 5 NICs + 2 SCs | **1 target entity only** |
-| RAM behaviour | Fills up, PC freezes | Stable — restarted between sessions |
-| CheatCode score | 30/100 after trial 1 | Consistent across all 3 trials |
+### Why imitation learning?
 
-Each session = **2 NIC insertions + 1 SC insertion** at one fixed board pose.
-Board pose varies **between** sessions, giving training diversity across 50 relaunches.
-The board always stays on the table: `z=1.14`, `roll=0.0`, and `pitch=0.0`.
-Only `x`, `y`, and `yaw` change between sessions.
+Writing a hand-coded controller for precise cable insertion is brittle — small pose errors or visual variation cause failures. Instead we:
+1. Use a "cheating" expert (**CheatCode**) that has access to hidden ground-truth TF frames in simulation to execute perfect insertions
+2. Record everything the expert does as demonstrations
+3. Train a neural network to reproduce that behavior from camera + state alone
 
----
+This is **behaviour cloning** — the network learns to imitate the expert.
 
-## Files
+### The expert: CheatCode
 
-| File | Purpose |
-|---|---|
-| `cheatcode_collector.py` | Policy wrapper — records expert demos via CheatCode |
-| `episode_recorder.py` | Buffers and saves one episode as HDF5 (schema v4) |
-| `validate_episode.py` | Validates one HDF5 episode file |
-| `convert_to_lerobot.py` | Converts HDF5 episodes → LeRobot v3.0 parquet + MP4 videos |
-| `configs/generate_competition_sessions.py` | **Generates competition session YAMLs** |
-| `configs/sessions/session_01.yaml … session_50.yaml` | **50 session configs (3 trials each)** |
-| `configs/test_5_trials.yaml` | 5-trial smoke test config |
-| `../run_act.py` | **Deployment policy** — loads local ACT checkpoint, runs at 20 Hz |
+CheatCode is a privileged policy that only works in simulation with `ground_truth:=true`. It reads hidden TF frames that tell it the exact position of every port. It never misses an insertion. We use it purely as a data source — it is **never deployed** on the real robot or in competition.
 
-Generated data is git-ignored:
+### How sessions are generated (getting diverse training data)
+
+A single scene (fixed board pose, one cable type, one rail) is not enough to train a policy that generalises. We need diversity across board positions, which rails are targeted, and visual clutter. At the same time we can't randomise everything every trial — Gazebo leaks RAM when entities respawn too often, and CheatCode's TF lookups get stale if the board pose jumps mid-session.
+
+The solution is **competition-format sessions**: one Gazebo launch = one fixed board pose, 3 trials back-to-back. Board pose varies *between* sessions instead of within them.
+
+**Each session runs 3 trials:**
+
+| Trial | Task | What spawns |
+|-------|------|-------------|
+| 1 | NIC insertion (SFP plug) | 1 NIC card on target rail + background mounts |
+| 2 | NIC insertion (SFP plug, different rail) | 1 NIC card on different rail + background mounts |
+| 3 | SC insertion | 1 SC mount on target rail + background mounts |
+
+(Sessions 11–20 reverse the order to `SC → NIC → NIC` so the policy also sees SC insertions as trial 1.)
+
+**What varies across the 50 sessions:**
+
+| Variable | Values | Purpose |
+|----------|--------|---------|
+| Board pose | 10 table poses A–J (x/y/yaw vary, z/roll/pitch fixed at `1.14 / 0 / 0`) | Force the policy to handle different board positions |
+| NIC rail target | cycles through all 5 rails | Cover every insertion site on the board |
+| SC rail target | alternates between rails 0 and 1 | Cover both SC sites |
+| Background mounts | 3 clutter arrangements | Visual variety — policy learns to ignore distractors |
+| NIC/SC translation | small offsets (±15–42 mm) | Sub-rail position variation |
+
+**Why only `x`, `y`, and `yaw` vary — not `z`, `roll`, `pitch`:**
+The board must stay flat on the table. Changing `z` would float or sink it through the table, and `roll`/`pitch` would tilt it off — both cause physically invalid scenes that CheatCode cannot solve.
+
+
+**Setup the enviroment variables**
+```bash
+export AIC_ROOT=$(git rev-parse --show-toplevel)
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
 ```
-training_robot/episodes/
-training_robot/lerobot_datasets/
-```
+**Generating the session YAMLs:**
 
----
+The 50 YAMLs in `configs/sessions/` are auto-generated — don't edit them by hand:
 
-## Session Config Design
-
-Each session YAML in `configs/sessions/` shares one fixed board pose across all 3 trials:
-
-| Trial | Task | Entity spawned |
-|---|---|---|
-| trial_1 | NIC insertion (sfp) | 1 NIC card on target rail + background mounts |
-| trial_2 | NIC insertion (sfp) | 1 NIC card on different rail + background mounts |
-| trial_3 | SC insertion | 1 SC mount on target rail + background mounts |
-
-Across 50 sessions:
-- Board pose cycles through 10 table poses (A–J): fixed `z=1.14`, fixed `roll=0`, fixed `pitch=0`, varied `x/y/yaw`
-- NIC rail targets cycle across all 5 rails (0–4) evenly
-- SC rail targets alternate between 0 and 1
-- Background mounts cycle through 3 arrangements for visual variety
-
-Do **not** collect 50 or 100 repeats of only `session_01.yaml` unless you are doing a tiny
-overfit/debug test. For the real dataset, run one 3-trial session, stop Gazebo, relaunch the
-next session YAML, and increment `RUN_ID`. That gives diversity without changing the board's
-height or tilting it off the table.
-
-To regenerate sessions (e.g. to change the number or tweak poses):
 ```bash
 cd $AIC_ROOT
 python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py --sessions 50
 ```
 
-For 100 sessions:
-```bash
-cd $AIC_ROOT
-python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py --sessions 100
-```
+This writes `session_01.yaml … session_50.yaml`. See `generate_competition_sessions.py` for the pose list (`POSES`), rail pattern (`SESSION_PATTERNS`), and mount arrangements (`MOUNT_SETS`) — edit those constants to change the diversity.
 
-If the eval container leaves the gripper open after a trial, use one trial per
-Gazebo launch. This is slower but gives clean data because every episode starts
-with a freshly initialized robot, gripper, cable, and board:
+**Alternate mode — one trial per Gazebo launch:**
+If the eval container leaves the gripper in a bad state between trials (e.g. stuck open), use `--trials-per-session 1`. This generates 150 single-trial files (`session_001.yaml … session_150.yaml`), one for each trial in the original 50×3 plan. Slower because Gazebo restarts every episode, but every episode starts from a fully reset robot, gripper, cable, and board:
+
 ```bash
 cd $AIC_ROOT
 rm -f team_policy/team_policy/training_robot/configs/sessions/session_*.yaml
@@ -110,64 +84,130 @@ python3 team_policy/team_policy/training_robot/configs/generate_competition_sess
   --trials-per-session 1
 ```
 
-This writes `session_001.yaml` through `session_150.yaml`. Run each file with
-`num_episodes:=1` and increment `RUN_ID` for every file.
+### What gets recorded per episode
+
+At 20 Hz, for every timestep:
+
+| Data | Shape | What it is |
+|------|-------|------------|
+| Left / center / right camera | (T, H, W, 3) | RGB images from 3 wrist/head cameras |
+| TCP pose | (T, 7) | Tool position + quaternion in robot base frame |
+| TCP velocity | (T, 6) | Cartesian linear + angular velocity |
+| TCP error | (T, 6) | Pose error to current CheatCode target |
+| Joint positions | (T, 7) | All 7 joint angles in radians |
+| Joint velocity | (T, 7) | Per-joint velocity |
+| Wrist force/torque | (T, 6) | F/T sensor readings |
+| Delta action | (T, 6) | What CheatCode commanded — this is the training label |
+
+**33D robot state vector used for training:**
+```
+tcp_pose(7) + tcp_velocity(6) + tcp_error(6) + joint_positions(7) + joint_velocity(7) = 33
+```
+
+### The policy: ACT (Action Chunking with Transformers)
+
+```
+At each 20 Hz step:
+
+  Inputs
+  ------
+  3x camera images  -->  ResNet-18 encoder  -->  image feature tokens
+  33D robot state   -->  linear projection  -->  state token
+
+  Transformer encoder-decoder
+  ---------------------------
+  Attends over all tokens
+  Predicts a CHUNK of 100 future actions at once
+
+  Output
+  ------
+  100 x [dx, dy, dz, drx, dry, drz]   (6D delta TCP pose)
+  Applied at 20 Hz = 5 seconds of planned motion
+```
+
+**Why action chunking?** Predicting one action at a time compounds errors — small mistakes at step 1 corrupt step 2. Predicting 100 steps as one coherent plan is much more stable. The policy replans every 5 seconds to correct any drift.
+
+**At deployment:** the policy receives a camera frame + robot state, outputs the 100-step chunk, executes it, then replans. No ground truth, no TF frames — only what a real competition robot would have.
+
+### End-to-end data flow
+
+```
+Gazebo simulation (ground_truth:=true)
+  |
+  |  CheatCode executes insertions using hidden TF frames
+  |  EpisodeRecorder captures images + state + actions at 20 Hz
+  v
+episodes/run_001/ ... run_050/
+  150 HDF5 files  (50 sessions x 3 trials)
+  |
+  |  validate_episode.py  -- checks shapes, timing, success flag
+  v
+episodes/merged/
+  150 renumbered HDF5 files
+  |
+  |  convert_to_lerobot.py  -- HDF5 -> parquet + MP4, builds stats
+  v
+lerobot_datasets/aic_dataset_v1/
+  |
+  |  lerobot-train (ACT)
+  |  Input:  3x images + 33D state
+  |  Output: 100 x 6D delta actions
+  |  100k gradient steps, checkpoints every 20k
+  v
+outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model/
+  |
+  |  team_policy.run_act  (deployed in competition)
+  |  Runs at 20 Hz using only cameras + robot state
+  v
+Robot inserts cable autonomously
+```
 
 ---
 
-## HDF5 Schema v4 — What Gets Recorded
+## Quick Start (first-time setup)
 
-Each episode is saved at ~20 Hz:
-
-| Field | Shape | Description |
-|---|---|---|
-| `observations/images/{left,center,right}` | `(T, H, W, 3)` | Camera images, uint8 RGB, gzip-compressed |
-| `observations/tcp_pose` | `(T, 7)` | Tool position + quaternion in base frame |
-| `observations/tcp_velocity` | `(T, 6)` | Cartesian tool velocity (linear + angular) |
-| `observations/tcp_error` | `(T, 6)` | Pose error to current target |
-| `observations/joint_positions` | `(T, 7)` | Joint angles (rad) |
-| `observations/joint_velocity` | `(T, 7)` | Per-joint velocity (rad/s) |
-| `observations/wrist_force` | `(T, 6)` | F/T sensor readings |
-| `observations/relative_pose` | `(T, 7)` | Target port pose in plug-tip frame (ground truth) |
-| `observations/privileged_tf/transforms` | `(T, 5, 7)` | TF snapshots (debug only) |
-| `actions/commanded_pose` | `(T, 7)` | Absolute TCP target commanded by CheatCode |
-| `actions/delta_pose` | `(T, 6)` | Position delta + axis-angle rotation delta |
-| `actions/velocity` | `(T, 6)` | Finite-difference velocity of commanded pose |
-
-**Robot state vector used for training (33D):**
-```
-tcp_pose (7) + tcp_velocity (6) + tcp_error (6) + joint_positions (7) + joint_velocity (7) = 33
-```
-
----
-
-## Complete Workflow
-
-### Step 0 — Shell Environment
-
-Set these once per terminal session. `AIC_ROOT` and `TRAIN_ROOT` stay exported for the whole day.
+### Step A — Set environment variables (run in every terminal you open)
 
 ```bash
-# Run this from anywhere inside the cloned repo
 export AIC_ROOT=$(git rev-parse --show-toplevel)
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
 ```
 
-After any code change to `cheatcode_collector.py`, `episode_recorder.py`, or `run_act.py`:
+`git rev-parse --show-toplevel` finds the repo root automatically — works for any username and any clone location. **Paste these two lines at the top of every terminal you open for this pipeline.**
+
+### Step B — Build after any code change
+
+If you edit `cheatcode_collector.py`, `episode_recorder.py`, or `run_act.py`, rebuild before running:
+
 ```bash
-cd $AIC_ROOT
-pixi reinstall ros-kilted-team-policy
+cd $AIC_ROOT && pixi reinstall ros-kilted-team-policy
 ```
+
+### Step C — Pipeline overview
+
+| Step | What happens |
+|------|-------------|
+| [1. Collect](#step-1----collect-episodes-50-sessions--3-trials--150-episodes) | Run 50 Gazebo sessions × 3 trials → 150 HDF5 episode files |
+| [2. Validate](#step-2----count-and-validate) | Check every HDF5 file passes quality thresholds |
+| [3. Convert](#step-3----convert-to-lerobot-format) | Merge + convert HDF5 → LeRobot parquet + MP4 dataset |
+| [4. Train](#step-4----train-act-policy) | Train ACT neural network on the dataset |
+| [5. Deploy](#step-5----deploy-and-test-the-trained-policy) | Load checkpoint, run policy in simulation |
+
+> **Important:** Steps 1–2 require `ground_truth:=true` in Terminal 1 (Gazebo side).
+> The deployed policy (Step 5) uses only cameras + robot state — no ground truth needed.
 
 ---
 
-### Step 1 — Collect Episodes (50 sessions × 3 trials = 150 episodes)
+## Step 1 — Collect Episodes (50 sessions × 3 trials = 150 episodes)
 
 Run one session at a time. Each session takes ~10–15 minutes.
 
 #### Terminal 1 — Start Simulation + Engine
 
 ```bash
+export AIC_ROOT=$(git rev-parse --show-toplevel)
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+
 distrobox enter -r aic_eval -- /entrypoint.sh \
   ground_truth:=true \
   start_aic_engine:=true \
@@ -182,6 +222,8 @@ No node with name 'aic_model' found. Retrying...
 #### Terminal 2 — Start CheatCode Collector
 
 ```bash
+export AIC_ROOT=$(git rev-parse --show-toplevel)
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
 export RUN_ID=run_001
 export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
 
@@ -216,7 +258,7 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
   aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_02.yaml
 ```
 
-**Terminal 2** — increment RUN_ID (`TRAIN_ROOT` stays set, no need to re-export):
+**Terminal 2** — increment RUN_ID (`AIC_ROOT` and `TRAIN_ROOT` stay set from before):
 ```bash
 export RUN_ID=run_002
 export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
@@ -244,13 +286,13 @@ cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
 ```
 training_robot/episodes/
   run_001/
-    episode_00000.hdf5   ← NIC0, pose A
-    episode_00001.hdf5   ← NIC2, pose A
-    episode_00002.hdf5   ← SC0,  pose A
+    episode_00000.hdf5   <- NIC0, pose A
+    episode_00001.hdf5   <- NIC2, pose A
+    episode_00002.hdf5   <- SC0,  pose A
   run_002/
-    episode_00000.hdf5   ← NIC1, pose B
-    episode_00001.hdf5   ← NIC3, pose B
-    episode_00002.hdf5   ← SC1,  pose B
+    episode_00000.hdf5   <- NIC1, pose B
+    episode_00001.hdf5   <- NIC3, pose B
+    episode_00002.hdf5   <- SC1,  pose B
   ...
   run_050/
     episode_00000.hdf5
@@ -261,11 +303,11 @@ training_robot/episodes/
 **50 sessions × 3 trials = 150 HDF5 files total.**
 
 If a trial fails (CheatCode returns False), `success_only:=true` discards it — no file saved.
-In that case just rerun that session with a new `RUN_ID`.
+Just rerun that session with a new `RUN_ID`.
 
 ---
 
-### Step 2 — Count and Validate
+## Step 2 — Count and Validate
 
 Count all collected episodes across all runs:
 ```bash
@@ -274,6 +316,7 @@ find $TRAIN_ROOT/episodes -name 'episode_*.hdf5' | wc -l
 
 Validate all episodes (stops on first failure):
 ```bash
+cd $AIC_ROOT
 for f in $TRAIN_ROOT/episodes/run_*/episode_*.hdf5; do
   echo "--- $f ---"
   pixi run python -m team_policy.training_robot.validate_episode --file "$f" || break
@@ -282,6 +325,7 @@ done
 
 Validate a single episode:
 ```bash
+cd $AIC_ROOT
 pixi run python -m team_policy.training_robot.validate_episode \
   --file $TRAIN_ROOT/episodes/run_001/episode_00000.hdf5
 ```
@@ -301,7 +345,7 @@ PASS — episode looks valid (N frames, Xs, success=True)
 
 ---
 
-### Step 3 — Convert to LeRobot Format
+## Step 3 — Convert to LeRobot Format
 
 Merge all runs into one renumbered folder, then convert:
 
@@ -331,8 +375,8 @@ Output structure:
 ```
 lerobot_datasets/aic_dataset_v1/
   meta/
-    info.json           ← 33D state, 6D action, video feature schema
-    stats.json          ← mean/std/min/max for normalisation
+    info.json           <- 33D state, 6D action, video feature schema
+    stats.json          <- mean/std/min/max for normalisation
     tasks.parquet
     episodes/chunk-000/file-000.parquet
   data/chunk-000/
@@ -345,7 +389,7 @@ lerobot_datasets/aic_dataset_v1/
 
 ---
 
-### Step 4 — Train ACT Policy
+## Step 4 — Train ACT Policy
 
 ```bash
 export LEROBOT=$TRAIN_ROOT/lerobot_datasets
@@ -368,16 +412,17 @@ For CPU-only machines replace `--policy.device=cuda` with `--policy.device=cpu`.
 Training writes checkpoints every 20 000 steps:
 ```
 outputs/train/aic_act_run_001/checkpoints/
-  020000/pretrained_model/   ← deploy this folder
+  020000/pretrained_model/   <- deploy this folder
     config.json
     model.safetensors
     policy_preprocessor_step_3_normalizer_processor.safetensors
     policy_postprocessor_step_0_unnormalizer_processor.safetensors
-  020000/training_state/     ← resume training only
+  020000/training_state/     <- resume training only
 ```
 
 Resume training from a checkpoint:
 ```bash
+cd $AIC_ROOT
 pixi run lerobot-train \
   --config_path=outputs/train/aic_act_run_001/checkpoints/020000/pretrained_model/train_config.json \
   --resume=true \
@@ -386,11 +431,14 @@ pixi run lerobot-train \
 
 ---
 
-### Step 5 — Deploy and Test the Trained Policy
+## Step 5 — Deploy and Test the Trained Policy
 
-#### Terminal 1 — Start Simulation (no ground_truth needed for deployment)
+#### Terminal 1 — Start Simulation (no ground_truth needed)
 
 ```bash
+export AIC_ROOT=$(git rev-parse --show-toplevel)
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+
 distrobox enter -r aic_eval -- /entrypoint.sh \
   ground_truth:=false \
   start_aic_engine:=true \
@@ -400,6 +448,7 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
 #### Terminal 2 — Run the Trained Policy
 
 ```bash
+export AIC_ROOT=$(git rev-parse --show-toplevel)
 export CKPT=$AIC_ROOT/outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model
 
 cd $AIC_ROOT
@@ -428,83 +477,15 @@ Watch Gazebo to see whether it succeeds.
 
 ---
 
-## Architecture Summary (ACT)
-
-```
-Inputs at each 20 Hz step:
-  ├─ 3× camera images (left, center, right)  → ResNet-18 encoder → image tokens
-  └─ 33D robot state                         → linear projection → state token
-
-Transformer encoder-decoder:
-  Attends over tokens → predicts chunk of K=100 future 6D actions
-
-Output per step:
-  100 × [dx, dy, dz, drx, dry, drz]   applied at 20 Hz = 5 s of planned motion
-```
-
-Action chunking reduces compounding errors: instead of 100 independent predictions,
-one coherent 100-step plan is generated. The policy replans every 5 seconds to correct drift.
-
----
-
-## Complete Data Flow
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  TERMINAL 1 — aic_eval container                                     │
-│                                                                      │
-│  Gazebo + aic_engine                                                 │
-│    • Config: configs/sessions/session_XX.yaml                        │
-│    • Spawns: robot + 1 target entity (NIC or SC) per trial           │
-│    • Board pose FIXED for all 3 trials in the session                │
-│    • ground_truth:=true → publishes hidden TF frames                 │
-│    • Calls insert_cable() once per trial, 3 trials total             │
-└─────────────────────────────┬────────────────────────────────────────┘
-                              │ ROS 2 topics + services
-┌─────────────────────────────▼────────────────────────────────────────┐
-│  TERMINAL 2 — cheatcode_collector (aic_model)                        │
-│                                                                      │
-│  DataCollectionPolicy.insert_cable():                                │
-│    • Wraps move_robot() to capture commanded poses                   │
-│    • Records at 20 Hz in background thread:                          │
-│        3× camera images, tcp_pose, tcp_vel, tcp_err                  │
-│        joint_positions, joint_velocity, wrist_force                  │
-│        relative_pose (plug→port), privileged_tf snapshots            │
-│    • Runs CheatCode as the expert (uses ground-truth TF)             │
-│    • On success → episodes/run_XXX/episode_XXXXX.hdf5                │
-│    • Exits after 3 episodes                                          │
-└─────────────────────────────┬────────────────────────────────────────┘
-                              │  repeat × 50 sessions (Ctrl+C T1, relaunch both)
-┌─────────────────────────────▼────────────────────────────────────────┐
-│  validate_episode.py  — checks shapes, quaternions, timing, etc.     │
-└─────────────────────────────┬────────────────────────────────────────┘
-                              │
-┌─────────────────────────────▼────────────────────────────────────────┐
-│  convert_to_lerobot.py                                               │
-│    • Merges run_001 … run_050 → single renumbered folder             │
-│    • HDF5 images → MP4 videos                                        │
-│    • Builds 33D state + 6D delta action per frame                    │
-│    • Writes parquet + stats.json + info.json                         │
-└─────────────────────────────┬────────────────────────────────────────┘
-                              │
-┌─────────────────────────────▼────────────────────────────────────────┐
-│  lerobot-train (ACT)                                                 │
-│    Input:  3× images + 33D state                                     │
-│    Output: 100 × 6D delta TCP actions                                │
-│    Result: pretrained_model/ checkpoint                              │
-└─────────────────────────────┬────────────────────────────────────────┘
-                              │
-┌─────────────────────────────▼────────────────────────────────────────┐
-│  team_policy.run_act  (deployment)                                   │
-│    • Loads local checkpoint via checkpoint_path ROS param            │
-│    • Runs at 20 Hz: image + state → 6D delta → MODE_POSITION command │
-│    • No ground_truth required                                        │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
----
-
 ## Common Issues
+
+### `AIC_ROOT` or `TRAIN_ROOT` is empty / path not found
+
+You opened a new terminal without running the exports. Paste these at the top of every terminal:
+```bash
+export AIC_ROOT=$(git rev-parse --show-toplevel)
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+```
 
 ### RAM fills up / PC freezes mid-run
 
@@ -514,7 +495,7 @@ Each session is only 3 trials with 1 entity spawned per trial.
 
 ### Score drops to ~30 after trial 1
 
-Same cause as above — board pose was jumping between trials, causing stale TF lookups.
+Board pose was jumping between trials, causing stale TF lookups.
 The session YAMLs fix this by keeping the board pose fixed for all 3 trials.
 
 ### Fewer than 3 episodes saved after a session
@@ -532,7 +513,7 @@ save as zeros and validation will flag the episode.
 
 Recorded before schema v4 or controller was not publishing joint velocities. Re-collect after:
 ```bash
-pixi reinstall ros-kilted-team-policy
+cd $AIC_ROOT && pixi reinstall ros-kilted-team-policy
 ```
 
 ### `success=1` but `final_error` is large (e.g. 0.045 m)
@@ -552,3 +533,32 @@ files. Always increment `RUN_ID` for each new collection run.
 ```
 The path must point to the `pretrained_model/` subfolder, not the checkpoint root or
 `training_state/` folder.
+
+---
+
+## Historical note — the old 50-trial config
+
+Earlier iterations used `orientation_sweep_50_trials.yaml`, which ran all 50 trials in a single Gazebo session with all 5 NICs + 2 SC mounts spawned simultaneously every trial. That caused RAM leaks (Gazebo accumulates entities across respawns) and score drops (CheatCode's TF lookups went stale when the board pose jumped mid-session). The competition-session YAMLs described above replace it.
+
+If you find that config, delete it — it is not used anywhere in the current pipeline.
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `cheatcode_collector.py` | Policy wrapper — records expert demos via CheatCode |
+| `episode_recorder.py` | Buffers and saves one episode as HDF5 (schema v4) |
+| `validate_episode.py` | Validates one HDF5 episode file |
+| `convert_to_lerobot.py` | Converts HDF5 episodes to LeRobot v3.0 parquet + MP4 videos |
+| `configs/generate_competition_sessions.py` | Generates competition session YAMLs |
+| `configs/sessions/session_01.yaml ... session_50.yaml` | 50 session configs (3 trials each) |
+| `configs/test_5_trials.yaml` | 5-trial smoke test config |
+| `../run_act.py` | Deployment policy — loads local ACT checkpoint, runs at 20 Hz |
+
+Generated data is git-ignored:
+```
+training_robot/episodes/
+training_robot/lerobot_datasets/
+```
