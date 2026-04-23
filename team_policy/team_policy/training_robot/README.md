@@ -1,4 +1,4 @@
-# CheatCode Training Data Pipeline
+
 
 Full imitation-learning pipeline: collect expert demos → validate → convert → train ACT → deploy.
 
@@ -24,7 +24,7 @@ The old `orientation_sweep_50_trials.yaml` ran 50 trials in one Gazebo session w
 cards + 2 SC mounts spawned simultaneously every trial. This caused two problems:
 
 - **RAM fills up** → PC freezes mid-run as Gazebo accumulates 50 × 7+ entities
-- **Score drops to ~30 after trial 1** → The board pose (x/y/z + yaw) jumped to a completely
+- **Score drops to ~30 after trial 1** → The board pose (x/y/yaw) jumped to a completely
   different position every trial. CheatCode's TF lookups got stale during entity respawn,
   causing it to move to the wrong position and miss the insertion
 
@@ -40,6 +40,8 @@ The fix is **competition-format sessions**:
 
 Each session = **2 NIC insertions + 1 SC insertion** at one fixed board pose.
 Board pose varies **between** sessions, giving training diversity across 50 relaunches.
+The board always stays on the table: `z=1.14`, `roll=0.0`, and `pitch=0.0`.
+Only `x`, `y`, and `yaw` change between sessions.
 
 ---
 
@@ -75,10 +77,15 @@ Each session YAML in `configs/sessions/` shares one fixed board pose across all 
 | trial_3 | SC insertion | 1 SC mount on target rail + background mounts |
 
 Across 50 sessions:
-- Board pose cycles through 10 positions (A–J) → full spatial diversity
+- Board pose cycles through 10 table poses (A–J): fixed `z=1.14`, fixed `roll=0`, fixed `pitch=0`, varied `x/y/yaw`
 - NIC rail targets cycle across all 5 rails (0–4) evenly
 - SC rail targets alternate between 0 and 1
 - Background mounts cycle through 3 arrangements for visual variety
+
+Do **not** collect 50 or 100 repeats of only `session_01.yaml` unless you are doing a tiny
+overfit/debug test. For the real dataset, run one 3-trial session, stop Gazebo, relaunch the
+next session YAML, and increment `RUN_ID`. That gives diversity without changing the board's
+height or tilting it off the table.
 
 To regenerate sessions (e.g. to change the number or tweak poses):
 ```bash
@@ -90,6 +97,19 @@ For 100 sessions:
 ```bash
 python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py --sessions 100
 ```
+
+If the eval container leaves the gripper open after a trial, use one trial per
+Gazebo launch. This is slower but gives clean data because every episode starts
+with a freshly initialized robot, gripper, cable, and board:
+```bash
+rm -f team_policy/team_policy/training_robot/configs/sessions/session_*.yaml
+python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py \
+  --sessions 50 \
+  --trials-per-session 1
+```
+
+This writes `session_001.yaml` through `session_150.yaml`. Run each file with
+`num_episodes:=1` and increment `RUN_ID` for every file.
 
 ---
 

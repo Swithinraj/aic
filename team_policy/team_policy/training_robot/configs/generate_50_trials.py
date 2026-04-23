@@ -17,20 +17,23 @@ from __future__ import annotations
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Board pose diversity (10 positions)
+# Board pose diversity (10 table positions)
+#
+# Keep the board on the table: z is fixed in _pose_block, roll/pitch are zero.
+# Only x/y and yaw vary.
 # ---------------------------------------------------------------------------
 
 POSITIONS = {
     "A": dict(x=0.160, y=-0.180, roll= 0.00, pitch= 0.00, yaw=2.80),
-    "B": dict(x=0.140, y=-0.220, roll= 0.04, pitch=-0.03, yaw=3.35),
+    "B": dict(x=0.140, y=-0.220, roll= 0.00, pitch= 0.00, yaw=3.35),
     "C": dict(x=0.175, y=-0.150, roll= 0.00, pitch= 0.00, yaw=2.55),
-    "D": dict(x=0.155, y=-0.250, roll=-0.02, pitch= 0.02, yaw=3.10),
-    "E": dict(x=0.195, y=-0.100, roll= 0.03, pitch=-0.02, yaw=2.70),
+    "D": dict(x=0.155, y=-0.250, roll= 0.00, pitch= 0.00, yaw=3.10),
+    "E": dict(x=0.195, y=-0.100, roll= 0.00, pitch= 0.00, yaw=2.70),
     "F": dict(x=0.120, y=-0.175, roll= 0.00, pitch= 0.00, yaw=2.90),
-    "G": dict(x=0.215, y=-0.155, roll=-0.03, pitch= 0.03, yaw=3.20),
-    "H": dict(x=0.165, y=-0.060, roll= 0.02, pitch=-0.01, yaw=2.65),
-    "I": dict(x=0.185, y=-0.195, roll=-0.01, pitch= 0.01, yaw=3.50),
-    "J": dict(x=0.135, y=-0.125, roll= 0.04, pitch=-0.04, yaw=2.45),
+    "G": dict(x=0.215, y=-0.155, roll= 0.00, pitch= 0.00, yaw=3.20),
+    "H": dict(x=0.165, y=-0.060, roll= 0.00, pitch= 0.00, yaw=2.65),
+    "I": dict(x=0.185, y=-0.195, roll= 0.00, pitch= 0.00, yaw=3.50),
+    "J": dict(x=0.135, y=-0.125, roll= 0.00, pitch= 0.00, yaw=2.45),
 }
 
 # ---------------------------------------------------------------------------
