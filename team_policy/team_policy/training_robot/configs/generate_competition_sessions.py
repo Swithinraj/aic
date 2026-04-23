@@ -98,7 +98,7 @@ HEADER_TMPL = """\
 #
 # Session {session_num:02d} of {total}
 # Board pose: {pose_label}
-# Trials: NIC{nic_a} → NIC{nic_b} → SC{sc_c}
+# Trials: {trial_sequence}
 #
 # Usage:
 #   aic_engine_config_file:={yaml_path}
@@ -453,18 +453,30 @@ def build_session(session_num: int, total: int, out_dir: Path) -> Path:
     pose_label = "ABCDEFGHIJ"[pose_idx]
     yaml_path  = out_dir / f"session_{session_num:02d}.yaml"
 
+    if 11 <= session_num <= 20:
+        trial_str = f"SC{sc_c} → NIC{nic_a} → NIC{nic_b}"
+    else:
+        trial_str = f"NIC{nic_a} → NIC{nic_b} → SC{sc_c}"
+
     header = HEADER_TMPL.format(
         session_num=session_num,
         total=total,
         pose_label=pose_label,
-        nic_a=nic_a, nic_b=nic_b, sc_c=sc_c,
+        trial_sequence=trial_str,
         yaml_path=str(yaml_path),
     )
 
-    content = header
-    content += build_nic_trial(1, pose, nic_a, nic_trans_a, mounts)
-    content += build_nic_trial(2, pose, nic_b, nic_trans_b, mounts)
-    content += build_sc_trial( 3, pose, sc_c,  sc_trans_c,  mounts)
+    if 11 <= session_num <= 20:
+        # SC port first, then two NIC insertions
+        content = header
+        content += build_sc_trial( 1, pose, sc_c,  sc_trans_c,  mounts)
+        content += build_nic_trial(2, pose, nic_a, nic_trans_a, mounts)
+        content += build_nic_trial(3, pose, nic_b, nic_trans_b, mounts)
+    else:
+        content = header
+        content += build_nic_trial(1, pose, nic_a, nic_trans_a, mounts)
+        content += build_nic_trial(2, pose, nic_b, nic_trans_b, mounts)
+        content += build_sc_trial( 3, pose, sc_c,  sc_trans_c,  mounts)
     content += FOOTER
 
     yaml_path.write_text(content)
@@ -493,7 +505,19 @@ def build_single_trial_session(
     (nic_a, nic_b, sc_c), pose, mounts, pose_label = _session_spec(source_session)
 
     yaml_path = out_dir / f"session_{file_num:03d}.yaml"
-    if source_trial == 1:
+    if 11 <= source_session <= 20:
+        if source_trial == 1:
+            task_label = f"SC{sc_c}"
+            body = build_sc_trial(1, pose, sc_c, SC_TRANS_OPTIONS[sc_c % len(SC_TRANS_OPTIONS)], mounts)
+        elif source_trial == 2:
+            task_label = f"NIC{nic_a}"
+            body = build_nic_trial(1, pose, nic_a, NIC_TRANS_OPTIONS[nic_a % len(NIC_TRANS_OPTIONS)], mounts)
+        elif source_trial == 3:
+            task_label = f"NIC{nic_b}"
+            body = build_nic_trial(1, pose, nic_b, NIC_TRANS_OPTIONS[nic_b % len(NIC_TRANS_OPTIONS)], mounts)
+        else:
+            raise ValueError(f"source_trial must be 1, 2, or 3, got {source_trial}")
+    elif source_trial == 1:
         task_label = f"NIC{nic_a}"
         body = build_nic_trial(
             1, pose, nic_a, NIC_TRANS_OPTIONS[nic_a % len(NIC_TRANS_OPTIONS)], mounts
@@ -548,7 +572,11 @@ def main() -> None:
             build_session(i, args.sessions, out_dir)
             nic_a, nic_b, sc_c = SESSION_PATTERNS[(i - 1) % len(SESSION_PATTERNS)]
             pose_label = "ABCDEFGHIJ"[(i - 1) % len(POSES)]
-            print(f"  session_{i:02d}.yaml  pose={pose_label}  NIC{nic_a}→NIC{nic_b}→SC{sc_c}")
+            if 11 <= i <= 20:
+                trial_str = f"SC{sc_c}→NIC{nic_a}→NIC{nic_b}"
+            else:
+                trial_str = f"NIC{nic_a}→NIC{nic_b}→SC{sc_c}"
+            print(f"  session_{i:02d}.yaml  pose={pose_label}  {trial_str}")
 
         print(f"\nGenerated {args.sessions} session YAMLs in: {out_dir}/")
         print(f"Each session = 3 trials, FIXED table pose, lean entity spawn.")

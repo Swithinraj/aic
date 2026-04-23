@@ -89,12 +89,13 @@ height or tilting it off the table.
 
 To regenerate sessions (e.g. to change the number or tweak poses):
 ```bash
-cd ~/ros2_ws/src/aic
+cd $AIC_ROOT
 python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py --sessions 50
 ```
 
 For 100 sessions:
 ```bash
+cd $AIC_ROOT
 python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py --sessions 100
 ```
 
@@ -102,6 +103,7 @@ If the eval container leaves the gripper open after a trial, use one trial per
 Gazebo launch. This is slower but gives clean data because every episode starts
 with a freshly initialized robot, gripper, cable, and board:
 ```bash
+cd $AIC_ROOT
 rm -f team_policy/team_policy/training_robot/configs/sessions/session_*.yaml
 python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py \
   --sessions 50 \
@@ -143,15 +145,17 @@ tcp_pose (7) + tcp_velocity (6) + tcp_error (6) + joint_positions (7) + joint_ve
 
 ### Step 0 — Shell Environment
 
-Set these once in Terminal 2. `TRAIN_ROOT` stays exported for the whole day.
+Set these once per terminal session. `AIC_ROOT` and `TRAIN_ROOT` stay exported for the whole day.
 
 ```bash
-export TRAIN_ROOT=/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot
+# Run this from anywhere inside the cloned repo
+export AIC_ROOT=$(git rev-parse --show-toplevel)
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
 ```
 
 After any code change to `cheatcode_collector.py`, `episode_recorder.py`, or `run_act.py`:
 ```bash
-cd ~/ros2_ws/src/aic
+cd $AIC_ROOT
 pixi reinstall ros-kilted-team-policy
 ```
 
@@ -167,7 +171,7 @@ Run one session at a time. Each session takes ~10–15 minutes.
 distrobox enter -r aic_eval -- /entrypoint.sh \
   ground_truth:=true \
   start_aic_engine:=true \
-  aic_engine_config_file:=/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions/session_01.yaml
+  aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_01.yaml
 ```
 
 Wait until Gazebo opens and you see:
@@ -178,11 +182,10 @@ No node with name 'aic_model' found. Retrying...
 #### Terminal 2 — Start CheatCode Collector
 
 ```bash
-export TRAIN_ROOT=/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot
 export RUN_ID=run_001
 export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
 
-cd ~/ros2_ws/src/aic && pixi run ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
   -p use_sim_time:=true \
   -p policy:=team_policy.training_robot.cheatcode_collector \
   -p output_dir:="$OUTPUT_DIR" \
@@ -210,7 +213,7 @@ Terminal 2 exits on its own after 3 episodes. Press `Ctrl+C` in Terminal 1.
 distrobox enter -r aic_eval -- /entrypoint.sh \
   ground_truth:=true \
   start_aic_engine:=true \
-  aic_engine_config_file:=/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions/session_02.yaml
+  aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_02.yaml
 ```
 
 **Terminal 2** — increment RUN_ID (`TRAIN_ROOT` stays set, no need to re-export):
@@ -218,7 +221,7 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
 export RUN_ID=run_002
 export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
 
-cd ~/ros2_ws/src/aic && pixi run ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
   -p use_sim_time:=true \
   -p policy:=team_policy.training_robot.cheatcode_collector \
   -p output_dir:="$OUTPUT_DIR" \
@@ -303,7 +306,6 @@ PASS — episode looks valid (N frames, Xs, success=True)
 Merge all runs into one renumbered folder, then convert:
 
 ```bash
-export TRAIN_ROOT=/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot
 export LEROBOT=$TRAIN_ROOT/lerobot_datasets
 
 # Merge all runs into one folder (renumber episode files sequentially)
@@ -317,7 +319,7 @@ done
 echo "Merged $idx episodes"
 
 # Convert to LeRobot format
-cd ~/ros2_ws/src/aic
+cd $AIC_ROOT
 pixi run python -m team_policy.training_robot.convert_to_lerobot \
   --input  "$MERGED" \
   --output "$LEROBOT/aic_dataset_v1" \
@@ -346,10 +348,9 @@ lerobot_datasets/aic_dataset_v1/
 ### Step 4 — Train ACT Policy
 
 ```bash
-export TRAIN_ROOT=/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot
 export LEROBOT=$TRAIN_ROOT/lerobot_datasets
 
-cd ~/ros2_ws/src/aic
+cd $AIC_ROOT
 pixi run lerobot-train \
   --dataset.repo_id=local/aic_dataset_v1 \
   --dataset.root="$LEROBOT/aic_dataset_v1" \
@@ -393,15 +394,15 @@ pixi run lerobot-train \
 distrobox enter -r aic_eval -- /entrypoint.sh \
   ground_truth:=false \
   start_aic_engine:=true \
-  aic_engine_config_file:=/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions/session_01.yaml
+  aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_01.yaml
 ```
 
 #### Terminal 2 — Run the Trained Policy
 
 ```bash
-export CKPT=/home/ibrahim/ros2_ws/src/aic/outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model
+export CKPT=$AIC_ROOT/outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model
 
-cd ~/ros2_ws/src/aic
+cd $AIC_ROOT
 pixi reinstall ros-kilted-team-policy
 
 pixi run ros2 run aic_model aic_model --ros-args \
