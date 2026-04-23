@@ -180,7 +180,9 @@ class DataCollectionPolicy(Policy):
         recording_active.set()
 
         def obs_loop():
+            _step = 0.10  # 10 Hz
             while recording_active.is_set():
+                t0 = time.time()
                 obs = get_observation()
                 if obs is not None:
                     relative_pose = self._relative_pose_plug_to_target(task)
@@ -191,7 +193,7 @@ class DataCollectionPolicy(Policy):
                         privileged_tf=privileged_tf,
                         privileged_tf_valid=privileged_tf_valid,
                     )
-                time.sleep(0.10)
+                time.sleep(max(0.0, _step - (time.time() - t0)))
 
         obs_thread = threading.Thread(target=obs_loop, daemon=True)
         obs_thread.start()

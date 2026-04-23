@@ -8,7 +8,7 @@ ROS param (required):
 State (33D, must match training):
     tcp_pose(7) + tcp_velocity(6) + tcp_error(6) + joint_positions(7) + joint_velocity(7)
 
-Action (6D delta TCP at 20 Hz):
+Action (6D delta TCP at 10 Hz):
     [dx, dy, dz, drx, dry, drz]  — position delta (m) + axis-angle rotation delta (rad)
 
 Usage:
@@ -45,8 +45,8 @@ from safetensors.torch import load_file
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 _IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
-# Safety clamps per 20 Hz step
-_MAX_DELTA_POS_M   = 0.05   # 5 cm max translation per step
+# Safety clamps per 10 Hz step (100 ms)
+_MAX_DELTA_POS_M   = 0.15   # 15 cm — covers p95 of training deltas (mean=5.5cm, p95=13cm)
 _MAX_DELTA_ROT_RAD = 0.20   # ~11 deg max rotation per step
 
 
@@ -248,7 +248,7 @@ class RunACT(Policy):
         self.get_logger().info(f"RunACT.insert_cable() start — task: {task}")
 
         TIME_LIMIT_S = 60.0
-        STEP_S       = 1.0 / 20.0   # 20 Hz matches training
+        STEP_S       = 1.0 / 10.0   # 10 Hz matches training
         step_count   = 0
         start        = time.time()
 
@@ -273,7 +273,7 @@ class RunACT(Policy):
             move_robot(motion_update=mu)
 
             step_count += 1
-            if step_count % 20 == 0:
+            if step_count % 10 == 0:
                 send_feedback(f"RunACT step={step_count} elapsed={time.time()-start:.1f}s")
 
             time.sleep(max(0.0, STEP_S - (time.time() - t0)))
