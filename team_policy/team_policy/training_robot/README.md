@@ -356,12 +356,13 @@ Merge all runs into one renumbered folder, then convert:
 ```bash
 export LEROBOT=$TRAIN_ROOT/lerobot_datasets
 
-# Merge all runs into one folder (renumber episode files sequentially)
+# Merge all runs into one folder using symlinks (avoids duplicating ~60GB of HDF5 data)
+# Using symlinks instead of cp saves disk space — convert reads through them identically
 MERGED="$TRAIN_ROOT/episodes/merged"
 rm -rf "$MERGED" && mkdir -p "$MERGED"
 idx=0
 for f in $TRAIN_ROOT/episodes/run_*/episode_*.hdf5; do
-  cp "$f" "$MERGED/episode_$(printf '%05d' $idx).hdf5"
+  ln -s "$f" "$MERGED/episode_$(printf '%05d' $idx).hdf5"
   idx=$((idx + 1))
 done
 echo "Merged $idx episodes"
@@ -396,6 +397,37 @@ lerobot_datasets/aic_dataset_v1/
 
 ## Step 4 — Train ACT Policy
 
+### Required fix before first run (lerobot 0.5.1 bug)
+
+lerobot 0.5.1 ships with a broken GR00T policy file that crashes on import even though
+GR00T is never used for ACT training. Apply this one-time patch before running training:
+
+```bash
+sed -i \
+  's/backbone_cfg: dict = field(init=False,/backbone_cfg: dict = field(default=None, init=False,/g;
+   s/action_head_cfg: dict = field(init=False,/action_head_cfg: dict = field(default=None, init=False,/g;
+   s/action_horizon: int = field(init=False,/action_horizon: int = field(default=None, init=False,/g;
+   s/action_dim: int = field(init=False,/action_dim: int = field(default=None, init=False,/g' \
+  $AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/lerobot/policies/groot/groot_n1.py
+```
+
+Verify it worked:
+```bash
+grep "default=None, init=False" \
+  $AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/lerobot/policies/groot/groot_n1.py | head -1
+# Should print a line — if empty, re-run the sed command above
+```
+
+This patch is applied to the pixi environment only — it is NOT part of the source tree and
+will revert if pixi reinstalls the environment. Re-apply whenever you see:
+`TypeError: non-default argument 'backbone_cfg' follows default argument`
+
+### Run training (inside tmux to survive terminal close)
+
+```bash
+tmux new -s training   # create session — detach with Ctrl+B then D, reattach with: tmux attach -t training
+```
+
 ```bash
 export LEROBOT=$TRAIN_ROOT/lerobot_datasets
 
@@ -404,6 +436,7 @@ pixi run lerobot-train \
   --dataset.repo_id=local/aic_dataset_v1 \
   --dataset.root="$LEROBOT/aic_dataset_v1" \
   --policy.type=act \
+  --policy.push_to_hub=false \
   --output_dir=outputs/train/aic_act_run_001 \
   --job_name=aic_act_run_001 \
   --policy.device=cuda \
