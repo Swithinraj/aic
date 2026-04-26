@@ -22,3 +22,5 @@ team_policy/models/depth_anything_v2_small/
 team_policy/models/Depth-Anything-V2-Metric-Indoor-Base-hf/*.safetensors
 
 team_policy/models/Depth-Anything-V2-Metric-Indoor-Base-hf/*
+
+team_policy/Data_Collection/
