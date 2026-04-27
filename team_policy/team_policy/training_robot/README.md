@@ -118,15 +118,15 @@ At each 10 Hz step:
   Transformer encoder-decoder
   ---------------------------
   Attends over all tokens
-  Predicts a CHUNK of 50 future actions at once
+  Predicts a CHUNK of 100 future actions at once
 
   Output
   ------
-  50 x [dx, dy, dz, drx, dry, drz]   (6D delta TCP pose)
-  Applied at 10 Hz = 5 seconds of planned motion
+  100 x [dx, dy, dz, drx, dry, drz]   (6D delta TCP pose)
+  Applied at 10 Hz = 10 seconds of planned motion
 ```
 
-**Why action chunking?** Predicting one action at a time compounds errors — small mistakes at step 1 corrupt step 2. Predicting 100 steps as one coherent plan is much more stable. The policy replans every 5 seconds to correct any drift.
+**Why action chunking?** Predicting one action at a time compounds errors — small mistakes at step 1 corrupt step 2. Predicting 100 steps as one coherent plan is much more stable. The policy replans every 10 seconds to correct any drift.
 
 **At deployment:** the policy receives a camera frame + robot state, outputs the 100-step chunk, executes it, then replans. No ground truth, no TF frames — only what a real competition robot would have.
 
@@ -517,6 +517,24 @@ Watch Gazebo to see whether it succeeds.
 
 ---
 
+## Run log — `aic_act_run_001` (current checkpoint)
+
+| Field | Value |
+|---|---|
+| Sessions collected | 67 (`run_001` … `run_067`) |
+| Raw HDF5 episodes | ~402 |
+| Episodes after filter (`success_only` + `max_final_error 0.02`) | **157** |
+| Frames in dataset | 70,764 @ 10 Hz |
+| Training steps | 100,000 / 100,000 |
+| Final loss | 0.033 (grad norm ≈ 2.85) |
+| Duration | ~8 h 56 min on CUDA |
+| Checkpoints | every 20k → `020000`, `040000`, `060000`, `080000`, `100000`, `last` |
+| Deployed checkpoint | `outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model/` |
+
+This sits between the "Good starting point" and "Recommended" rows above — expect occasional collisions on unseen poses; more sessions or a force-stop guard in `run_act.py` are the next levers.
+
+---
+
 ## Common Issues
 
 ### `AIC_ROOT` or `TRAIN_ROOT` is empty / path not found
@@ -593,9 +611,8 @@ If you find that config, delete it — it is not used anywhere in the current pi
 | `validate_episode.py` | Validates one HDF5 episode file |
 | `convert_to_lerobot.py` | Converts HDF5 episodes to LeRobot v3.0 parquet + MP4 videos |
 | `configs/generate_competition_sessions.py` | Generates competition session YAMLs |
-| `configs/sessions/session_01.yaml ... session_50.yaml` | 50 session configs (3 trials each) |
-| `configs/test_5_trials.yaml` | 5-trial smoke test config |
-| `../run_act.py` | Deployment policy — loads local ACT checkpoint, runs at 20 Hz |
+| `configs/sessions/session_01.yaml ... session_NN.yaml` | Session configs (3 trials each) |
+| `../run_act.py` | Deployment policy — loads local ACT checkpoint, runs at 10 Hz |
 
 Generated data is git-ignored:
 ```

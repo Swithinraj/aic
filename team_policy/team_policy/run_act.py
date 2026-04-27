@@ -269,6 +269,12 @@ class RunACT(Policy):
             raw_action = (norm_action * self.action_std + self.action_mean)
             action_np  = raw_action[0].cpu().numpy().astype(np.float64)
 
+            if step_count < 5:
+                self.get_logger().info(
+                    f"step={step_count} norm={norm_action[0].cpu().numpy().round(3).tolist()} "
+                    f"raw={action_np.round(4).tolist()}"
+                )
+
             mu = self._delta_to_motion(obs_msg, action_np)
             move_robot(motion_update=mu)
 
