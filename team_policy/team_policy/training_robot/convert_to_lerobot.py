@@ -5,13 +5,13 @@ The action representation:
   - We compute delta TCP pose between consecutive frames (6D: dx,dy,dz + axis-angle drx,dry,drz)
   - This matches the 6D Cartesian twist action space used by the AIC LeRobot controller
 
-Robot state (33D):
+Robot state (27D):
   - tcp_pose         7D  (x y z qx qy qz qw)
   - tcp_velocity     6D  (vx vy vz wx wy wz)  — Cartesian tool velocity
-  - tcp_error        6D
   - joint_positions  7D
   - joint_velocity   7D  — per-joint velocity; tcp_velocity only tells you how the
                            tool moves in Cartesian space, not how each joint contributes
+  (tcp_error excluded — it is CheatCode-privileged at training time, near-zero at inference)
 
 Usage:
     cd ~/ros2_ws/src/aic
@@ -193,6 +193,28 @@ def _concat_videos_ffmpeg(input_paths: List[Path], output_path: Path) -> bool:
 # Stats helpers
 # ---------------------------------------------------------------------------
 
+def _find_port_xyz_in_base(ep_tf_frame_pairs: List[str],
+                           privileged_tf: np.ndarray,
+                           privileged_tf_valid: np.ndarray,
+                           T: int) -> np.ndarray:
+    """Return (T, 3) port position in base_link from privileged_tf.
+
+    Searches frame_pairs for the entry 'base_link<-*port*' and extracts xyz.
+    Falls back to zeros if not found (policy sees unknown port position).
+    """
+    port_idx = None
+    for i, fp in enumerate(ep_tf_frame_pairs):
+        if "base_link<-" in fp and "port" in fp.lower():
+            port_idx = i
+            break
+    if port_idx is None or privileged_tf.shape[1] == 0:
+        return np.zeros((T, 3), dtype=np.float32)
+    xyz = privileged_tf[:, port_idx, :3].astype(np.float32)
+    if privileged_tf_valid.shape[1] > port_idx:
+        xyz[~privileged_tf_valid[:, port_idx]] = 0.0
+    return xyz
+
+
 def compute_stats(all_states: List[np.ndarray], all_actions: List[np.ndarray]) -> dict:
     states  = np.concatenate(all_states,  axis=0)
     actions = np.concatenate(all_actions, axis=0)
@@ -257,13 +279,16 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
         with h5py.File(ep_file, "r") as hf:
             meta    = hf["metadata"]
             success = bool(meta.attrs.get("success", 0))
-            final_error = float(meta.attrs.get("final_error", float("nan")))
             if success_only and not success:
                 print(f"  skip {ep_file.name} (failed)")
                 continue
-            if not (final_error <= max_final_error):
-                print(f"  skip {ep_file.name} (final_error={final_error:.3f}m > {max_final_error}m)")
-                continue
+            # final_error can be NaN when relative_pose was never valid — treat as passing.
+            final_error_raw = meta.attrs.get("final_error", None)
+            if final_error_raw is not None:
+                final_error = float(final_error_raw)
+                if not math.isnan(final_error) and final_error > max_final_error:
+                    print(f"  skip {ep_file.name} (final_error={final_error:.3f}m > {max_final_error}m)")
+                    continue
 
             T_full = int(meta.attrs.get("num_frames", hf["observations/tcp_pose"].shape[0]))
             ts_full = hf["observations/timestamps"][:]
@@ -279,7 +304,6 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
 
             tcp_poses  = hf["observations/tcp_pose"][:][indices]
             tcp_vels   = hf["observations/tcp_velocity"][:][indices]
-            tcp_errors = hf["observations/tcp_error"][:][indices]
             joint_pos  = hf["observations/joint_positions"][:][indices]
             joint_vel  = (
                 hf["observations/joint_velocity"][:][indices]
@@ -325,7 +349,28 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 privileged_tf_valid = np.zeros((T, 0), dtype=bool)
                 ep_tf_frame_pairs = []
 
-            state = np.concatenate([tcp_poses, tcp_vels, tcp_errors, joint_pos, joint_vel], axis=1)
+            # Port xyz: prefer real YOLO detections; fall back to GT+noise for old episodes
+            if "observations/yolo_port_xyz" in hf:
+                yolo_xyz   = hf["observations/yolo_port_xyz"][:][indices].astype(np.float32)
+                yolo_valid = (
+                    hf["observations/yolo_port_valid"][:][indices].astype(bool)
+                    if "observations/yolo_port_valid" in hf
+                    else np.ones(T, dtype=bool)
+                )
+                gt_xyz  = _find_port_xyz_in_base(ep_tf_frame_pairs, privileged_tf, privileged_tf_valid, T)
+                # Where YOLO didn't detect, use GT + 2cm noise to simulate YOLO accuracy
+                noise   = np.random.normal(0.0, 0.02, gt_xyz.shape).astype(np.float32)
+                port_xyz = np.where(yolo_valid[:, None], yolo_xyz, gt_xyz + noise)
+                yolo_coverage = float(yolo_valid.mean()) * 100
+                print(f"    yolo_port_xyz: {yolo_coverage:.0f}% frames detected by YOLO")
+            else:
+                # Old episode — use GT + noise to simulate YOLO
+                gt_xyz   = _find_port_xyz_in_base(ep_tf_frame_pairs, privileged_tf, privileged_tf_valid, T)
+                noise    = np.random.normal(0.0, 0.02, gt_xyz.shape).astype(np.float32)
+                port_xyz = (gt_xyz + noise).astype(np.float32)
+                print(f"    yolo_port_xyz: no YOLO recorded — using GT+noise fallback")
+            state = np.concatenate([tcp_poses, tcp_vels, joint_pos, joint_vel, port_xyz], axis=1)
+            # state: tcp_pose(7)+tcp_vel(6)+jpos(7)+jvel(7)+port_xyz(3) = 30D
 
             if "actions/delta_pose" in hf:
                 action = hf["actions/delta_pose"][:][indices]
@@ -408,7 +453,7 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
     # Build features spec (ACT training features + standard frame metadata).
     # Exclude string and privileged fields — they cannot be tensorized by the normalizer.
     data_features_spec = {
-        "observation.state": {"dtype": "float32", "shape": (33,)},
+        "observation.state": {"dtype": "float32", "shape": (30,)},
         "action":            {"dtype": "float32", "shape": (6,)},
     }
     all_features_spec = {**data_features_spec, **DEFAULT_FEATURES}
@@ -473,7 +518,7 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
     # --- Write tasks.parquet ---
     tasks_path = out / DEFAULT_TASKS_PATH
     tasks_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"task_index": [0]}, index=pd.Index(["insert cable"], name="task")).to_parquet(tasks_path)
+    pd.DataFrame({"task_index": [0], "task": ["insert cable"]}).to_parquet(tasks_path, index=False)
 
     # --- Write episodes parquet ---
     ep_parquet_path = out / DEFAULT_EPISODES_PATH.format(chunk_index=0, file_index=0)
@@ -484,7 +529,7 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
     # Only include features that are tensorizeable (no strings, no privileged debug data).
     # Standard lerobot frame metadata (DEFAULT_FEATURES) is merged in at load time.
     info_features: dict = {
-        "observation.state": {"dtype": "float32", "shape": [33], "fps": 10},
+        "observation.state": {"dtype": "float32", "shape": [30], "fps": 10},
         "action":            {"dtype": "float32", "shape": [6],  "fps": 10},
         "timestamp":         {"dtype": "float32", "shape": [1],  "fps": 10},
         "frame_index":       {"dtype": "int64",   "shape": [1],  "fps": 10},
@@ -527,7 +572,7 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
 
     print(f"\nDone — {lerobot_idx} episodes, {total_frames} frames → {output_dir}")
     print(f"  format: LeRobot {CODEBASE_VERSION}")
-    print(f"  state: 33D (tcp_pose 7 + tcp_vel 6 + tcp_err 6 + joint_pos 7 + joint_vel 7)")
+    print(f"  state: 30D (tcp_pose 7 + tcp_vel 6 + joint_pos 7 + joint_vel 7 + port_xyz 3)")
     print(f"  videos: {'written + concatenated' if has_video else 'not found in HDF5'}")
     print("Next step: pixi run lerobot-train --dataset.repo_id=local/aic_pilot ...")
 

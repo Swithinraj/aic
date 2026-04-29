@@ -19,6 +19,7 @@ Usage (Terminal 2 — run collector):
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import threading
 import time
@@ -35,6 +36,7 @@ from aic_model.policy import (
 )
 from aic_task_interfaces.msg import Task
 from rclpy.time import Time
+from std_msgs.msg import String
 from tf2_ros import TransformException
 
 from team_policy.training_robot.episode_recorder import EpisodeRecorder  # type: ignore[import-unresolved]
@@ -50,8 +52,22 @@ class DataCollectionPolicy(Policy):
 
         self._recorder    = EpisodeRecorder(self._output_dir)
         self._cheatcode   = CheatCode(parent_node)
-        self._episode_idx = 0
-        self._saved_count = 0
+
+        # Resume from existing files so relaunching never overwrites saved episodes.
+        _existing = sorted(pathlib.Path(self._output_dir).glob("episode_*.hdf5"))
+        self._episode_idx = len(_existing)
+        self._saved_count = len(_existing)
+
+        # YOLO port detection — updated from /fused_yolo/detections_json
+        self._yolo_lock          = threading.Lock()
+        self._yolo_port_xyz      = np.zeros(3, dtype=np.float32)
+        self._yolo_port_valid    = False
+        self._current_port_name  = ""
+
+        parent_node.create_subscription(
+            String, "/fused_yolo/detections_json",
+            self._cb_fused_yolo, 10,
+        )
 
         self.get_logger().info(
             f"DataCollectionPolicy ready — target={self._num_episodes} episodes, "
@@ -123,6 +139,32 @@ class DataCollectionPolicy(Policy):
             valid[idx] = True
         return transforms, valid
 
+    def _cb_fused_yolo(self, msg: String) -> None:
+        """Store the latest YOLO-detected port xyz in base_link for the current task."""
+        try:
+            dets = json.loads(msg.data)
+        except Exception:
+            return
+        with self._yolo_lock:
+            target = self._current_port_name
+        for det in dets:
+            name = str(det.get("instance_name", "")).lower()
+            cls  = str(det.get("class_name",    "")).lower()
+            if target and not (target in name or target in cls):
+                continue
+            pos = det.get("pose_base_link", {}).get("position", {})
+            if not pos:
+                continue
+            xyz = np.array([
+                float(pos.get("x", 0.0)),
+                float(pos.get("y", 0.0)),
+                float(pos.get("z", 0.0)),
+            ], dtype=np.float32)
+            with self._yolo_lock:
+                self._yolo_port_xyz   = xyz
+                self._yolo_port_valid = True
+            return  # take first matching detection
+
     # ------------------------------------------------------------------
     # Policy entry point — called once per trial by aic_engine
     # ------------------------------------------------------------------
@@ -150,6 +192,11 @@ class DataCollectionPolicy(Policy):
         task_id   = str(getattr(task, "id", str(episode_id)))
 
         send_feedback(f"collector/episode={episode_id} port={port_type}/{port_name}")
+        with self._yolo_lock:
+            self._current_port_name = port_name.strip().lower()
+            self._yolo_port_xyz     = np.zeros(3, dtype=np.float32)
+            self._yolo_port_valid   = False
+
         self._recorder.start_episode(episode_id, task_id, port_type, port_name)
         tf_pairs = self._privileged_tf_pairs(task)
         self._recorder.set_privileged_tf_frame_pairs(
@@ -187,11 +234,15 @@ class DataCollectionPolicy(Policy):
                 if obs is not None:
                     relative_pose = self._relative_pose_plug_to_target(task)
                     privileged_tf, privileged_tf_valid = self._privileged_tf_snapshot(tf_pairs)
+                    with self._yolo_lock:
+                        yolo_xyz   = self._yolo_port_xyz.copy()
+                        yolo_valid = self._yolo_port_valid
                     self._recorder.record_frame(
                         obs,
                         relative_pose=relative_pose,
                         privileged_tf=privileged_tf,
                         privileged_tf_valid=privileged_tf_valid,
+                        yolo_port_xyz=yolo_xyz if yolo_valid else None,
                     )
                 time.sleep(max(0.0, _step - (time.time() - t0)))
 

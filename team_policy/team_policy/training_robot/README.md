@@ -217,10 +217,15 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
   aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_01.yaml
 ```
 
+
+
 Wait until Gazebo opens and you see:
 ```
 No node with name 'aic_model' found. Retrying...
 ```
+
+
+
 
 #### Terminal 2 — Start CheatCode Collector
 
@@ -238,6 +243,23 @@ cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
   -p num_episodes:=3 \
   -p success_only:=true
 ```
+
+```bash
+
+from yolo
+
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/ros2_ws/src/aic/team_policy/fastdds_no_shm.xml
+cd ~/ros2_ws/src/aic
+pixi run ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p output_dir:=/tmp/aic_dataset_fresh \
+    -p num_episodes:=200 \
+    -p success_only:=true
+```
+
+
+
 
 Expected output per episode:
 ```

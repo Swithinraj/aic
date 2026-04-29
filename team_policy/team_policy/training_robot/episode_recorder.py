@@ -108,6 +108,7 @@ class Frame:
     privileged_tf: Optional[np.ndarray] = None  # (N, 7) selected TF snapshot
     privileged_tf_valid: Optional[np.ndarray] = None  # (N,)
     commanded_pose: Optional[np.ndarray] = None  # (7,) — set when CheatCode issues a command
+    yolo_port_xyz: Optional[np.ndarray] = None  # (3,) YOLO-detected port xyz in base_link
 
 
 @dataclass
@@ -208,6 +209,7 @@ class EpisodeRecorder:
         relative_pose: Optional[np.ndarray] = None,
         privileged_tf: Optional[np.ndarray] = None,
         privileged_tf_valid: Optional[np.ndarray] = None,
+        yolo_port_xyz: Optional[np.ndarray] = None,
     ) -> None:
         """
         obs is an aic_model_interfaces/msg/Observation.
@@ -264,6 +266,7 @@ class EpisodeRecorder:
             privileged_tf=None if privileged_tf is None else np.asarray(privileged_tf, dtype=np.float32).copy(),
             privileged_tf_valid=None if privileged_tf_valid is None else np.asarray(privileged_tf_valid, dtype=np.bool_).copy(),
             commanded_pose=self._last_commanded_pose,
+            yolo_port_xyz=None if yolo_port_xyz is None else np.asarray(yolo_port_xyz, dtype=np.float32).copy(),
         )
         self._current.frames.append(frame)
 
@@ -389,8 +392,15 @@ class EpisodeRecorder:
         obs.create_dataset("joint_velocity",  data=joint_vel)
         obs.create_dataset("wrist_force",     data=wrist_forces)
         obs.create_dataset("timestamps",      data=timestamps)
-        obs.create_dataset("relative_pose",   data=relative_poses)
+        obs.create_dataset("relative_pose",       data=relative_poses)
         obs.create_dataset("relative_pose_valid", data=relative_valid)
+        yolo_port_valid = np.array([f.yolo_port_xyz is not None for f in ep.frames], dtype=np.bool_)
+        yolo_port_xyz   = np.stack([
+            f.yolo_port_xyz if f.yolo_port_xyz is not None else np.zeros(3, dtype=np.float32)
+            for f in ep.frames
+        ])
+        obs.create_dataset("yolo_port_xyz",   data=yolo_port_xyz)
+        obs.create_dataset("yolo_port_valid", data=yolo_port_valid)
         tf_group = obs.create_group("privileged_tf")
         tf_group.create_dataset("transforms", data=privileged_tf)
         tf_group.create_dataset("valid", data=privileged_tf_valid)
