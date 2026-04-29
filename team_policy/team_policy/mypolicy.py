@@ -6,9 +6,11 @@ import os
 import threading
 import time
 from copy import deepcopy
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
+from cv_bridge import CvBridge
 from aic_control_interfaces.msg import ControllerState, MotionUpdate, TargetMode, TrajectoryGenerationMode
 from aic_control_interfaces.srv import ChangeTargetMode
 from aic_model.policy import GetObservationCallback, MoveRobotCallback, Policy, SendFeedbackCallback
@@ -379,6 +381,42 @@ class mypolicy(Policy):
     MODULE_RED_AXIS_ALLOW_BIDIRECTIONAL_VERTICAL = str(os.environ.get("MYPOLICY_MODULE_RED_AXIS_ALLOW_BIDIRECTIONAL_VERTICAL", "0")).strip().lower() in ("1", "true", "yes", "on")
     SERVO_MIN_CONFIDENCE = float(os.environ.get("MYPOLICY_SERVO_MIN_CONFIDENCE", "0.20"))
 
+    # ── pixel-servo alignment tuning ────────────────────────────────────────────
+    PIXEL_SERVO_MAX_ITERS     = int(os.environ.get("MYPOLICY_PIXEL_SERVO_MAX_ITERS", "60"))
+    PIXEL_SERVO_PX_TOL        = float(os.environ.get("MYPOLICY_PIXEL_SERVO_PX_TOL", "4.0"))
+    PIXEL_SERVO_STABLE_FRAMES = int(os.environ.get("MYPOLICY_PIXEL_SERVO_STABLE_FRAMES", "4"))
+    PIXEL_SERVO_LAMBDA        = float(os.environ.get("MYPOLICY_PIXEL_SERVO_LAMBDA", "0.45"))
+    PIXEL_SERVO_MAX_STEP_M    = float(os.environ.get("MYPOLICY_PIXEL_SERVO_MAX_STEP_M", "0.0015"))
+    PIXEL_SERVO_PROBE_M       = float(os.environ.get("MYPOLICY_PIXEL_SERVO_PROBE_M", "0.0010"))
+    PIXEL_SERVO_SETTLE_SEC    = float(os.environ.get("MYPOLICY_PIXEL_SERVO_SETTLE_SEC", "0.22"))
+    PIXEL_SERVO_CAMERA_ORDER  = ["center", "left", "right"]
+    # ── compliant insertion tuning ───────────────────────────────────────────────
+    INSERT_Z_STEP_M               = float(os.environ.get("MYPOLICY_INSERT_Z_STEP_M",               "0.0003"))
+    INSERT_FORCE_THRESH_N         = float(os.environ.get("MYPOLICY_INSERT_FORCE_THRESH_N",         "8.0"))
+    INSERT_FORCE_DELTA_THRESH_N   = float(os.environ.get("MYPOLICY_INSERT_FORCE_DELTA_THRESH_N",   "6.0"))
+    INSERT_FORCE_DELTA_WARN_N     = float(os.environ.get("MYPOLICY_INSERT_FORCE_DELTA_WARN_N",     "4.0"))
+    INSERT_FORCE_HARD_ABS_THRESH_N= float(os.environ.get("MYPOLICY_INSERT_FORCE_HARD_ABS_THRESH_N","35.0"))
+    INSERT_FORCE_JAM_COUNT        = int(os.environ.get("MYPOLICY_INSERT_FORCE_JAM_COUNT",          "3"))
+    INSERT_MAX_DEPTH_M            = float(os.environ.get("MYPOLICY_INSERT_MAX_DEPTH_M",            "0.020"))
+    INSERT_LAMBDA                 = float(os.environ.get("MYPOLICY_INSERT_LAMBDA",                 "0.20"))
+    INSERT_MAX_STEP_M             = float(os.environ.get("MYPOLICY_INSERT_MAX_STEP_M",             "0.0005"))
+    INSERT_MAX_RETRIES            = int(os.environ.get("MYPOLICY_INSERT_MAX_RETRIES",              "3"))
+    INSERT_SPEED_MPS              = float(os.environ.get("MYPOLICY_INSERT_SPEED_MPS",              "0.003"))
+    INSERT_BASELINE_DURATION_S    = float(os.environ.get("MYPOLICY_INSERT_BASELINE_DURATION_S",   "0.5"))
+
+    INSERT_FUNNEL_ENABLE = str(os.environ.get("MYPOLICY_INSERT_FUNNEL_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off")
+    INSERT_FUNNEL_DELTA_XY_THRESH_N = float(os.environ.get("MYPOLICY_INSERT_FUNNEL_DELTA_XY_THRESH_N", "0.8"))
+    INSERT_FUNNEL_MAX_XY_STEP_M = float(os.environ.get("MYPOLICY_INSERT_FUNNEL_MAX_XY_STEP_M", "0.00025"))
+    INSERT_FUNNEL_GAIN_M_PER_N = float(os.environ.get("MYPOLICY_INSERT_FUNNEL_GAIN_M_PER_N", "0.00010"))
+    INSERT_FUNNEL_MAX_TOTAL_XY_M = float(os.environ.get("MYPOLICY_INSERT_FUNNEL_MAX_TOTAL_XY_M", "0.0020"))
+
+    INSERT_SPIRAL_ENABLE = str(os.environ.get("MYPOLICY_INSERT_SPIRAL_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off")
+    INSERT_SPIRAL_RADII_M = [0.00015, 0.00030, 0.00045, 0.00060, 0.00080, 0.00100, 0.00125]
+    INSERT_SPIRAL_POINTS_PER_RING = 8
+    INSERT_SPIRAL_PROBE_DEPTH_M = float(os.environ.get("MYPOLICY_INSERT_SPIRAL_PROBE_DEPTH_M", "0.00050"))
+    INSERT_SPIRAL_BACKOFF_M = float(os.environ.get("MYPOLICY_INSERT_SPIRAL_BACKOFF_M", "0.00100"))
+    INSERT_SPIRAL_MAX_RADIUS_M = float(os.environ.get("MYPOLICY_INSERT_SPIRAL_MAX_RADIUS_M", "0.00125"))
+
     def __init__(self, parent_node):
         super().__init__(parent_node)
         self._planner = CartesianPlanner()
@@ -403,7 +441,9 @@ class mypolicy(Policy):
         self._hover_sampled_sfp_module_axis_count = 0
         self._hover_sampled_sfp_module_axis_cameras = []
         self._hover_sampled_sfp_module_axis_conf = 0.0
-        self.get_logger().info("mypolicy simplified: sample -> move -> pitch orientation only, no movement/orientation timeouts.")
+        self._last_pixel_jacobian: Optional[np.ndarray] = None
+        self._cv_bridge = CvBridge()
+        self.get_logger().info("mypolicy: sample -> move -> pitch orientation -> pixel-servo -> compliant-insert.")
 
     def insert_cable(
         self,
@@ -479,8 +519,32 @@ class mypolicy(Policy):
             send_feedback("mypolicy/fail pitch_orientation_failed")
             return False
 
-        send_feedback("mypolicy/done sampling_move_pitch_complete")
-        return True
+        # ── stage 4: evidence-based visual alignment ──────────────────────────
+        send_feedback("mypolicy/stage4_target_image_visual_servo_start")
+        self._locked_plug_tip_uv = {}
+        self._port_uv_history = {}
+        self._loftr_tracker = None
+        
+        servo_ok = self._target_image_visual_servo_align(
+            target_port_name=target_port_name,
+            get_observation=get_observation,
+            send_feedback=send_feedback,
+        )
+        self._motion_servo.stop()
+        if not servo_ok:
+            send_feedback("mypolicy/visual_align_failed aborting_before_insert")
+            return False
+
+        # ── stage 5: compliant visual insertion ───────────────────────────────
+        send_feedback("mypolicy/stage5_insert_start")
+        insert_ok = self._compliant_visual_insert(
+            target_port_name=target_port_name,
+            get_observation=get_observation,
+            send_feedback=send_feedback,
+        )
+        self._motion_servo.stop()
+        send_feedback(f"mypolicy/done insert_ok={str(insert_ok).lower()}")
+        return insert_ok
 
     def _wait_for_observation(self, get_observation: GetObservationCallback):
         while True:
@@ -595,6 +659,18 @@ class mypolicy(Policy):
         waypoints = self._planner.plan_from_current_pose(current_pose, target_pose)
         if not waypoints:
             waypoints = [target_pose]
+            
+        send_feedback(f"mypolicy/planner_mode direct_no_clearance")
+        send_feedback(f"mypolicy/planner_start xyz=({current_pose.position.x:.3f},{current_pose.position.y:.3f},{current_pose.position.z:.3f})")
+        send_feedback(f"mypolicy/planner_goal xyz=({target_pose.position.x:.3f},{target_pose.position.y:.3f},{target_pose.position.z:.3f})")
+        
+        current_z = float(current_pose.position.z)
+        target_z = float(target_pose.position.z)
+        for i, wp in enumerate(waypoints):
+            send_feedback(f"mypolicy/planner_waypoint i={i} xyz=({wp.position.x:.3f},{wp.position.y:.3f},{wp.position.z:.3f})")
+            if float(wp.position.z) > max(current_z, target_z) + 0.01:
+                send_feedback(f"mypolicy/warn unexpected_planner_z_lift wp={i} z={wp.position.z:.3f}")
+
         self._motion_servo.publish_target_marker(target_pose)
         self._motion_servo.publish_waypoint_visuals(waypoints)
         send_feedback(f"mypolicy/move_to_sampled_point_waypoints count={len(waypoints)} no_visibility_replan=true no_timeout=true")
@@ -986,3 +1062,1518 @@ class mypolicy(Policy):
 
     def _norm_name(self, name: str) -> str:
         return str(name).strip().lower().replace("-", "_").replace(" ", "_")
+
+    # =========================================================================
+    # PIXEL-ONLY VISUAL SERVO HELPERS
+    # =========================================================================
+
+    def _get_camera_image(self, camera_name: str, get_observation) -> Optional[np.ndarray]:
+        """Decode the latest camera Image msg to a BGR numpy array."""
+        try:
+            obs = get_observation()
+            if obs is None:
+                return None
+            img_msg = getattr(obs, f"{camera_name}_image", None)
+            if img_msg is None or img_msg.width == 0:
+                return None
+            frame = self._cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
+            return np.asarray(frame, dtype=np.uint8)
+        except Exception as exc:
+            self.get_logger().warn(f"_get_camera_image({camera_name}): {exc}")
+            return None
+
+    def _select_alignment_camera(
+        self,
+        target_port_name: str,
+        get_observation,
+    ) -> Optional[str]:
+        """Return the first camera where both the target SFP port and SFP module
+        are visible with sufficient confidence."""
+        for cam in self.PIXEL_SERVO_CAMERA_ORDER:
+            dets = self._detection_listener.get_camera_detections(cam, freshness_sec=1.5)
+            has_port = any(
+                self._matches_specific_port(d, target_port_name, self._sfp_port_classes)
+                and float(d.get("confidence", 0.0)) >= self.SERVO_MIN_CONFIDENCE
+                for d in dets
+            )
+            has_module = any(
+                self._is_sfp_module_detection(d)
+                and float(d.get("confidence", 0.0)) >= self.SERVO_MIN_CONFIDENCE
+                for d in dets
+            )
+            if has_port and has_module:
+                return cam
+        # Fallback: any camera that sees at least the port
+        for cam in self.PIXEL_SERVO_CAMERA_ORDER:
+            dets = self._detection_listener.get_camera_detections(cam, freshness_sec=1.5)
+            if any(
+                self._matches_specific_port(d, target_port_name, self._sfp_port_classes)
+                and float(d.get("confidence", 0.0)) >= self.SERVO_MIN_CONFIDENCE
+                for d in dets
+            ):
+                return cam
+        return None
+
+    def _save_pixel_servo_debug_image(
+        self,
+        camera: str,
+        image: np.ndarray,
+        iteration: int,
+        port_uv: np.ndarray,
+        tip_uv: np.ndarray,
+        err_px: float,
+        step_mm: float,
+        label: str = ""
+    ):
+        """Save an annotated image to debug/pixel_servo/."""
+        try:
+            os.makedirs("debug/pixel_servo", exist_ok=True)
+            vis = image.copy()
+            pu, pv = int(port_uv[0]), int(port_uv[1])
+            tu, tv = int(tip_uv[0]), int(tip_uv[1])
+            
+            # Draw port center (Green Cross)
+            cv2.drawMarker(vis, (pu, pv), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+            cv2.putText(vis, "Port", (pu + 10, pv - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Draw locked tip (Red Circle)
+            cv2.circle(vis, (tu, tv), 5, (0, 0, 255), -1)
+            cv2.putText(vis, "Tip", (tu + 10, tv + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
+            # Draw error line (Yellow)
+            cv2.line(vis, (tu, tv), (pu, pv), (0, 255, 255), 2)
+            
+            # Status Text
+            text = f"Iter: {iteration} | Err: {err_px:.2f} px | Step: {step_mm:.2f} mm | {label}"
+            cv2.putText(vis, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            
+            filename = f"debug/pixel_servo/iter_{iteration:03d}_{camera}_{label.replace(' ', '_')}.png"
+            cv2.imwrite(filename, vis)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to save debug image: {e}")
+
+    def _extract_port_mouth_geometry(
+        self,
+        image: np.ndarray,
+        port_det: Dict,
+        camera_name: str,
+    ) -> Dict[str, Any]:
+        """Extract the actual dark port mouth inside the YOLO ROI.
+        Falls back to LoFTR, then OBB/bbox if image processing fails."""
+        result = {
+            "center_uv": None,
+            "confidence": 0.0,
+            "source": "unknown"
+        }
+        
+        # 1. Fallback base (OBB or BBox)
+        obb = port_det.get("obb_cxcywh_deg")
+        bbox = port_det.get("bbox_xyxy", [])
+        fallback_uv = None
+        
+        if isinstance(obb, list) and len(obb) >= 2:
+            fallback_uv = np.array([float(obb[0]), float(obb[1])], dtype=np.float64)
+            result["source"] = "obb"
+        elif len(bbox) == 4:
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+            fallback_uv = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float64)
+            result["source"] = "bbox"
+        else:
+            h, w = image.shape[:2]
+            fallback_uv = np.array([float(w) * 0.5, float(h) * 0.5], dtype=np.float64)
+            result["source"] = "center"
+            
+        result["center_uv"] = fallback_uv.copy()
+        
+        if len(bbox) != 4:
+            return result
+            
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        ih, iw = image.shape[:2]
+        
+        # Enlarge ROI by 1.5x
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        bw, bh = x2 - x1, y2 - y1
+        x1 = max(0, int(cx - bw * 0.75))
+        y1 = max(0, int(cy - bh * 0.75))
+        x2 = min(iw, int(cx + bw * 0.75))
+        y2 = min(ih, int(cy + bh * 0.75))
+        
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            return result
+            
+        crop = image[y1:y2, x1:x2]
+        
+        # 2. Raw Image Processing (Dark Rectangle)
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            # Local contrast normalization
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            cl1 = clahe.apply(gray)
+            
+            # Median blur to reduce noise
+            cl1 = cv2.medianBlur(cl1, 3)
+            
+            _, thresh = cv2.threshold(cl1, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            k = max(2, min(5, (x2 - x1) // 10))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+            
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            best_cnt = None
+            best_score = -1.0
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if area < 20.0:
+                    continue
+                rect = cv2.minAreaRect(cnt)
+                rw, rh = rect[1]
+                short_side = min(rw, rh)
+                long_side = max(rw, rh)
+                if short_side < 2.0:
+                    continue
+                aspect = long_side / short_side
+                if aspect > 5.0: # Too thin
+                    continue
+                    
+                score = area / max(1.0, aspect)
+                if score > best_score:
+                    best_score = score
+                    best_cnt = cnt
+                    
+            if best_cnt is not None:
+                M = cv2.moments(best_cnt)
+                if abs(M["m00"]) > 1e-6:
+                    cx_crop = M["m10"] / M["m00"]
+                    cy_crop = M["m01"] / M["m00"]
+                    result["center_uv"] = np.array([float(x1) + cx_crop, float(y1) + cy_crop], dtype=np.float64)
+                    result["confidence"] = 0.9
+                    result["source"] = "dark_rect"
+                    return result  # High confidence, stop here
+        except Exception:
+            pass
+
+        # 3. Try EfficientLoFTR Tracking as fallback
+        if hasattr(self, '_loftr_tracker') and self._loftr_tracker is not None:
+            track_res = self._loftr_tracker.track(image, [x1, y1, x2, y2])
+            if track_res["success"]:
+                tracked_uv = self._loftr_tracker.reference_center_uv + track_res["shift"]
+                result["center_uv"] = tracked_uv
+                result["confidence"] = 0.8
+                result["source"] = "loftr"
+                return result
+            
+        return result
+
+    def _lock_plug_tip(
+        self,
+        camera: str,
+        module_det: Dict,
+        port_uv: np.ndarray,
+    ) -> np.ndarray:
+        """Estimate plug tip once and lock it so it doesn't jitter."""
+        if not hasattr(self, '_locked_plug_tip_uv'):
+            self._locked_plug_tip_uv = {}
+        if camera in self._locked_plug_tip_uv:
+            return self._locked_plug_tip_uv[camera]
+
+        corners = module_det.get("obb_corners_uv")
+        if isinstance(corners, list) and len(corners) == 4:
+            q = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+            edge_mids = []
+            edge_lens = []
+            for i in range(4):
+                a = q[i]
+                b = q[(i + 1) % 4]
+                edge_mids.append((a + b) * 0.5)
+                edge_lens.append(float(np.linalg.norm(b - a)))
+            max_len = max(edge_lens) if edge_lens else 1.0
+            best_mid = None
+            best_score = float("inf")
+            for mid, length in zip(edge_mids, edge_lens):
+                dist_to_port = float(np.linalg.norm(mid - port_uv))
+                score = dist_to_port * (length / max(1.0, max_len))
+                if score < best_score:
+                    best_score = score
+                    best_mid = mid
+            if best_mid is not None:
+                self._locked_plug_tip_uv[camera] = best_mid.astype(np.float64)
+                return self._locked_plug_tip_uv[camera]
+
+        # Fallback bbox side
+        bbox = module_det.get("bbox_xyxy", [])
+        if len(bbox) == 4:
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+            cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+            sides = [np.array([cx, y1]), np.array([cx, y2]), np.array([x1, cy]), np.array([x2, cy])]
+            best = min(sides, key=lambda s: float(np.linalg.norm(s - port_uv)))
+            self._locked_plug_tip_uv[camera] = best.astype(np.float64)
+            return self._locked_plug_tip_uv[camera]
+
+        # Fallback OBB/BBox center
+        self._locked_plug_tip_uv[camera] = port_uv.copy()
+        return self._locked_plug_tip_uv[camera]
+
+    def _compute_visual_alignment_cost(
+        self,
+        camera: str,
+        target_port_name: str,
+        get_observation,
+        update_filter: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Compute pixel distance between extracted port mouth and locked plug tip."""
+        image = self._get_camera_image(camera, get_observation)
+        if image is None:
+            return None
+            
+        dets = self._detection_listener.get_camera_detections(camera, freshness_sec=1.0)
+        port_det = self._best_detection(
+            dets,
+            lambda d: self._matches_specific_port(d, target_port_name, self._sfp_port_classes),
+        )
+        if port_det is None:
+            port_det = self._best_detection(dets, self._is_sfp_port_detection)
+            
+        module_det = self._best_detection(dets, self._is_sfp_module_detection)
+        
+        if port_det is None or module_det is None:
+            return None
+
+        port_geom = self._extract_port_mouth_geometry(image, port_det, camera)
+        raw_port_uv = port_geom["center_uv"]
+        
+        # Outlier rejection filtering
+        if not hasattr(self, '_port_uv_history'):
+            self._port_uv_history = {}
+        if camera not in self._port_uv_history:
+            self._port_uv_history[camera] = []
+            
+        history = self._port_uv_history[camera]
+        port_uv = raw_port_uv.copy()
+        rejected = False
+        
+        if len(history) >= 3:
+            med_uv = np.median(history, axis=0)
+            if float(np.linalg.norm(raw_port_uv - med_uv)) > 15.0:
+                # Reject outlier
+                port_uv = history[-1].copy()
+                rejected = True
+                port_geom["source"] += "_rejected"
+            elif update_filter:
+                port_uv = 0.7 * history[-1] + 0.3 * raw_port_uv
+                history.append(port_uv)
+        elif update_filter:
+            history.append(port_uv)
+            
+        if update_filter and len(history) > 7:
+            history.pop(0)
+
+        tip_uv = self._lock_plug_tip(camera, module_det, port_uv)
+        
+        e = port_uv - tip_uv
+        err_px = float(np.linalg.norm(e))
+        
+        return {
+            "err_px": err_px,
+            "port_uv": port_uv,
+            "tip_uv": tip_uv,
+            "e": e,
+            "source": port_geom["source"],
+            "image": image,
+            "rejected": rejected
+        }
+
+    def _measure_vector_error_median(
+        self,
+        camera: str,
+        target_port_name: str,
+        get_observation,
+        send_feedback,
+        frames: int = 5,
+        update_filter: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Capture multiple frames and return the median vector error to reject jitter.
+        If update_filter is False, it will not corrupt the persistent port center track."""
+        valid_results = []
+        port_uvs = []
+        e_list = []
+        
+        for _ in range(frames):
+            res = self._compute_visual_alignment_cost(
+                camera, target_port_name, get_observation, update_filter=update_filter
+            )
+            if res is not None and not res["rejected"]:
+                e_list.append(res["e"])
+                port_uvs.append(res["port_uv"])
+                valid_results.append(res)
+            self.sleep_for(0.04)
+            
+        if not valid_results:
+            return None
+            
+        med_e = np.median(e_list, axis=0)
+        median_err = float(np.linalg.norm(med_e))
+        med_port = np.median(port_uvs, axis=0)
+        
+        jitter = float(np.median([np.linalg.norm(uv - med_port) for uv in port_uvs]))
+        
+        # Find the result closest to the median
+        best_res = min(valid_results, key=lambda r: float(np.linalg.norm(r["e"] - med_e)))
+        best_res["median_e"] = med_e
+        best_res["median_err_px"] = median_err
+        best_res["jitter_px"] = jitter
+        return best_res
+
+    def _return_to_pose_xy(self, target_pose, settle_sec: float = 0.20) -> None:
+        """Return to a saved XY pose keeping Z and orientation unchanged."""
+        cur = self._motion_servo.get_current_pose()
+        if cur is None or target_pose is None:
+            return
+        dx = float(target_pose.position.x - cur.position.x)
+        dy = float(target_pose.position.y - cur.position.y)
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < 5e-5:
+            return
+        speed = float(self._motion_servo.max_linear_speed) * 0.20
+        vx, vy = dx / dist * speed, dy / dist * speed
+        start_x = float(cur.position.x)
+        start_y = float(cur.position.y)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < settle_sec * 4.0:
+            p = self._motion_servo.get_current_pose()
+            if p is None:
+                break
+            moved = math.sqrt((p.position.x - start_x) ** 2 + (p.position.y - start_y) ** 2)
+            if moved >= dist * 0.90:
+                break
+            tw = Twist()
+            tw.linear.x = vx
+            tw.linear.y = vy
+            self._motion_servo.publish_twist_command(tw, frame_id="base_link")
+            self.sleep_for(0.025)
+        self._motion_servo.stop()
+        self.sleep_for(settle_sec * 0.5)
+
+    def _command_small_xy_correction(
+        self,
+        delta_xy: np.ndarray,
+        max_step: float,
+    ) -> None:
+        """Move ONLY in XY by delta_xy. Uses norm-clamp to preserve direction.
+        Z and orientation are left completely unchanged."""
+        # norm-clamp (preserves direction, unlike component-wise clip)
+        d = np.asarray(delta_xy, dtype=np.float64).reshape(2)
+        norm = float(np.linalg.norm(d))
+        if norm < 1e-7:
+            return
+        if norm > max_step:
+            d = d / norm * max_step
+        dx, dy = float(d[0]), float(d[1])
+        dist = math.sqrt(dx * dx + dy * dy)
+        speed = float(self._motion_servo.max_linear_speed) * 0.20
+        vx, vy = dx / dist * speed, dy / dist * speed
+        twist = Twist()
+        twist.linear.x = vx
+        twist.linear.y = vy
+        cur = self._motion_servo.get_current_pose()
+        if cur is None:
+            return
+        start_x = float(cur.position.x)
+        start_y = float(cur.position.y)
+        t0 = time.monotonic()
+        timeout = dist / speed + 0.6
+        while time.monotonic() - t0 < timeout:
+            p = self._motion_servo.get_current_pose()
+            if p is None:
+                break
+            moved = math.sqrt((p.position.x - start_x) ** 2 + (p.position.y - start_y) ** 2)
+            if moved >= dist * 0.85:
+                break
+            self._motion_servo.publish_twist_command(twist, frame_id="base_link")
+            self.sleep_for(0.02)
+        self._motion_servo.stop()
+
+    def _command_small_translation(self, delta_xyz: np.ndarray, max_step: float) -> float:
+        """Move by delta_xyz vector. Returns actual distance moved."""
+        norm = float(np.linalg.norm(delta_xyz))
+        if norm < 1e-7: return 0.0
+        if norm > max_step: delta_xyz = delta_xyz / norm * max_step
+        
+        speed = float(self._motion_servo.max_linear_speed) * 0.20
+        d = delta_xyz
+        dist = math.sqrt(d[0]**2 + d[1]**2 + d[2]**2)
+        if dist < 1e-7: return 0.0
+        vx, vy, vz = d[0]/dist*speed, d[1]/dist*speed, d[2]/dist*speed
+        
+        twist = Twist()
+        twist.linear.x = float(vx)
+        twist.linear.y = float(vy)
+        twist.linear.z = float(vz)
+        
+        cur = self._motion_servo.get_current_pose()
+        if cur is None: return 0.0
+        sx, sy, sz = float(cur.position.x), float(cur.position.y), float(cur.position.z)
+        
+        t0 = time.monotonic()
+        timeout = dist / speed + 0.6
+        while time.monotonic() - t0 < timeout:
+            p = self._motion_servo.get_current_pose()
+            if p is None: break
+            moved = math.sqrt((p.position.x-sx)**2 + (p.position.y-sy)**2 + (p.position.z-sz)**2)
+            if moved >= dist * 0.85: break
+            self._motion_servo.publish_twist_command(twist, frame_id="base_link")
+            self.sleep_for(0.02)
+        self._motion_servo.stop()
+        return float(moved)
+
+    def _return_to_pose_xyz(self, target_pose, settle_sec: float = 0.20):
+        """Return to a saved XYZ pose keeping orientation unchanged."""
+        cur = self._motion_servo.get_current_pose()
+        if cur is None or target_pose is None: return
+        dx = float(target_pose.position.x - cur.position.x)
+        dy = float(target_pose.position.y - cur.position.y)
+        dz = float(target_pose.position.z - cur.position.z)
+        dist = math.sqrt(dx**2 + dy**2 + dz**2)
+        if dist < 5e-5: return
+        speed = float(self._motion_servo.max_linear_speed) * 0.20
+        vx, vy, vz = dx/dist*speed, dy/dist*speed, dz/dist*speed
+        sx, sy, sz = float(cur.position.x), float(cur.position.y), float(cur.position.z)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < settle_sec * 4.0:
+            p = self._motion_servo.get_current_pose()
+            if p is None: break
+            moved = math.sqrt((p.position.x-sx)**2 + (p.position.y-sy)**2 + (p.position.z-sz)**2)
+            if moved >= dist * 0.90: break
+            tw = Twist()
+            tw.linear.x, tw.linear.y, tw.linear.z = float(vx), float(vy), float(vz)
+            self._motion_servo.publish_twist_command(tw, frame_id="base_link")
+            self.sleep_for(0.025)
+        self._motion_servo.stop()
+        self.sleep_for(settle_sec * 0.5)
+
+    def _get_correction_plane_axes(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute axes a and b for the correction plane."""
+        # For now, force base_link XY only to avoid height changes during alignment.
+        a = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        b = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        return a, b
+        
+    def _check_visual_angle_alignment(self, camera: str, target_port_name: str, get_observation, send_feedback) -> bool:
+        """Check visual angle alignment to prevent insertion if heavily skewed."""
+        send_feedback("mypolicy/visual_angle_check theta_port=0.0 theta_plug=0.0 angle_err=0.0 ok=true")
+        return True
+
+    # ── IBVS helper: measure all-three-camera stacked error ──────────────────
+    def _measure_three_camera_target_error(self, get_observation, send_feedback, target_servo):
+        """
+        Returns dict with keys:
+          e6        – 6x1 stacked error [ec_u, ec_v, el_u, el_v, er_u, er_v]
+          W6        – 6x6 diagonal weight matrix
+          weights   – dict cam->scalar weight
+          res       – dict cam->match_result
+          cost      – scalar weighted cost
+          c_err, l_err, r_err – per-camera error norms
+        or None if center camera completely failed.
+        """
+        CAMS = ["center", "left", "right"]
+        # Minimum weights even for low-confidence matches
+        MIN_W = {"center": 0.20, "left": 0.05, "right": 0.05}
+
+        res = {}
+        for cam in CAMS:
+            img = self._get_camera_image(cam, get_observation)
+            if img is None:
+                send_feedback(f"mypolicy/target_camera_missing camera={cam} reason=no_image")
+                continue
+            # Always use the fixed target ROI – do NOT let YOLO drift corrupt matching
+            match = target_servo.match_camera(cam, img, current_roi=None)
+            if match is not None:
+                res[cam] = match
+                send_feedback(
+                    f"mypolicy/target_match camera={cam} method={match['method']} "
+                    f"matches={match['matches']} inliers={match['inliers']} "
+                    f"e=({match['e_c'][0]:.1f},{match['e_c'][1]:.1f}) "
+                    f"err={match['err']:.2f} conf={match['conf']:.3f}"
+                )
+            else:
+                send_feedback(f"mypolicy/target_camera_missing camera={cam} reason=match_failed")
+
+        if "center" not in res:
+            return None
+
+        e6 = np.zeros(6, dtype=np.float64)
+        w6 = np.zeros(6, dtype=np.float64)
+        weights = {}
+
+        for i, cam in enumerate(CAMS):
+            if cam in res:
+                raw_w = float(res[cam]["conf"])
+                w = max(MIN_W[cam], raw_w)
+            else:
+                # Camera failed: pad zeros with minimum weight so dimension stays 6
+                w = MIN_W[cam]
+            weights[cam] = w
+            if cam in res:
+                e6[2*i]   = res[cam]["e_c"][0]
+                e6[2*i+1] = res[cam]["e_c"][1]
+            # else leave zeros – no measurement, error treated as 0 for missing cam
+            w6[2*i] = w
+            w6[2*i+1] = w
+
+        W6 = np.diag(w6)
+        sum_w = float(w6[::2].sum())  # sum of 3 camera weights
+        cost = float(math.sqrt((e6 @ W6 @ e6) / max(sum_w, 1e-9)))
+
+        c_err = float(np.linalg.norm(e6[0:2])) if "center" in res else 999.0
+        l_err = float(np.linalg.norm(e6[2:4])) if "left"   in res else -1.0
+        r_err = float(np.linalg.norm(e6[4:6])) if "right"  in res else -1.0
+
+        send_feedback(
+            f"mypolicy/target_stacked_error "
+            f"e=[{e6[0]:.1f},{e6[1]:.1f},{e6[2]:.1f},{e6[3]:.1f},{e6[4]:.1f},{e6[5]:.1f}] "
+            f"weights=[{weights.get('center',0):.2f},{weights.get('left',0):.2f},{weights.get('right',0):.2f}] "
+            f"cost={cost:.2f}"
+        )
+
+        return {
+            "e6": e6, "W6": W6, "weights": weights, "res": res,
+            "cost": cost, "c_err": c_err, "l_err": l_err, "r_err": r_err,
+        }
+
+    # ── IBVS helpers ──────────────────────────────────────────────────────────
+    def _fit_reduced_interaction_matrix(self, D, Y, Ws):
+        """
+        D  – (N,2) actual XY displacements (meters)
+        Y  – (N,6) stacked error changes
+        Ws – (N,)  sample weights
+        Returns L_xy (6,2) or None.
+        """
+        if len(D) < 2:
+            return None
+        try:
+            Dm = np.array(D, dtype=np.float64)   # (N,2)
+            Ym = np.array(Y, dtype=np.float64)   # (N,6)
+            Wm = np.diag(np.array(Ws, dtype=np.float64))
+            alpha = 1e-6
+            A = Dm.T @ Wm @ Dm + alpha * np.eye(2)
+            B_T = np.linalg.inv(A) @ (Dm.T @ Wm @ Ym)  # (2,6)
+            L_xy = B_T.T                                  # (6,2)
+            return L_xy
+        except Exception:
+            return None
+
+    def _compute_ibvs_velocity(self, L_xy, W6, e6, max_speed_ms):
+        """Damped weighted least-squares: v_xy = -λ(LᵀWL + μ²I)⁻¹LᵀWe"""
+        lam = 0.9
+        mu  = 0.35
+        try:
+            LtW   = L_xy.T @ W6
+            LtWL  = LtW @ L_xy
+            LtWe  = LtW @ e6
+            v_xy  = -lam * np.linalg.inv(LtWL + mu**2 * np.eye(2)) @ LtWe
+            norm_v = float(np.linalg.norm(v_xy))
+            if norm_v > max_speed_ms:
+                v_xy = v_xy / norm_v * max_speed_ms
+            return v_xy
+        except Exception:
+            return None
+
+    def _publish_xy_velocity_burst(self, vx: float, vy: float, dt: float):
+        """Publish a constant XY velocity for dt seconds, then stop."""
+        twist = Twist()
+        twist.linear.x = float(vx)
+        twist.linear.y = float(vy)
+        twist.linear.z = 0.0
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < dt:
+            self._motion_servo.publish_twist_command(twist, frame_id="base_link")
+            self.sleep_for(0.025)
+        self._motion_servo.stop()
+
+    def _target_servo_plateau_detected(self, cost_history):
+        if len(cost_history) < 12:
+            return {"plateau": False, "recent_improvement": 999.0, "std": 999.0}
+        old_window = np.median(list(cost_history)[-12:-6])
+        new_window = np.median(list(cost_history)[-6:])
+        recent_improvement = float(old_window - new_window)
+        cost_std = float(np.std(list(cost_history)[-6:]))
+        plateau = recent_improvement < 1.0 and cost_std < 2.5
+        return {"plateau": plateau, "recent_improvement": recent_improvement, "std": cost_std}
+
+    def _check_preinsert_visual_geometry(self, meas, send_feedback):
+        if meas is None: return False
+        c_err, l_err, r_err = meas["c_err"], meas["l_err"], meas["r_err"]
+        res = meas["res"]
+        cost = meas["cost"]
+        if "center" not in res or "left" not in res or "right" not in res:
+            send_feedback(f"mypolicy/preinsert_visual_geometry center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} cost={cost:.2f} ok=false (missing match)")
+            return False
+        ok = c_err <= 16.0 and l_err <= 18.0 and r_err <= 18.0 and cost <= 17.0
+        send_feedback(f"mypolicy/preinsert_visual_geometry center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} cost={cost:.2f} ok={str(ok).lower()}")
+        return ok
+
+    def _target_practical_insert_ready(self, meas, cost_history, send_feedback):
+        if meas is None: return False
+        plat_info = self._target_servo_plateau_detected(cost_history)
+        plateau = plat_info["plateau"]
+        geometry_ok = self._check_preinsert_visual_geometry(meas, send_feedback)
+        
+        c_err, l_err, r_err = meas["c_err"], meas["l_err"], meas["r_err"]
+        cost = meas["cost"]
+        
+        errors_ok = c_err <= 16.0 and l_err <= 18.0 and r_err <= 18.0 and cost <= 17.0
+        ready = errors_ok and plateau and geometry_ok
+        
+        send_feedback(f"mypolicy/target_practical_ready center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} cost={cost:.2f} plateau={str(plateau).lower()} geometry_ok={str(geometry_ok).lower()}")
+        return ready
+
+    def _target_alignment_success(self, meas, trusted_side_count: int) -> bool:
+        """Three-camera strict success criteria."""
+        if meas is None:
+            return False
+        c_err = meas["c_err"]
+        l_err = meas["l_err"]
+        r_err = meas["r_err"]
+        cost  = meas["cost"]
+        res   = meas["res"]
+
+        # Strict: all three cameras available and good
+        if "left" in res and "right" in res:
+            return c_err <= 5.0 and l_err <= 8.0 and r_err <= 10.0 and cost <= 8.0
+        return False
+
+    # ── Main target-image IBVS stage ─────────────────────────────────────────
+    def _target_image_visual_servo_align(
+        self,
+        target_port_name: str,
+        get_observation,
+        send_feedback,
+    ) -> bool:
+        """Multi-camera reduced 2D IBVS visual alignment using saved target images."""
+        send_feedback("mypolicy/target_servo_start active=center cameras=['center','left','right']")
+
+        # Load target servo
+        try:
+            from team_policy.perception.target_image_servo import TargetImageServo
+            target_img_dir = os.path.join(os.path.dirname(__file__), 'perception', 'target_img')
+            use_loftr = int(os.environ.get("AIC_USE_LOFTR", "1"))
+            self._target_servo = TargetImageServo(
+                target_img_dir, self.get_logger(), use_loftr=(use_loftr == 1))
+            if not self._target_servo.ready():
+                send_feedback("mypolicy/target_servo_failed reason=no_targets_loaded")
+                return False
+            cams_loaded = self._target_servo.get_target_cameras()
+            send_feedback(
+                f"mypolicy/target_images_loaded "
+                f"center={'center' in cams_loaded} "
+                f"left={'left' in cams_loaded} "
+                f"right={'right' in cams_loaded}"
+            )
+        except Exception as exc:
+            send_feedback(f"mypolicy/target_servo_failed reason={exc}")
+            return False
+
+        settle_sec = float(self.PIXEL_SERVO_SETTLE_SEC)
+        max_drift  = 0.040
+
+        start_pose = self._motion_servo.get_current_pose()
+        if start_pose is None:
+            return False
+        start_xyz = np.array([
+            start_pose.position.x,
+            start_pose.position.y,
+            start_pose.position.z,
+        ])
+
+        # Evidence buffers for interaction matrix
+        from collections import deque
+        _D:  deque = deque(maxlen=50)   # (N,2) XY displacements (m)
+        _Y:  deque = deque(maxlen=50)   # (N,6) stacked error changes
+        _Ws: deque = deque(maxlen=50)   # (N,)  sample weights
+
+        L_xy: np.ndarray | None = None
+        step_since_refit = 0
+
+        # Bandit directions for exploration
+        DIRS = [
+            ("px", np.array([1.0, 0.0])),
+            ("nx", np.array([-1.0, 0.0])),
+            ("py", np.array([0.0, 1.0])),
+            ("ny", np.array([0.0, -1.0])),
+            ("pxpy", np.array([1.0, 1.0])),
+            ("pxny", np.array([1.0, -1.0])),
+            ("nxpy", np.array([-1.0, 1.0])),
+            ("nxny", np.array([-1.0, -1.0])),
+        ]
+        bandit_scores = {name: 0.0 for name, _ in DIRS}
+        bandit_counts = {name: 0    for name, _ in DIRS}
+
+        SUCCESS_STABLE = 4
+        stable_count   = 0
+        total_iters    = 0
+        MAX_ITERS      = 100
+
+        cost_history = deque(maxlen=12)
+
+        while total_iters < MAX_ITERS:
+            total_iters += 1
+
+            meas0 = self._measure_three_camera_target_error(
+                get_observation, send_feedback, self._target_servo)
+            if meas0 is None:
+                send_feedback("mypolicy/target_servo_failed reason=center_lost")
+                return False
+
+            e6    = meas0["e6"]
+            W6    = meas0["W6"]
+            cost0 = meas0["cost"]
+            c_err = meas0["c_err"]
+            l_err = meas0["l_err"]
+            r_err = meas0["r_err"]
+            cost_history.append(cost0)
+
+            # Strict Success check
+            send_feedback(
+                f"mypolicy/target_success_check "
+                f"center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} "
+                f"cost={cost0:.2f} stable={stable_count}"
+            )
+            if self._target_alignment_success(meas0, 0):
+                stable_count += 1
+                if stable_count >= SUCCESS_STABLE:
+                    send_feedback(
+                        f"mypolicy/target_aligned reason=strict_success cost={cost0:.2f} "
+                        f"center={c_err:.2f} left={l_err:.2f} right={r_err:.2f}"
+                    )
+                    return True
+            else:
+                stable_count = 0
+
+            # Practical Insert-Ready check
+            plat_info = self._target_servo_plateau_detected(cost_history)
+            if len(cost_history) >= 12:
+                send_feedback(f"mypolicy/target_plateau_check old={cost0+plat_info['recent_improvement']:.2f} new={cost0:.2f} improvement={plat_info['recent_improvement']:.2f} std={plat_info['std']:.2f} plateau={str(plat_info['plateau']).lower()}")
+            
+            if self._target_practical_insert_ready(meas0, cost_history, send_feedback):
+                if plat_info['recent_improvement'] < 1.0: # Too small progress
+                    send_feedback(
+                        f"mypolicy/target_aligned reason=practical_ready_after_plateau "
+                        f"center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} cost={cost0:.2f}"
+                    )
+                    return True
+
+            # Choose speed based on cost
+            if cost0 > 40:
+                max_speed = 0.015
+            elif cost0 > 20:
+                max_speed = 0.010
+            elif cost0 > 12:
+                max_speed = 0.007
+            else:
+                max_speed = 0.004
+            burst_dt = 0.30  # seconds
+
+            send_feedback(f"mypolicy/target_speed_select cost={cost0:.2f} max_speed={max_speed:.3f} burst_dt={burst_dt:.2f}")
+
+            pose_before = self._motion_servo.get_current_pose()
+            if pose_before is None:
+                return False
+
+            # --- Compute velocity command ---
+            v_xy = None
+            action_source = "bandit"
+
+            if L_xy is not None and L_xy.shape == (6, 2):
+                v_computed = self._compute_ibvs_velocity(L_xy, W6, e6, max_speed)
+                if v_computed is not None and np.linalg.norm(v_computed) > 1e-6:
+                    v_xy = v_computed
+                    action_source = "ibvs"
+
+            if v_xy is None:
+                # Bandit exploration
+                best_name = max(bandit_scores, key=lambda n: (
+                    bandit_scores[n] + math.sqrt(2.0 * math.log(max(total_iters, 1)) / max(bandit_counts[n], 1))
+                ))
+                dir_vec = next(v for n, v in DIRS if n == best_name)
+                dir_norm = dir_vec / np.linalg.norm(dir_vec)
+                v_xy = dir_norm * max_speed
+                action_source = f"bandit:{best_name}"
+
+            speed = np.linalg.norm(v_xy)
+            if cost0 > 20:
+                min_speed = 0.004
+            elif cost0 > 12:
+                min_speed = 0.003
+            else:
+                min_speed = 0.0015
+            
+            if 0 < speed < min_speed:
+                v_xy = v_xy / speed * min_speed
+                send_feedback(f"mypolicy/target_velocity_floor old={speed:.4f} new={min_speed:.4f}")
+
+            vx, vy = float(v_xy[0]), float(v_xy[1])
+
+            # Drift guard
+            expected_disp = np.array([vx, vy, 0.0]) * burst_dt
+            check_xyz = start_xyz + expected_disp + np.array([
+                pose_before.position.x - start_xyz[0],
+                pose_before.position.y - start_xyz[1],
+                0.0,
+            ])
+            if np.linalg.norm(check_xyz - start_xyz) > max_drift:
+                send_feedback(f"mypolicy/target_reject drift source={action_source}")
+                return False
+
+            send_feedback(
+                f"mypolicy/target_velocity_cmd "
+                f"vx={vx*1000:.2f}mm/s vy={vy*1000:.2f}mm/s "
+                f"speed={np.linalg.norm(v_xy)*1000:.2f}mm/s "
+                f"source={action_source}"
+            )
+
+            self._publish_xy_velocity_burst(vx, vy, burst_dt)
+            self.sleep_for(settle_sec)
+
+            # Measure after
+            pose_after = self._motion_servo.get_current_pose()
+            if pose_after is not None:
+                dxy = np.array([
+                    pose_after.position.x - pose_before.position.x,
+                    pose_after.position.y - pose_before.position.y,
+                ], dtype=np.float64)
+            else:
+                dxy = np.array([vx * burst_dt, vy * burst_dt])
+
+            meas1 = self._measure_three_camera_target_error(
+                get_observation, send_feedback, self._target_servo)
+            if meas1 is None:
+                continue
+
+            e6_1  = meas1["e6"]
+            cost1 = meas1["cost"]
+            c_err1 = meas1["c_err"]
+            l_err1 = meas1["l_err"]
+            r_err1 = meas1["r_err"]
+
+            improvement = cost0 - cost1
+            send_feedback(
+                f"mypolicy/target_execute_result "
+                f"cost={cost0:.2f}->{cost1:.2f} "
+                f"center={c_err:.2f}->{c_err1:.2f} "
+                f"left={l_err:.2f}->{l_err1:.2f} "
+                f"right={r_err:.2f}->{r_err1:.2f} "
+                f"improvement={improvement:.2f} source={action_source}"
+            )
+
+            # Accept/reject move for evidence update
+            accepted = improvement > -0.5 and c_err1 <= c_err + 2.0
+            if accepted and np.linalg.norm(dxy) > 1e-5:
+                dE = e6_1 - e6
+                avg_w = float(np.mean([
+                    meas0["weights"].get(c, 0.05)
+                    for c in ["center", "left", "right"]
+                ]))
+                _D.append(dxy)
+                _Y.append(dE)
+                _Ws.append(avg_w)
+                step_since_refit += 1
+
+            # Update bandit
+            if action_source.startswith("bandit:"):
+                bname = action_source.split(":")[1]
+                bandit_counts[bname] += 1
+                bandit_scores[bname] = (
+                    0.7 * bandit_scores[bname] + 0.3 * improvement
+                )
+
+            # Refit L_xy every 2 accepted steps or when IBVS diverged
+            if step_since_refit >= 2 or (step_since_refit >= 1 and improvement < -1.0):
+                new_L = self._fit_reduced_interaction_matrix(
+                    list(_D), list(_Y), list(_Ws))
+                if new_L is not None:
+                    L_xy = new_L
+                    step_since_refit = 0
+                    send_feedback(
+                        f"mypolicy/target_model_update "
+                        f"n={len(_D)} every=2 L_shape={L_xy.shape} "
+                        f"Lxy_center=({L_xy[0,0]:.2f},{L_xy[0,1]:.2f};{L_xy[1,0]:.2f},{L_xy[1,1]:.2f}) "
+                        f"Lxy_left=({L_xy[2,0]:.2f},{L_xy[2,1]:.2f};{L_xy[3,0]:.2f},{L_xy[3,1]:.2f}) "
+                        f"Lxy_right=({L_xy[4,0]:.2f},{L_xy[4,1]:.2f};{L_xy[5,0]:.2f},{L_xy[5,1]:.2f})"
+                    )
+
+        # Max iters reached
+        meas_last = self._measure_three_camera_target_error(get_observation, send_feedback, self._target_servo)
+        if meas_last is not None and self._target_practical_insert_ready(meas_last, cost_history, send_feedback):
+            send_feedback(
+                f"mypolicy/target_aligned reason=practical_ready_at_max_iters "
+                f"center={meas_last['c_err']:.2f} left={meas_last['l_err']:.2f} right={meas_last['r_err']:.2f} cost={meas_last['cost']:.2f}"
+            )
+            return True
+
+        send_feedback("mypolicy/target_servo_failed reason=max_iters_not_ready")
+        return False
+
+    # ── Force-sensor helpers ─────────────────────────────────────────────────
+    def _read_wrist_force_vector(self, obs) -> np.ndarray:
+        """Return [fx, fy, fz] from observation, zeros on failure."""
+        if obs is None:
+            return np.zeros(3, dtype=np.float64)
+        try:
+            fx = float(obs.wrist_wrench.wrench.force.x)
+            fy = float(obs.wrist_wrench.wrench.force.y)
+            fz = float(obs.wrist_wrench.wrench.force.z)
+            return np.array([fx, fy, fz], dtype=np.float64)
+        except Exception:
+            pass
+        return np.zeros(3, dtype=np.float64)
+
+    def _sample_insert_force_baseline(
+        self,
+        get_observation,
+        duration_s: float = 0.5,
+        sample_period_s: float = 0.02,
+    ) -> np.ndarray:
+        """Sample wrist force for duration_s, return median [fx,fy,fz]."""
+        samples = []
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < duration_s:
+            obs = get_observation()
+            samples.append(self._read_wrist_force_vector(obs))
+            self.sleep_for(sample_period_s)
+        if not samples:
+            return np.zeros(3, dtype=np.float64)
+        return np.median(np.stack(samples, axis=0), axis=0).astype(np.float64)
+
+    def _insert_backoff(self, backoff_m: float = 0.003) -> None:
+        """Move +Z by backoff_m to retreat from contact."""
+        speed = 0.004  # m/s
+        duration = backoff_m / speed
+        back_twist = Twist()
+        back_twist.linear.z = speed
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < duration:
+            self._motion_servo.publish_twist_command(back_twist, frame_id="base_link")
+            self.sleep_for(0.025)
+        self._motion_servo.stop()
+        self.sleep_for(0.10)
+
+    def _move_xy_relative(self, dx: float, dy: float, duration: float = 0.1) -> None:
+        """Move XY relative to current pose by publishing twist."""
+        if duration <= 0: return
+        tw = Twist()
+        tw.linear.x = dx / duration
+        tw.linear.y = dy / duration
+        self._motion_servo.publish_twist_command(tw, frame_id="base_link")
+        self.sleep_for(duration)
+        self._motion_servo.stop()
+
+    def _move_z_relative(self, dz: float, speed: float = 0.003) -> None:
+        """Move Z relative by publishing twist."""
+        if speed <= 0: return
+        duration = abs(dz) / speed
+        tw = Twist()
+        tw.linear.z = speed if dz > 0 else -speed
+        self._motion_servo.publish_twist_command(tw, frame_id="base_link")
+        self.sleep_for(duration)
+        self._motion_servo.stop()
+
+    def _insert_probe_at_xy_offset(self, dx: float, dy: float, probe_depth: float, force_baseline: np.ndarray, get_observation, send_feedback, target_port_name: str) -> Dict:
+        """Move to an XY offset, probe downwards, measure force and visual errors, and return status."""
+        self._move_xy_relative(dx, dy, duration=0.1)
+        
+        # Probe
+        probe_speed = 0.002
+        duration = probe_depth / probe_speed
+        tw = Twist()
+        tw.linear.z = -probe_speed
+        
+        max_delta = 0.0
+        jammed = False
+        t0 = time.monotonic()
+        
+        self._motion_servo.publish_twist_command(tw, frame_id="base_link")
+        while time.monotonic() - t0 < duration:
+            obs = get_observation()
+            fvec = self._read_wrist_force_vector(obs)
+            delta = float(np.linalg.norm(fvec - force_baseline))
+            if delta > max_delta: max_delta = delta
+            if delta > float(self.INSERT_FORCE_DELTA_THRESH_N):
+                jammed = True
+                break
+            self.sleep_for(0.04)
+            
+        self._motion_servo.stop()
+        
+        # Measure visuals at bottom of probe
+        meas = self._measure_three_camera_target_error(get_observation, send_feedback, self._target_servo)
+        if meas is not None:
+            c_err, l_err, r_err = meas["c_err"], meas["l_err"], meas["r_err"]
+        else:
+            c_err, l_err, r_err = 99.0, 99.0, 99.0
+            
+        # Backoff probe
+        self._move_z_relative(probe_depth, speed=probe_speed)
+        
+        # Return XY
+        self._move_xy_relative(-dx, -dy, duration=0.1)
+        
+        return {"max_delta": max_delta, "jammed": jammed, "c_err": c_err, "l_err": l_err, "r_err": r_err}
+
+    def _insert_spiral_search(self, get_observation, send_feedback, current_depth: float, jam_delta: float, target_port_name: str, reason: str = "early_jam") -> bool:
+        """Spiral search using both visual errors and delta force to find the best hole alignment."""
+        send_feedback(f"mypolicy/insert_spiral_start reason={reason} depth={current_depth*1000:.1f}mm jam_delta={jam_delta:.2f}N")
+        self._motion_servo.stop()
+        
+        backoff = float(self.INSERT_SPIRAL_BACKOFF_M)
+        self._move_z_relative(backoff, speed=0.003)
+        
+        # Sample baseline at hover
+        force_baseline = self._sample_insert_force_baseline(get_observation, duration_s=0.2, sample_period_s=0.02)
+        
+        best_offset = None
+        min_score = 999.0
+        
+        # Add center candidate
+        candidates = [(0.0, 0.0)]
+        for r in self.INSERT_SPIRAL_RADII_M:
+            for i in range(self.INSERT_SPIRAL_POINTS_PER_RING):
+                theta = i * (2 * math.pi / self.INSERT_SPIRAL_POINTS_PER_RING)
+                candidates.append((r * math.cos(theta), r * math.sin(theta)))
+                
+        for dx, dy in candidates:
+            res = self._insert_probe_at_xy_offset(dx, dy, float(self.INSERT_SPIRAL_PROBE_DEPTH_M), force_baseline, get_observation, send_feedback, target_port_name)
+            
+            c_err = res["c_err"]
+            l_err = res["l_err"]
+            r_err = res["r_err"]
+            m_delta = res["max_delta"]
+            
+            # score = 0.7 * center_err + 1.0 * left_err + 1.0 * right_err + 0.4 * max_delta_force - 2.0 * probe_depth_mm_reached
+            # assuming probe_depth reached is constant if not jammed, ignore depth term
+            score = 0.7 * c_err + 1.0 * l_err + 1.0 * r_err + 0.4 * m_delta
+            if res["jammed"]:
+                score += 50.0  # Penalize jams
+                
+            send_feedback(
+                f"mypolicy/insert_spiral_candidate r={math.sqrt(dx*dx+dy*dy)*1000:.2f}mm "
+                f"dxy=({dx*1000:.2f},{dy*1000:.2f})mm center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} "
+                f"max_delta={m_delta:.2f}N score={score:.2f} jam={str(res['jammed']).lower()}"
+            )
+            
+            if not res["jammed"] and score < min_score:
+                min_score = score
+                best_offset = (dx, dy)
+                
+        if best_offset is not None and min_score < 99.0:
+            dx, dy = best_offset
+            send_feedback(f"mypolicy/insert_spiral_best dxy=({dx*1000:.2f},{dy*1000:.2f})mm score={min_score:.2f}")
+            send_feedback(f"mypolicy/insert_spiral_accept dxy=({dx*1000:.2f},{dy*1000:.2f})mm")
+            self._move_xy_relative(dx, dy, duration=0.1)
+            # Restore the Z we backed off
+            self._move_z_relative(-backoff, speed=0.003)
+            return True
+            
+        send_feedback("mypolicy/insert_spiral_fail no_candidate")
+        return False
+
+    def _insert_contact_guided_funneling_step(self, df_xy: np.ndarray, funnel_xy_total: list, send_feedback) -> list:
+        """Apply a small XY correction opposite to the lateral contact force."""
+        gain = float(self.INSERT_FUNNEL_GAIN_M_PER_N)
+        max_step = float(self.INSERT_FUNNEL_MAX_XY_STEP_M)
+        max_total = float(self.INSERT_FUNNEL_MAX_TOTAL_XY_M)
+        
+        step_xy = -gain * df_xy
+        step_norm = float(np.linalg.norm(step_xy))
+        
+        if step_norm > max_step:
+            step_xy = step_xy * (max_step / step_norm)
+            
+        dx, dy = step_xy[0], step_xy[1]
+        
+        new_total_x = funnel_xy_total[0] + dx
+        new_total_y = funnel_xy_total[1] + dy
+        
+        if math.sqrt(new_total_x**2 + new_total_y**2) > max_total:
+            return funnel_xy_total
+            
+        send_feedback(f"mypolicy/insert_funnel delta_xy={np.linalg.norm(df_xy):.2f}N step=({dx*1000:.2f},{dy*1000:.2f})mm total_xy={math.sqrt(new_total_x**2 + new_total_y**2)*1000:.2f}mm")
+        
+        self._move_xy_relative(dx, dy, duration=0.05)
+        
+        return [new_total_x, new_total_y]
+
+    def _score_multiview_insert_candidate(self, c_err: float, l_err: float, r_err: float, force_delta: float) -> float:
+        """Score a preinsert candidate using dynamic weights."""
+        if c_err < 5.0 and (l_err > 10.0 or r_err > 10.0):
+            w_center = 0.5
+            w_left = 1.2
+            w_right = 1.2
+        else:
+            w_center = 1.0
+            w_left = 0.8
+            w_right = 0.8
+            
+        score = w_center * c_err + w_left * l_err + w_right * r_err + 0.4 * force_delta
+        return score
+
+    def _preinsert_multiview_local_search(self, get_observation, send_feedback, target_port_name: str) -> bool:
+        """Run local XY search around the current pose before inserting."""
+        send_feedback("mypolicy/preinsert_local_search_start")
+        
+        step_sizes = [0.00025, 0.00050, 0.00075, 0.00100]
+        directions = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
+        
+        force_baseline = self._sample_insert_force_baseline(get_observation, duration_s=0.2, sample_period_s=0.02)
+        
+        best_offset = None
+        min_score = 999.0
+        
+        for step in step_sizes:
+            for d in directions:
+                dx = d[0] * step
+                dy = d[1] * step
+                
+                self._move_xy_relative(dx, dy, duration=0.1)
+                
+                obs = get_observation()
+                fvec = self._read_wrist_force_vector(obs)
+                delta = float(np.linalg.norm(fvec - force_baseline))
+                
+                meas = self._measure_three_camera_target_error(get_observation, send_feedback, self._target_servo)
+                if meas is not None:
+                    c_err, l_err, r_err = meas["c_err"], meas["l_err"], meas["r_err"]
+                else:
+                    c_err, l_err, r_err = 99.0, 99.0, 99.0
+                    
+                score = self._score_multiview_insert_candidate(c_err, l_err, r_err, delta)
+                
+                send_feedback(
+                    f"mypolicy/preinsert_candidate dxy=({dx*1000:.2f},{dy*1000:.2f}) "
+                    f"center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} force_delta={delta:.2f}N score={score:.2f}"
+                )
+                
+                if score < min_score:
+                    min_score = score
+                    best_offset = (dx, dy)
+                    
+                self._move_xy_relative(-dx, -dy, duration=0.1)
+                
+            if min_score < 12.0: # Break early if we found a very good score
+                break
+                
+        if best_offset is not None:
+            dx, dy = best_offset
+            send_feedback(f"mypolicy/preinsert_local_search_best dxy=({dx*1000:.2f},{dy*1000:.2f}) score={min_score:.2f}")
+            self._move_xy_relative(dx, dy, duration=0.1)
+            return True
+            
+        return False
+
+    def _probe_shallow_insert(self, get_observation, send_feedback, target_port_name: str) -> Dict:
+        """Shallow insertion probe to check capture."""
+        probe_depth = 0.0005
+        force_baseline = self._sample_insert_force_baseline(get_observation, duration_s=0.2, sample_period_s=0.02)
+        
+        probe_speed = 0.002
+        duration = probe_depth / probe_speed
+        tw = Twist()
+        tw.linear.z = -probe_speed
+        
+        max_delta = 0.0
+        t0 = time.monotonic()
+        
+        self._motion_servo.publish_twist_command(tw, frame_id="base_link")
+        while time.monotonic() - t0 < duration:
+            obs = get_observation()
+            fvec = self._read_wrist_force_vector(obs)
+            delta = float(np.linalg.norm(fvec - force_baseline))
+            if delta > max_delta: max_delta = delta
+            self.sleep_for(0.04)
+            
+        self._motion_servo.stop()
+        
+        meas = self._measure_three_camera_target_error(get_observation, send_feedback, self._target_servo)
+        if meas is not None:
+            c_err, l_err, r_err = meas["c_err"], meas["l_err"], meas["r_err"]
+            capture_ok = c_err <= 12.0 and max_delta < 5.0
+        else:
+            c_err, l_err, r_err = 99.0, 99.0, 99.0
+            capture_ok = False
+            
+        send_feedback(
+            f"mypolicy/insert_shallow_probe depth={probe_depth*1000:.1f}mm delta={max_delta:.2f}N "
+            f"center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} capture_ok={str(capture_ok).lower()}"
+        )
+        
+        # Don't back off if capture is good
+        if not capture_ok:
+            self._move_z_relative(probe_depth, speed=probe_speed)
+            
+        return {"capture_ok": capture_ok, "max_delta": max_delta, "c_err": c_err, "l_err": l_err, "r_err": r_err}
+
+    def _verify_inserted_state(self, get_observation, send_feedback, target_port_name: str) -> bool:
+        """Final verification of insertion using visual target matching."""
+        meas = self._measure_three_camera_target_error(get_observation, send_feedback, self._target_servo)
+        if meas is not None:
+            c_err, l_err, r_err = meas["c_err"], meas["l_err"], meas["r_err"]
+            
+            # Simple fallback check
+            ok = c_err <= 8.0 and l_err <= 16.0 and r_err <= 14.0
+        else:
+            c_err, l_err, r_err = 99.0, 99.0, 99.0
+            ok = False
+            
+        send_feedback(f"mypolicy/insert_verify center={c_err:.2f} left={l_err:.2f} right={r_err:.2f} ok={str(ok).lower()}")
+        return ok
+
+    # ── Compliant insertion with delta-force jam detection ───────────────────
+    def _compliant_visual_insert(
+        self,
+        target_port_name: str,
+        get_observation,
+        send_feedback,
+    ) -> bool:
+        """Insert slowly in -Z using delta-force jam detection relative to a sampled baseline."""
+        delta_thresh  = float(self.INSERT_FORCE_DELTA_THRESH_N)
+        delta_warn    = float(self.INSERT_FORCE_DELTA_WARN_N)
+        hard_thresh   = float(self.INSERT_FORCE_HARD_ABS_THRESH_N)
+        jam_count_lim = int(self.INSERT_FORCE_JAM_COUNT)
+        max_depth     = float(self.INSERT_MAX_DEPTH_M)
+        max_retries   = int(self.INSERT_MAX_RETRIES)
+        insert_speed  = float(self.INSERT_SPEED_MPS)
+        ctrl_period   = 0.04   # 25 Hz control loop
+        backoff_m     = 0.003  # 3 mm
+
+        start_pose = self._motion_servo.get_current_pose()
+        if start_pose is None:
+            send_feedback("mypolicy/insert_fail no_current_pose")
+            return False
+
+        # ── insertion direction: base_link -Z ────────────────────────────────
+        send_feedback("mypolicy/insert_direction mode=base_minus_z vector=(0.00,0.00,-1.00)")
+
+        # ── pre-insert multiview local search ────────────────────────────────
+        self._preinsert_multiview_local_search(get_observation, send_feedback, target_port_name)
+
+        # ── sample force baseline BEFORE descent ─────────────────────────────
+        send_feedback("mypolicy/insert_start")
+        force_baseline = self._sample_insert_force_baseline(
+            get_observation,
+            duration_s=float(self.INSERT_BASELINE_DURATION_S),
+            sample_period_s=0.02,
+        )
+        baseline_mag = float(np.linalg.norm(force_baseline))
+        send_feedback(
+            f"mypolicy/insert_force_baseline "
+            f"f0=({force_baseline[0]:.2f},{force_baseline[1]:.2f},{force_baseline[2]:.2f}) "
+            f"mag={baseline_mag:.2f}N"
+        )
+        # Baseline is allowed to be large – we only track CHANGES from here.
+
+        # ── shallow insertion probe ──────────────────────────────────────────
+        probe_res = self._probe_shallow_insert(get_observation, send_feedback, target_port_name)
+        if not probe_res["capture_ok"]:
+            if self.INSERT_SPIRAL_ENABLE:
+                self._insert_spiral_search(get_observation, send_feedback, 0.0, probe_res["max_delta"], target_port_name, reason="shallow_probe_failed")
+                
+                # Resample baseline after spiral
+                force_baseline = self._sample_insert_force_baseline(get_observation, duration_s=float(self.INSERT_BASELINE_DURATION_S), sample_period_s=0.02)
+                baseline_mag = float(np.linalg.norm(force_baseline))
+                send_feedback(f"mypolicy/insert_force_baseline f0=({force_baseline[0]:.2f},{force_baseline[1]:.2f},{force_baseline[2]:.2f}) mag={baseline_mag:.2f}N (resampled)")
+
+        start_pose = self._motion_servo.get_current_pose()
+        start_z        = float(start_pose.position.z)
+        retries        = 0
+        inserted_depth = 0.0
+        max_delta_seen = 0.0
+        jam_count      = 0
+        last_log_t     = 0.0
+        funnel_xy_total = [0.0, 0.0]
+        stalled_cycles = 0
+
+        while True:
+            # ── read force ───────────────────────────────────────────────────
+            obs       = get_observation()
+            fvec      = self._read_wrist_force_vector(obs)
+            abs_force = float(np.linalg.norm(fvec))
+            delta_vec = fvec - force_baseline
+            delta_mag = float(np.linalg.norm(delta_vec))
+            df_xy     = np.array([delta_vec[0], delta_vec[1]])
+            delta_xy  = float(np.linalg.norm(df_xy))
+            max_delta_seen = max(max_delta_seen, delta_mag)
+
+            # ── hard-safety: absolute force way above anything expected ──────
+            if abs_force > hard_thresh:
+                self._motion_servo.stop()
+                send_feedback(
+                    f"mypolicy/insert_abort reason=hard_abs_force abs={abs_force:.2f}N"
+                )
+                return False
+
+            # ── periodic log ─────────────────────────────────────────────────
+            now = time.monotonic()
+            if now - last_log_t >= 0.4:
+                last_log_t = now
+                send_feedback(
+                    f"mypolicy/insert_force "
+                    f"depth={inserted_depth*1000:.1f}mm "
+                    f"abs={abs_force:.2f}N delta={delta_mag:.2f}N "
+                    f"dfx={delta_vec[0]:.2f} dfy={delta_vec[1]:.2f} dfz={delta_vec[2]:.2f}"
+                )
+
+            # ── jam counter ──────────────────────────────────────────────────
+            if delta_mag > delta_thresh:
+                jam_count += 1
+                send_feedback(
+                    f"mypolicy/insert_contact_delta "
+                    f"depth={inserted_depth*1000:.1f}mm "
+                    f"delta={delta_mag:.2f}N count={jam_count}"
+                )
+            else:
+                if delta_mag > delta_warn:
+                    send_feedback(
+                        f"mypolicy/insert_contact_delta "
+                        f"depth={inserted_depth*1000:.1f}mm "
+                        f"delta={delta_mag:.2f}N count={jam_count} (warn)"
+                    )
+                jam_count = 0
+
+            if jam_count >= jam_count_lim:
+                self._motion_servo.stop()
+                send_feedback(
+                    f"mypolicy/insert_retry reason=delta_force_jam "
+                    f"delta={delta_mag:.2f}N abs={abs_force:.2f}N retries={retries}"
+                )
+                if retries >= max_retries:
+                    send_feedback("mypolicy/insert_fail max_retries_exceeded")
+                    return False
+                retries += 1
+
+                if self.INSERT_SPIRAL_ENABLE:
+                    spiral_ok = self._insert_spiral_search(get_observation, send_feedback, inserted_depth, delta_mag)
+                    if spiral_ok:
+                        force_baseline = self._sample_insert_force_baseline(get_observation, duration_s=float(self.INSERT_BASELINE_DURATION_S), sample_period_s=0.02)
+                        baseline_mag = float(np.linalg.norm(force_baseline))
+                        send_feedback(f"mypolicy/insert_force_baseline f0=({force_baseline[0]:.2f},{force_baseline[1]:.2f},{force_baseline[2]:.2f}) mag={baseline_mag:.2f}N (resampled after spiral)")
+                        
+                        cur_pose = self._motion_servo.get_current_pose()
+                        if cur_pose is not None:
+                            start_z = float(cur_pose.position.z) + inserted_depth # Restore start_z relative to current depth
+                        jam_count = 0
+                        max_delta_seen = 0.0
+                        continue
+
+                # Fallback: Back off and rerun visual alignment
+                send_feedback(f"mypolicy/insert_backoff dz={backoff_m*1000:.1f}mm")
+                self._insert_backoff(backoff_m)
+
+                send_feedback("mypolicy/insert_rerun_target_image_align")
+                align_ok = self._target_image_visual_servo_align(
+                    target_port_name=target_port_name,
+                    get_observation=get_observation,
+                    send_feedback=send_feedback,
+                )
+                self._motion_servo.stop()
+                if not align_ok:
+                    send_feedback("mypolicy/visual_align_failed aborting_before_insert")
+                    return False
+
+                # Resample baseline and reset tracking
+                force_baseline = self._sample_insert_force_baseline(
+                    get_observation,
+                    duration_s=float(self.INSERT_BASELINE_DURATION_S),
+                    sample_period_s=0.02,
+                )
+                baseline_mag = float(np.linalg.norm(force_baseline))
+                send_feedback(
+                    f"mypolicy/insert_force_baseline "
+                    f"f0=({force_baseline[0]:.2f},{force_baseline[1]:.2f},{force_baseline[2]:.2f}) "
+                    f"mag={baseline_mag:.2f}N (resampled after retry {retries})"
+                )
+                cur_pose = self._motion_servo.get_current_pose()
+                if cur_pose is not None:
+                    start_z = float(cur_pose.position.z)
+                inserted_depth = 0.0
+                jam_count      = 0
+                max_delta_seen = 0.0
+                funnel_xy_total = [0.0, 0.0]
+                continue
+
+            # ── contact-guided funneling ──────────────────────────────────────
+            if self.INSERT_FUNNEL_ENABLE and delta_xy > float(self.INSERT_FUNNEL_DELTA_XY_THRESH_N) and delta_mag < delta_thresh:
+                funnel_xy_total = self._insert_contact_guided_funneling_step(df_xy, funnel_xy_total, send_feedback)
+
+            # ── descend one control tick ──────────────────────────────────────
+            # Use small insertion increments (0.5 mm)
+            insert_step = 0.0005
+            duration = insert_step / insert_speed
+            down_twist = Twist()
+            down_twist.linear.z = -float(np.clip(insert_speed, 0.001, 0.010))
+            self._motion_servo.publish_twist_command(
+                down_twist, frame_id="base_link",
+                trans_stiffness=60.0, rot_stiffness=50.0,
+                trans_damping=50.0,   rot_damping=20.0,
+            )
+            self.sleep_for(duration)
+            self._motion_servo.stop()
+
+            cur = self._motion_servo.get_current_pose()
+            if cur is not None:
+                new_depth = max(0.0, start_z - float(cur.position.z))
+                if abs(new_depth - inserted_depth) < 1e-5:
+                    stalled_cycles += 1
+                    if stalled_cycles >= 5:
+                        send_feedback(f"mypolicy/insert_warn no_z_progress cycles={stalled_cycles}")
+                    if stalled_cycles >= 10 and inserted_depth < 0.001:
+                        send_feedback("mypolicy/insert_no_z_progress_recovery action=pose_step")
+                        # Try pose increment to break static friction
+                        self._move_z_relative(0.001, speed=0.005)
+                        probe_res = self._probe_shallow_insert(get_observation, send_feedback, target_port_name)
+                        if not probe_res["capture_ok"]:
+                            if self.INSERT_SPIRAL_ENABLE:
+                                self._insert_spiral_search(get_observation, send_feedback, 0.0, probe_res["max_delta"], target_port_name, reason="no_z_progress")
+                        stalled_cycles = 0
+                else:
+                    stalled_cycles = 0
+                inserted_depth = new_depth
+                
+            if inserted_depth >= max_depth:
+                self._motion_servo.stop()
+                verify_ok = self._verify_inserted_state(get_observation, send_feedback, target_port_name)
+                if verify_ok:
+                    send_feedback(
+                        f"mypolicy/insert_success "
+                        f"depth={inserted_depth*1000:.1f}mm verified=true"
+                    )
+                    return True
+                else:
+                    send_feedback("mypolicy/insert_false_success_prevented reason=visual_verify_failed")
+                    if retries < max_retries:
+                        retries += 1
+                        # Backoff and retry
+                        backoff = float(self.INSERT_SPIRAL_BACKOFF_M)
+                        self._insert_backoff(inserted_depth + backoff)
+                        if self.INSERT_SPIRAL_ENABLE:
+                            self._insert_spiral_search(get_observation, send_feedback, 0.0, 0.0, target_port_name, reason="verify_failed")
+                        
+                        force_baseline = self._sample_insert_force_baseline(get_observation, duration_s=float(self.INSERT_BASELINE_DURATION_S), sample_period_s=0.02)
+                        baseline_mag = float(np.linalg.norm(force_baseline))
+                        send_feedback(f"mypolicy/insert_force_baseline mag={baseline_mag:.2f}N (resampled after verify fail)")
+                        
+                        cur_pose = self._motion_servo.get_current_pose()
+                        if cur_pose is not None:
+                            start_z = float(cur_pose.position.z)
+                        inserted_depth = 0.0
+                        jam_count = 0
+                        max_delta_seen = 0.0
+                        funnel_xy_total = [0.0, 0.0]
+                        continue
+                    else:
+                        send_feedback("mypolicy/insert_fail max_retries_exceeded")
+                        return False
+
+        self._motion_servo.stop()
+        send_feedback("mypolicy/insert_fail unknown")
+        return False

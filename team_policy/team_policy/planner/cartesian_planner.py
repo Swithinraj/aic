@@ -3,12 +3,13 @@ from typing import List
 
 from geometry_msgs.msg import Pose
 
-from team_policy.planner.search_backend import run_search
+from team_policy.planner.search_backend import run_search, run_direct_path
 
 
 @dataclass
 class PlannerConfig:
-    clearance_z: float = 0.40 #adding z-cearence for moving between two poses
+    use_clearance: bool = False
+    clearance_z: float = 0.0 # adding z-clearance for moving between two poses
     workspace_min_x: float = -0.70
     workspace_max_x: float = 0.10
     workspace_min_y: float = -0.40
@@ -23,14 +24,22 @@ class CartesianPlanner:
         self.config = config or PlannerConfig()
 
     def plan_from_current_pose(self, current_pose: Pose, target_pose: Pose) -> List[Pose]:
-        return run_search(
+        workspace_bounds = {
+            "x": (self.config.workspace_min_x, self.config.workspace_max_x),
+            "y": (self.config.workspace_min_y, self.config.workspace_max_y),
+            "z": (self.config.workspace_min_z, self.config.workspace_max_z),
+        }
+        if self.config.use_clearance:
+            return run_search(
+                start_pose=current_pose,
+                goal_pose=target_pose,
+                clearance_z=self.config.clearance_z,
+                workspace_bounds=workspace_bounds,
+                max_segment_length=self.config.max_segment_length,
+            )
+        return run_direct_path(
             start_pose=current_pose,
             goal_pose=target_pose,
-            clearance_z=self.config.clearance_z,
-            workspace_bounds={
-                "x": (self.config.workspace_min_x, self.config.workspace_max_x),
-                "y": (self.config.workspace_min_y, self.config.workspace_max_y),
-                "z": (self.config.workspace_min_z, self.config.workspace_max_z),
-            },
+            workspace_bounds=workspace_bounds,
             max_segment_length=self.config.max_segment_length,
         )

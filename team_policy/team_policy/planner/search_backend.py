@@ -24,6 +24,17 @@ def run_search(
     return densify_waypoints(coarse_waypoints, max_segment_length=max_segment_length)
 
 
+def run_direct_path(
+    start_pose: Pose,
+    goal_pose: Pose,
+    workspace_bounds: Bounds,
+    max_segment_length: float = 0.05,
+) -> List[Pose]:
+    clamped_start = clamp_pose(start_pose, workspace_bounds)
+    clamped_goal = clamp_pose(goal_pose, workspace_bounds)
+    return densify_waypoints([clamped_start, clamped_goal], max_segment_length)
+
+
 def build_clearance_waypoints(
     start_pose: Pose,
     goal_pose: Pose,
