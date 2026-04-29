@@ -12,6 +12,7 @@ axis-angle rotation diff) for the 6-D Cartesian twist action space.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -22,7 +23,17 @@ import numpy as np
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 CONTACT_FORCE_THRESHOLD_N = 0.5
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
+
+# Episode rejection thresholds (pass None to skip a check)
+# SFP and SC connectors have different acceptable final-error ranges.
+DEFAULT_MAX_FINAL_ERROR_M: dict = {
+    "sfp_port":  0.003,   # 3 mm — SFP rails guide the connector well
+    "sc_port":   0.010,   # 10 mm — SC spring-latch, more tolerance needed
+    "default":   0.015,   # fallback for unknown port types
+}
+DEFAULT_MAX_SUSTAINED_FORCE_DURATION_S: float = 0.5   # reject if >20N held >0.5s
+FORCE_PENALTY_N: float = 20.0   # competition penalty threshold
 
 
 def _quat_normalize(q: np.ndarray) -> np.ndarray:
@@ -74,7 +85,12 @@ def _pose_delta(current_pose: np.ndarray, target_pose: np.ndarray) -> np.ndarray
 
 
 def _compute_target_velocity_actions(cmd_poses: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
-    """Finite-difference expert commanded poses into 6D velocity-like actions."""
+    """Finite-difference expert commanded poses into 6D velocity-like actions.
+
+    The last frame is set to zero: the episode has ended so commanded velocity is zero.
+    Copying velocities[-2] (the old behaviour) was wrong — it propagated motion into the
+    terminal state, teaching the model to keep moving after insertion is complete.
+    """
     T = cmd_poses.shape[0]
     velocities = np.zeros((T, 6), dtype=np.float32)
     valid = np.any(cmd_poses, axis=1)
@@ -88,8 +104,7 @@ def _compute_target_velocity_actions(cmd_poses: np.ndarray, timestamps: np.ndarr
         delta = _pose_delta(cmd_poses[i], cmd_poses[i + 1])
         velocities[i] = delta / dt
 
-    if T > 1:
-        velocities[-1] = velocities[-2]
+    # Last frame: episode is done — leave as zeros (no motion commanded).
     return velocities
 
 
@@ -133,6 +148,7 @@ class EpisodeRecorder:
         os.makedirs(output_dir, exist_ok=True)
         self._current: Optional[Episode] = None
         self._last_commanded_pose: Optional[np.ndarray] = None
+        self._commanded_pose_lock = threading.Lock()   # guards _last_commanded_pose
         self._hf = None                              # open h5py.File during an episode
         self._partial_path: Optional[str] = None
         self._final_path: Optional[str] = None
@@ -168,7 +184,8 @@ class EpisodeRecorder:
             port_name=port_name,
             start_time=time.time(),
         )
-        self._last_commanded_pose = None
+        with self._commanded_pose_lock:
+            self._last_commanded_pose = None
 
         self._final_path = os.path.join(self._output_dir, f"episode_{episode_id:05d}.hdf5")
         self._partial_path = self._final_path + ".partial"
@@ -180,7 +197,8 @@ class EpisodeRecorder:
 
     def update_commanded_pose(self, pose: np.ndarray) -> None:
         """Call this every time CheatCode sends a move_robot command."""
-        self._last_commanded_pose = pose.copy()
+        with self._commanded_pose_lock:
+            self._last_commanded_pose = pose.copy()
 
     def set_privileged_tf_frame_pairs(self, frame_pairs: List[str]) -> None:
         """Declare the selected TF snapshot fields for the current episode."""
@@ -244,6 +262,13 @@ class EpisodeRecorder:
         js = obs.joint_states
         w = obs.wrist_wrench.wrench
 
+        with self._commanded_pose_lock:
+            cmd_pose_snapshot = (
+                self._last_commanded_pose.copy()
+                if self._last_commanded_pose is not None
+                else None
+            )
+
         frame = Frame(
             timestamp=time.time(),
             task_id=self._current.task_id,
@@ -265,13 +290,27 @@ class EpisodeRecorder:
             relative_pose=None if relative_pose is None else np.asarray(relative_pose, dtype=np.float32).copy(),
             privileged_tf=None if privileged_tf is None else np.asarray(privileged_tf, dtype=np.float32).copy(),
             privileged_tf_valid=None if privileged_tf_valid is None else np.asarray(privileged_tf_valid, dtype=np.bool_).copy(),
-            commanded_pose=self._last_commanded_pose,
+            commanded_pose=cmd_pose_snapshot,
             yolo_port_xyz=None if yolo_port_xyz is None else np.asarray(yolo_port_xyz, dtype=np.float32).copy(),
         )
         self._current.frames.append(frame)
 
-    def end_episode(self, success: bool) -> Optional[str]:
-        """Finalise, save to HDF5, return path or None if discarded."""
+    def end_episode(
+        self,
+        success: bool,
+        max_final_error_m: Optional[float] = None,
+        max_sustained_force_duration_s: Optional[float] = DEFAULT_MAX_SUSTAINED_FORCE_DURATION_S,
+        force_baseline_n: float = 0.0,
+    ) -> Optional[str]:
+        """Finalise, save to HDF5, return path or None if discarded.
+
+        Quality gates (pass None to skip):
+          max_final_error_m              — reject if final plug-to-port distance exceeds this
+          max_sustained_force_duration_s — reject if contact force > FORCE_PENALTY_N sustained > this long
+          force_baseline_n               — resting F/T reading to subtract before the force gate
+                                           (gripper + cable weight). Measure at episode start with
+                                           the robot stationary. Default 0 = use raw readings.
+        """
         if self._current is None or self._hf is None:
             return None
 
@@ -279,13 +318,61 @@ class EpisodeRecorder:
         ep.success = success
         ep.end_time = time.time()
 
+        reject_reason: Optional[str] = None
+
         if len(ep.frames) < 10:
+            reject_reason = f"too_short ({len(ep.frames)} frames)"
+        else:
+            frames = ep.frames
+            T = len(frames)
+            timestamps = np.array([f.timestamp for f in frames], dtype=np.float64)
+            wrist_forces = np.stack([f.wrist_force for f in frames])
+            # Contact force = raw magnitude minus resting baseline (gripper/cable weight).
+            raw_force_mag = np.linalg.norm(wrist_forces[:, :3], axis=1)
+            contact_force = np.maximum(0.0, raw_force_mag - force_baseline_n)
+            force_mag = contact_force   # used for all force metrics below
+
+            # --- Force penalty quality gate ---
+            if max_sustained_force_duration_s is not None:
+                above = contact_force > FORCE_PENALTY_N
+                if above.any() and T > 1:
+                    dt = np.diff(timestamps)
+                    dt_full = np.append(dt, np.median(dt))
+                    penalty_duration = float(dt_full[above].sum())
+                    if penalty_duration > max_sustained_force_duration_s:
+                        reject_reason = (
+                            f"force_penalty ({penalty_duration:.2f}s > "
+                            f"{max_sustained_force_duration_s}s contact force > {FORCE_PENALTY_N}N, "
+                            f"baseline={force_baseline_n:.1f}N)"
+                        )
+
+            # --- Final-error quality gate ---
+            if reject_reason is None and max_final_error_m is not None:
+                relative_valid = np.array(
+                    [f.relative_pose is not None for f in frames], dtype=np.bool_
+                )
+                valid_indices = np.flatnonzero(relative_valid)
+                if valid_indices.size:
+                    relative_poses = np.stack([
+                        f.relative_pose if f.relative_pose is not None
+                        else np.zeros(7, dtype=np.float32)
+                        for f in frames
+                    ])
+                    final_err = float(
+                        np.linalg.norm(relative_poses[valid_indices[-1], :3])
+                    )
+                    if final_err > max_final_error_m:
+                        reject_reason = (
+                            f"final_error ({final_err:.4f}m > {max_final_error_m}m)"
+                        )
+
+        if reject_reason is not None:
             self._abort_current()
             return None
 
         assert self._partial_path is not None and self._final_path is not None
         try:
-            self._write_state_and_metadata(ep)
+            self._write_state_and_metadata(ep, force_baseline_n=force_baseline_n)
             self._hf.close()
             os.replace(self._partial_path, self._final_path)
             saved_path = self._final_path
@@ -319,7 +406,7 @@ class EpisodeRecorder:
         self._final_path = None
         self._img_ds = {}
 
-    def _write_state_and_metadata(self, ep: Episode) -> None:
+    def _write_state_and_metadata(self, ep: Episode, force_baseline_n: float = 0.0) -> None:
         """Write state/action/metadata into the already-open HDF5 file."""
         import h5py
 
@@ -364,8 +451,11 @@ class EpisodeRecorder:
         ])
         velocity_actions = _compute_target_velocity_actions(cmd_poses, timestamps)
 
-        force_mag = np.linalg.norm(wrist_forces[:, :3], axis=1)
-        max_force = float(force_mag.max()) if T else 0.0
+        raw_force_mag = np.linalg.norm(wrist_forces[:, :3], axis=1)
+        # All force metrics stored in metadata use baseline-subtracted contact force,
+        # matching the competition scoring which evaluates tared force only.
+        contact_force = np.maximum(0.0, raw_force_mag - force_baseline_n)
+        max_force = float(contact_force.max()) if T else 0.0
         if T > 1:
             dt = np.diff(timestamps)
             median_dt = float(np.median(dt)) if dt.size else 0.0
@@ -374,14 +464,23 @@ class EpisodeRecorder:
         else:
             frame_dt = np.zeros(T, dtype=np.float64)
             insertion_time = 0.0
-        contact_mask = force_mag > CONTACT_FORCE_THRESHOLD_N
+        contact_mask = contact_force > CONTACT_FORCE_THRESHOLD_N
         contact_duration = float(frame_dt[contact_mask].sum()) if T else 0.0
+        penalty_mask = contact_force > FORCE_PENALTY_N
+        sustained_penalty_duration = float(frame_dt[penalty_mask].sum()) if T else 0.0
+        force_mag = contact_force  # alias used below for consistency
         valid_rel_indices = np.flatnonzero(relative_valid)
         final_error = (
             float(np.linalg.norm(relative_poses[valid_rel_indices[-1], :3]))
             if valid_rel_indices.size
             else float("nan")
         )
+        yolo_port_valid = np.array([f.yolo_port_xyz is not None for f in ep.frames], dtype=np.bool_)
+        yolo_port_xyz   = np.stack([
+            f.yolo_port_xyz if f.yolo_port_xyz is not None else np.zeros(3, dtype=np.float32)
+            for f in ep.frames
+        ])
+        yolo_valid_fraction = float(yolo_port_valid.mean()) if T else 0.0
 
         obs = self._hf.require_group("observations")
         obs.create_dataset("task_id", data=np.asarray(task_ids, dtype=h5py.string_dtype(encoding="utf-8")))
@@ -394,11 +493,6 @@ class EpisodeRecorder:
         obs.create_dataset("timestamps",      data=timestamps)
         obs.create_dataset("relative_pose",       data=relative_poses)
         obs.create_dataset("relative_pose_valid", data=relative_valid)
-        yolo_port_valid = np.array([f.yolo_port_xyz is not None for f in ep.frames], dtype=np.bool_)
-        yolo_port_xyz   = np.stack([
-            f.yolo_port_xyz if f.yolo_port_xyz is not None else np.zeros(3, dtype=np.float32)
-            for f in ep.frames
-        ])
         obs.create_dataset("yolo_port_xyz",   data=yolo_port_xyz)
         obs.create_dataset("yolo_port_valid", data=yolo_port_valid)
         tf_group = obs.create_group("privileged_tf")
@@ -428,3 +522,7 @@ class EpisodeRecorder:
         meta.attrs["insertion_time"] = insertion_time
         meta.attrs["contact_duration"] = contact_duration
         meta.attrs["contact_force_threshold_n"] = CONTACT_FORCE_THRESHOLD_N
+        meta.attrs["sustained_penalty_duration_s"] = sustained_penalty_duration
+        meta.attrs["force_penalty_threshold_n"] = FORCE_PENALTY_N
+        meta.attrs["force_baseline_n"] = force_baseline_n
+        meta.attrs["yolo_valid_fraction"] = yolo_valid_fraction

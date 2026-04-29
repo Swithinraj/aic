@@ -100,10 +100,11 @@ At 10 Hz, for every timestep:
 | Wrist force/torque | (T, 6) | F/T sensor readings |
 | Delta action | (T, 6) | What CheatCode commanded — this is the training label |
 
-**33D robot state vector used for training:**
+**30D robot state vector used for training:**
 ```
-tcp_pose(7) + tcp_velocity(6) + tcp_error(6) + joint_positions(7) + joint_velocity(7) = 33
+tcp_pose(7) + tcp_velocity(6) + joint_positions(7) + joint_velocity(7) + port_xyz(3) = 30
 ```
+`port_xyz` is the port position in `base_link` — from YOLO at inference, from GT+noise fallback for old episodes.
 
 ### The policy: ACT (Action Chunking with Transformers)
 
@@ -113,7 +114,7 @@ At each 10 Hz step:
   Inputs
   ------
   3x camera images  -->  ResNet-18 encoder  -->  image feature tokens
-  33D robot state   -->  linear projection  -->  state token
+  30D robot state   -->  linear projection  -->  state token
 
   Transformer encoder-decoder
   ---------------------------
@@ -151,7 +152,7 @@ episodes/merged/
 lerobot_datasets/aic_dataset_v1/
   |
   |  lerobot-train (ACT)
-  |  Input:  3x images + 33D state
+  |  Input:  3x images + 30D state
   |  Output: 100 x 6D delta actions
   |  100k gradient steps, checkpoints every 20k
   v
@@ -227,7 +228,7 @@ No node with name 'aic_model' found. Retrying...
 
 
 
-#### Terminal 2 — Start CheatCode Collector
+#### Terminal 2 — Start CheatCode Collector + YOLO
 
 ```bash
 export AIC_ROOT=$(git rev-parse --show-toplevel)
@@ -239,30 +240,16 @@ export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
 cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
   -p use_sim_time:=true \
   -p policy:=team_policy.training_robot.cheatcode_collector \
-  -p output_dir:="$OUTPUT_DIR" \
-  -p num_episodes:=3 \
-  -p success_only:=true
+  -p output_dir:="$OUTPUT_DIR"
 ```
 
-```bash
-
-from yolo
-
-export FASTRTPS_DEFAULT_PROFILES_FILE=~/ros2_ws/src/aic/team_policy/fastdds_no_shm.xml
-cd ~/ros2_ws/src/aic
-pixi run ros2 run aic_model aic_model --ros-args \
-    -p use_sim_time:=true \
-    -p policy:=team_policy.training_robot.cheatcode_collector \
-    -p output_dir:=/tmp/aic_dataset_fresh \
-    -p num_episodes:=200 \
-    -p success_only:=true
-```
-
-
-
+You do not need to pass `num_episodes` or `success_only`: each engine session has 3 trials, the collector defaults to `num_episodes=3`, and `success_only` defaults to `true`.
+The collector starts the YOLO planner inside the same process by default, so do not run `combined_yolo_depth_pose_planner` separately during collection.
 
 Expected output per episode:
 ```
+[INFO] Combined planner node started: YOLO + metric depth + CAD registration...
+[INFO] Embedded YOLO planner started
 [INFO] DataCollectionPolicy ready — target=3 episodes
 [INFO] collector/episode=0 port=sfp/sfp_port_0
 [INFO] [1/3] Saved .../run_001/episode_00000.hdf5
@@ -272,7 +259,7 @@ Expected output per episode:
 [INFO] [3/3] Saved .../run_001/episode_00002.hdf5
 ```
 
-Terminal 2 exits on its own after 3 episodes. Press `Ctrl+C` in Terminal 1.
+Terminal 2 finishes when the 3-trial session is done. Press `Ctrl+C` in Terminal 1.
 
 #### Next session — only two things change
 
@@ -292,9 +279,7 @@ export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
 cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
   -p use_sim_time:=true \
   -p policy:=team_policy.training_robot.cheatcode_collector \
-  -p output_dir:="$OUTPUT_DIR" \
-  -p num_episodes:=3 \
-  -p success_only:=true
+  -p output_dir:="$OUTPUT_DIR"
 ```
 
 #### Session reference
@@ -403,7 +388,7 @@ Output structure:
 ```
 lerobot_datasets/aic_dataset_v1/
   meta/
-    info.json           <- 33D state, 6D action, video feature schema
+    info.json           <- 30D state, 6D action, video feature schema
     stats.json          <- mean/std/min/max for normalisation
     tasks.parquet
     episodes/chunk-000/file-000.parquet

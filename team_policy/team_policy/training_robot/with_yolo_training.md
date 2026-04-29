@@ -1,27 +1,92 @@
-# YOLO-Guided Training Pipeline — run_003 (30D state)
+# YOLO-Guided Data Collection & Training Pipeline
 
-## Why run_003 exists
+## What this pipeline does
 
-| Run | State dim | Problem |
-|-----|-----------|---------|
-| run_001 | 33D | `tcp_error` was CheatCode ground-truth during training — near-zero at inference → robot hit the ground |
-| run_002 | 27D | No port signal — policy had no idea where the port was |
-| **run_003** | **30D** | **YOLO-detected port xyz — same signal at training and inference** |
+CheatCode (the official expert controller) performs perfect cable insertions while this pipeline records every frame: camera images, robot state, wrist forces, ground-truth TF poses, and — critically — YOLO-detected port positions. The result is a dataset where the policy can learn to insert cables using only what the real robot can see, without needing ground-truth information at inference time.
 
-**30D state breakdown:**
+### Why YOLO for port position?
+
+Ground-truth TF gives perfect port position during data collection but is unavailable on the real robot. YOLO gives the same imperfect-but-consistent signal at both training and inference time. The policy therefore learns to use a signal it will actually have, with no distribution shift between training and deployment.
+
+### Training state (30D)
+
 ```
-tcp_pose(7) + tcp_velocity(6) + joint_positions(7) + joint_velocity(7) + port_xyz(3) = 30
+tcp_pose(7)  +  tcp_velocity(6)  +  joint_positions(7)  +  joint_velocity(7)  +  port_xyz_in_base(3)
+     7               6                      7                      7                      3         = 30
 ```
-`port_xyz` = port position in `base_link` estimated by YOLO.
-During training YOLO runs live inside the sim. At inference YOLO runs on the real robot — no ground truth ever used.
+
+`port_xyz_in_base` is filled from YOLO detections during both collection and inference. If YOLO has no detection for a frame during collection, ground-truth port position + 2 cm Gaussian noise is substituted as a fallback.
+
+---
+
+## Architecture overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Terminal 1: Gazebo + aic_engine (restarts every run)   │
+│  → Runs 3 trials, then exits automatically              │
+│  → Uses session_XX.yaml to vary board pose each run     │
+└─────────────────────────┬───────────────────────────────┘
+                          │ ROS 2 topics
+┌─────────────────────────▼───────────────────────────────┐
+│  Terminal 2: cheatcode_collector + embedded YOLO         │
+│  → Starts YOLO + metric depth + CAD registration         │
+│  → Publishes /fused_yolo/detections_json internally     │
+│  → Wraps CheatCode with observation recording           │
+│  → Injects wrench compliance gains                      │
+│  → Applies quality gates, saves episode_NNNNN.hdf5      │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Terminology
+
+| Term | Meaning |
+|------|---------|
+| **Session** | One launch of `aic_engine` with one `session_XX.yaml`. Runs 3 trials automatically then exits. |
+| **Run** | One folder (`run_001`, `run_002`, …). One run = one session = up to 3 saved episodes. |
+| **Trial** | One cable insertion attempt by CheatCode. A trial may be saved or rejected by the quality gate. |
+| **Episode** | One saved `.hdf5` file = one passing trial. |
+| **Quality gate** | Automatic checks that reject bad episodes before they enter the dataset. |
+
+### Trial order in every session
+
+| Trial | Port type | Cable | Saved as |
+|-------|-----------|-------|----------|
+| 1 | SFP → NIC slot A | `sfp_sc_cable` | `episode_00000.hdf5` |
+| 2 | SFP → NIC slot B | `sfp_sc_cable` | `episode_00001.hdf5` |
+| 3 | SC fiber port | `sfp_sc_cable_reversed` | `episode_00002.hdf5` |
+
+SFP trials almost always pass (final error ~1 mm). SC trials sometimes pass, sometimes are rejected — this is normal. The quality gate is working correctly either way.
+
+---
+
+## Prerequisites
+
+Before starting, verify these are in place:
+
+```bash
+# 1. pixi is installed
+pixi --version
+
+# 2. distrobox container is built
+distrobox list | grep aic_eval
+
+# 3. YOLO model exists
+ls $(git rev-parse --show-toplevel)/.pixi/envs/default/lib/python3.12/site-packages/team_policy/models/yolov12.pt
+
+# 4. Session YAML files exist (should show 100 files)
+ls $(git rev-parse --show-toplevel)/team_policy/team_policy/training_robot/configs/sessions/ | wc -l
+```
 
 ---
 
 ## One-time setup
 
-### Environment variables
+### 1. Set environment variables
 
-Paste these in **every terminal** you open for this pipeline:
+Add these to your `~/.bashrc` so they are always available:
 
 ```bash
 export AIC_ROOT=$(git -C ~/ros2_ws/src/aic rev-parse --show-toplevel)
@@ -29,228 +94,291 @@ export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
 export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 ```
 
-### Sync source files after pixi reinstall
+Then reload: `source ~/.bashrc`
 
-Only needed after a `pixi reinstall`. Copies working files into the pixi install location:
+> **Important**: These variables must be set in the terminal where you run Terminals 2 and 3.
+> Terminal 1 (distrobox) uses **hardcoded absolute paths only** — `$TRAIN_ROOT` does not expand inside distrobox.
+
+### 2. Sync source files to pixi site-packages
+
+The collector runs from the pixi-installed copy, not the source tree. Sync after any edit or after `pixi reinstall`:
 
 ```bash
-cd $AIC_ROOT
 SITE=$AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/team_policy
-cp team_policy/team_policy/run_act.py                              $SITE/run_act.py
-cp team_policy/team_policy/training_robot/episode_recorder.py      $SITE/training_robot/episode_recorder.py
-cp team_policy/team_policy/training_robot/cheatcode_collector.py   $SITE/training_robot/cheatcode_collector.py
-cp team_policy/team_policy/training_robot/convert_to_lerobot.py    $SITE/training_robot/convert_to_lerobot.py
+cp $TRAIN_ROOT/episode_recorder.py    $SITE/training_robot/episode_recorder.py
+cp $TRAIN_ROOT/cheatcode_collector.py $SITE/training_robot/cheatcode_collector.py
+cp $TRAIN_ROOT/convert_to_lerobot.py  $SITE/training_robot/convert_to_lerobot.py
+cp $AIC_ROOT/team_policy/team_policy/run_act.py $SITE/run_act.py
 ```
 
-### Open a pixi shell
-
-Run all subsequent commands from inside a pixi shell — this avoids triggering a package rebuild on every command:
-
+Verify the sync worked:
 ```bash
-cd $AIC_ROOT
-pixi shell
+python3 -c "from team_policy.training_robot.episode_recorder import SCHEMA_VERSION; print('schema:', SCHEMA_VERSION)"
+# Expected: schema: 5
 ```
 
 ---
 
 ## Step 1 — Collect episodes
 
-**Target: 200 episodes** saved to `$TRAIN_ROOT/episodes/run_003/`
-
-### How a session works
-
-One run of `aic_engine` = **one session** = **3 trials**:
-- Trial 1: SFP NIC insertion
-- Trial 2: SFP NIC insertion
-- Trial 3: SC fiber insertion
-
-After trial 3, `aic_engine` exits automatically. You then restart the sim and collector and run the next session. YOLO stays running the whole time.
-
-You need **3 terminals** open, all with the env vars set and inside `pixi shell`.
+Open **2 terminals**. Set env vars in Terminal 2 before starting.
 
 ---
 
 ### Terminal 1 — Simulation
 
-**Start at the beginning of every session. Kill and restart after each session.**
+**Restart at the beginning of every run. Use a hardcoded absolute path for the session YAML.**
 
 ```bash
+# Replace session_01 with session_02, session_03, ... each run
 distrobox enter -r aic_eval -- /entrypoint.sh \
     ground_truth:=true \
     start_aic_engine:=true \
     gazebo_gui:=false \
-    launch_rviz:=false
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions/session_01.yaml
 ```
 
-Wait until you see this line before doing anything else:
+> **Why absolute path?** Environment variables like `$TRAIN_ROOT` are expanded by your shell *before* being passed to distrobox. If `$TRAIN_ROOT` is not set in the current shell (common when opening a new terminal), the path silently becomes `/configs/sessions/session_01.yaml` which does not exist, and `aic_engine` crashes without printing any useful error. Always use the full absolute path in Terminal 1.
+
+**Wait for this line before starting Terminal 2:**
 ```
 [aic_engine] No node with name 'aic_model' found. Retrying...
 ```
-This means the sim is up and waiting for a policy. Only then start Terminal 2 (first session only) and Terminal 3.
 
-> **Controller errors at startup are normal.** You will see joint controller spawner errors for the first few seconds. Ignore them — they resolve on their own. The `Retrying...` message confirms the sim is fully ready.
+What you will see before it (normal, ignore):
+```
+[joint_state_broadcaster_spawner]: Waiting for controller_manager ...
+[gz_sim]: Unable to create renderer ...
+[spawner_joint_state_broadcaster]: Controller spawner couldn't activate controllers ...
+```
+
+These errors always appear at startup. They are harmless. Only the `Retrying...` line matters.
 
 ---
 
-### Terminal 2 — YOLO planner
+### Terminal 2 — Collector + YOLO
 
-**Start once at the beginning of your first session. Leave it running for all sessions.**
-
-```bash
-ros2 run team_policy combined_yolo_depth_pose_planner
-```
-
-Wait until you see:
-```
-[yolov12_multicamera_detector]: Combined planner node started: YOLO + metric depth + CAD registration...
-```
-That line means YOLO loaded the model and is ready. **It does not print xyz to the terminal** — detections are published silently to `/fused_yolo/detections_json`. You can verify it is detecting by running `ros2 topic echo /fused_yolo/detections_json` in a spare terminal, but you do not need to do this every session.
-
-Once you see "Combined planner node started", proceed to Terminal 3.
-
-> Always use `combined_yolo_depth_pose_planner` — **not** `yolov12_detector`.
-> Only the combined node fuses depth + YOLO and publishes 3D port positions in `base_link`.
-> The collector subscribes to `/fused_yolo/detections_json` which only this node publishes.
-
----
-
-### Terminal 3 — Collector (CheatCode + recorder)
-
-**Start at the beginning of every session. Kill and restart after each session.**
+**Restart at the beginning of every run. Increment the run number each time.**
 
 ```bash
-ros2 run aic_model aic_model --ros-args \
+# Run 1
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.training_robot.cheatcode_collector \
-    -p output_dir:=$TRAIN_ROOT/episodes/run_003
+    -p output_dir:=$TRAIN_ROOT/episodes/run_001
 ```
 
-Expected output when it connects and starts:
+Change `run_001` → `run_002` → `run_003` … for each new session.
+
+You do not need to pass `num_episodes` or `success_only` here. The collector defaults to 3 episodes per run, and `success_only` defaults to `true`.
+The collector starts the YOLO planner inside the same process by default, so do not run `combined_yolo_depth_pose_planner` separately during collection.
+
+**Expected output on startup:**
 ```
-[INFO] DataCollectionPolicy ready — target=50 episodes, output=.../episodes/run_003
+[INFO] Combined planner node started: YOLO + metric depth + CAD registration...
+[INFO] Embedded YOLO planner started
+[INFO] DataCollectionPolicy ready — target=3 episodes, output=.../episodes/run_001, success_only=True
 ```
 
-Expected output per saved trial:
+**Expected output during a run:**
 ```
-[INFO] [4/50] Saved .../episodes/run_003/episode_00004.hdf5
+[INFO] collector/episode=0 port=sfp/sfp_port_0
+[INFO] collector/episode=0 force_baseline=20.8N          ← resting F/T (gripper weight)
+[INFO] pfrac: 0.01 xy_error: 0.071 0.111  integrators: ...  ← CheatCode approaching
+[INFO] [1/3] Saved .../run_001/episode_00000.hdf5        ← episode passed all gates
+
+[INFO] collector/episode=1 port=sfp/sfp_port_0
+...
+[INFO] [2/3] Saved .../run_001/episode_00001.hdf5
+
+[INFO] collector/episode=2 port=sc/sc_port_base
+...
+[INFO] [3/3] Saved .../run_001/episode_00002.hdf5        ← SC also saved (if quality gate passes)
 ```
 
-If a trial fails (CheatCode couldn't insert), you will see:
+**If an episode is rejected:**
 ```
+collector/episode=N rejected by quality gate — discarded (port=sc_port_base max_err=0.010m ...)
 collector/episode=N FAILED — discarded
+collector/episode=N too short — discarded
 ```
-Failed episodes are **not saved** — only successful insertions are kept. This is by design (`success_only=True`).
+
+Rejected episodes are never written to disk. The collector continues to the next trial automatically.
 
 ---
 
-### After 3 trials — end of session
+### Quality gates — what gets rejected and why
 
-When the engine finishes trial 3 it exits on its own. You will see Gazebo physics cleanup messages in Terminal 1 — **this is normal, not an error.**
+Every episode must pass all three checks before it is saved:
 
-**Steps to end a session and start the next one:**
+| Gate | SFP threshold | SC threshold | What triggers rejection |
+|------|--------------|-------------|------------------------|
+| **Minimum frames** | 10 frames | 10 frames | CheatCode crashed or timed out immediately |
+| **Final insertion error** | < 3 mm | < 10 mm | Plug tip was not at port at end of trial |
+| **Sustained contact force** | < 20 N for < 0.5 s | < 20 N for < 0.5 s | Robot pushed hard against something for too long |
 
-1. `Ctrl+C` in Terminal 3 (collector exits on its own, but Ctrl+C is safe)
-2. `Ctrl+C` in Terminal 1 (kills the sim — Gazebo may already have printed cleanup messages)
-3. Check how many episodes you have so far:
+Force measurements are **baseline-subtracted**: the resting F/T reading (~20–21 N from gripper + cable weight) is measured at the start of each episode and subtracted from all force values. "Contact force 0.5 N" means 0.5 N above the resting baseline, not 0.5 N absolute.
+
+YOLO coverage (`yolo_valid_fraction`) is recorded but does **not** gate episode saving. An episode can be saved even if YOLO had 0% coverage (the GT+noise fallback is used during training).
+
+---
+
+### After 3 trials — end-of-run checklist
+
+The engine exits automatically after trial 3. You will see Gazebo cleanup messages in Terminal 1.
+
+1. Wait for Terminal 2 to finish the session or stop printing new collector messages after trial 3
+2. `Ctrl+C` Terminal 1
+3. Verify what was saved:
    ```bash
-   ls $TRAIN_ROOT/episodes/run_003/*.hdf5 | wc -l
+   ls -lh $TRAIN_ROOT/episodes/run_001/
    ```
-4. Relaunch Terminal 1 — wait for `Retrying...`
-5. Relaunch Terminal 3 — the collector resumes from where it left off automatically
-6. Terminal 2 (YOLO) keeps running — **do not restart it**
-
-Repeat until you have 200 episodes.
+4. Restart Terminal 1 with the **next** session YAML (`session_02.yaml`)
+5. Wait for `Retrying...`
+6. Restart Terminal 2 with the **next** run folder (`run_002`)
 
 ---
 
-### Tracking progress
+### Check episode quality at any time
+
+Run this command to inspect all saved episodes across all runs:
 
 ```bash
-ls $TRAIN_ROOT/episodes/run_003/*.hdf5 | wc -l
+cd $AIC_ROOT && pixi run python3 -c "
+import h5py, numpy as np, pathlib
+
+base = pathlib.Path('team_policy/team_policy/training_robot/episodes')
+runs = sorted(base.glob('run_*'))
+total = 0
+for run in runs:
+    eps = sorted(run.glob('episode_*.hdf5'))
+    if not eps: continue
+    print(f'\n=== {run.name} ({len(eps)} eps) ===')
+    for ep in eps:
+        with h5py.File(ep) as f:
+            m = f['metadata']
+            port_t = m.attrs.get('port_type','?')
+            port   = m.attrs.get('port_name','?')
+            frames = f['observations/tcp_pose'].shape[0]
+            err    = m.attrs.get('final_error', float('nan'))
+            force  = m.attrs.get('max_force', float('nan'))
+            sust   = m.attrs.get('sustained_penalty_duration_s', float('nan'))
+            yolo   = m.attrs.get('yolo_valid_fraction', float('nan'))
+            ok     = '✓' if m.attrs.get('success',0) else '✗'
+            print(f'  {ok} {ep.name}  {port_t}/{port:<14} frames={frames:3d}  err={err*1000:4.1f}mm  force={force:.2f}N  sust={sust:.2f}s  yolo={yolo:.0%}')
+            total += 1
+print(f'\nTotal saved: {total} episodes across {len(runs)} runs')
+"
 ```
 
-Each session gives you up to 3 episodes (one per successful trial). Sessions where CheatCode fails a trial give fewer. Typical pace: **2–3 episodes per session**, so expect ~70–100 sessions for 200 episodes.
+**What good episodes look like:**
+```
+✓ episode_00000.hdf5  sfp/sfp_port_0   frames=447  err= 1.1mm  force=0.38N  sust=0.00s  yolo=100%
+✓ episode_00001.hdf5  sfp/sfp_port_0   frames=492  err= 1.1mm  force=0.28N  sust=0.00s  yolo=100%
+✓ episode_00002.hdf5  sc/sc_port_base  frames=496  err= 0.6mm  force=1.88N  sust=0.00s  yolo=100%
+```
 
 ---
 
-### What YOLO coverage looks like (good vs bad)
+### Session YAML files — why they exist
 
-While the collector is running, YOLO-detected xyz is recorded per frame. When you later convert (Step 2), it reports coverage per episode:
+The 100 YAML files in `configs/sessions/` vary the task board's x, y, and yaw position across sessions. This forces the policy to learn to use YOLO (since port position changes every session), not just memorize a fixed insertion trajectory.
 
-```
-yolo_port_xyz: 90%+ frames detected by YOLO   ← good — keep this episode
-yolo_port_xyz: no YOLO recorded — using GT+noise fallback  ← YOLO was not running
-```
+Each session file:
+- Fixes the board at one pose for all 3 trials within that session (so CheatCode always sees a consistent scene)
+- Uses a different pose than every other session (so the training dataset covers a wide range of board positions)
 
-If you see many episodes with low YOLO coverage it means YOLO was not running when you collected those episodes. Recollect them (or run Step 2 with `--success_only` to drop them).
+Session 1 through 50 are sufficient for a first training run (~100 quality episodes). Sessions 51–100 add diversity for a stronger model.
 
 ---
 
-## Step 2 — Convert to LeRobot dataset
+### Normal visual artifacts in Gazebo
 
-Run this once you have 200 episodes (or whenever you want to check a partial dataset):
+**Cable "in the air"**
+The SFP-SC cable has one end attached to the gripper (the plug being inserted) and one free end. The free end hangs from the gripper in a loop or sometimes gets flung to the side during physics initialization. This is normal and does not affect data quality — CheatCode uses TF poses, not cable positions, to control the arm.
+
+**No NIC card visible**
+Trial 3 (SC insertion) has no NIC cards in the scene — this is correct. NIC cards are only present in trials 1 and 2. If you see no NIC card at the start of what you think is trial 1, check whether trials 1 and 2 already completed while you were watching.
+
+**Pink/magenta bounding box on the board**
+A Gazebo visualization panel is open. Close it with the X in the Gazebo side panel — it uses GPU bandwidth but does not affect the simulation.
+
+**Board at a steep angle**
+Each session YAML sets a different yaw for the board. Some sessions have the board nearly sideways from the camera perspective. This is intentional — it provides training diversity.
+
+---
+
+## Step 2 — Merge all runs into one folder
+
+Before converting, merge all run folders into a single folder using symlinks (no data is copied):
+
+```bash
+MERGED=$TRAIN_ROOT/episodes/all
+rm -rf "$MERGED" && mkdir -p "$MERGED"
+N=0
+for f in $(ls $TRAIN_ROOT/episodes/run_*/*.hdf5 | sort); do
+    ln -s "$f" "$MERGED/episode_$(printf '%05d' $N).hdf5"
+    N=$((N+1))
+done
+echo "Total episodes merged: $N"
+```
+
+---
+
+## Step 3 — Convert to LeRobot dataset
 
 ```bash
 cd $AIC_ROOT
 pixi run python -m team_policy.training_robot.convert_to_lerobot \
-    --input  $TRAIN_ROOT/episodes/run_003 \
-    --output $TRAIN_ROOT/lerobot_datasets/aic_act_run_003 \
+    --input  $TRAIN_ROOT/episodes/all \
+    --output $TRAIN_ROOT/lerobot_datasets/aic_act_yolo_v1 \
     --success_only
 ```
 
-Expected final output:
-```
-Done — 200 episodes, XXXXX frames → .../lerobot_datasets/aic_act_run_003
-state: 30D (tcp_pose 7 + tcp_vel 6 + joint_pos 7 + joint_vel 7 + port_xyz 3)
-```
-
-> **Do not mix run_003 with run_001 or run_002 datasets.** The state dimensions are different and the normalizer stats are incompatible.
+The converter:
+- Builds a 30D state vector: `tcp_pose(7) + tcp_vel(6) + joint_pos(7) + joint_vel(7) + port_xyz(3)`
+- Fills `port_xyz` from `observations/yolo_port_xyz` (real YOLO) or GT+noise fallback for frames where YOLO had no detection
+- Writes LeRobot-format Parquet files and video-encoded camera observations
 
 ---
 
-## Step 3 — Train
+## Step 4 — Train
 
 Run inside `tmux` so training survives closing the terminal:
 
 ```bash
 tmux new -s training
-# Detach: Ctrl+B then D
-# Reattach later: tmux attach -t training
+# Detach any time: Ctrl+B then D
+# Reattach:        tmux attach -t training
 ```
 
 ```bash
 cd $AIC_ROOT
 pixi run lerobot-train \
-    --dataset.repo_id=local/aic_act_run_003 \
-    --dataset.root=$TRAIN_ROOT/lerobot_datasets/aic_act_run_003 \
+    --dataset.repo_id=local/aic_act_yolo_v1 \
+    --dataset.root=$TRAIN_ROOT/lerobot_datasets/aic_act_yolo_v1 \
     --policy.type=act \
     --policy.push_to_hub=false \
-    --output_dir=outputs/train/aic_act_run_003 \
-    --job_name=aic_act_run_003 \
+    --output_dir=outputs/train/aic_act_yolo_v1 \
+    --job_name=aic_act_yolo_v1 \
     --policy.device=cuda \
     --wandb.enable=false \
     --steps=100000 \
     --save_freq=20000
 ```
 
-Checkpoints are saved every 20k steps:
-```
-outputs/train/aic_act_run_003/checkpoints/
-  020000/pretrained_model/
-  040000/pretrained_model/
-  060000/pretrained_model/
-  080000/pretrained_model/
-  100000/pretrained_model/   ← use this for inference
-```
+Checkpoints are saved every 20k steps at `outputs/train/aic_act_yolo_v1/checkpoints/XXXXXX/pretrained_model/`.
+
+**When to stop**: Monitor training loss. For 100 episodes, loss typically plateaus around 80–100k steps. For 300 episodes, train to 150–200k steps.
 
 ---
 
-## Step 4 — Run inference
+## Step 5 — Run inference
 
-Open 3 terminals. Set env vars and enter `pixi shell` in each.
+Open 3 terminals. Set env vars before starting.
 
-**Terminal 1 — Simulation (no ground truth this time)**
-
+**Terminal 1 — Simulation (no ground truth at inference)**
 ```bash
 distrobox enter -r aic_eval -- /entrypoint.sh \
     ground_truth:=false \
@@ -260,73 +388,133 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
 ```
 
 **Terminal 2 — YOLO planner**
-
 ```bash
-ros2 run team_policy combined_yolo_depth_pose_planner
+cd $AIC_ROOT && pixi run ros2 run team_policy combined_yolo_depth_pose_planner
 ```
-
-Wait for "Combined planner node started" in the output, then start Terminal 3.
 
 **Terminal 3 — ACT policy**
-
 ```bash
-export CKPT=$AIC_ROOT/outputs/train/aic_act_run_003/checkpoints/100000/pretrained_model
-
-ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.run_act \
-    -p checkpoint_path:="$CKPT"
+    -p checkpoint_path:=$AIC_ROOT/outputs/train/aic_act_yolo_v1/checkpoints/100000/pretrained_model
 ```
 
-Watch Terminal 3 for:
-```
-port_xyz=[x.xxx, y.xxx, z.xxx]   ← YOLO feeding port position correctly
-port_xyz=[0.0, 0.0, 0.0]         ← YOLO not detecting — check Terminal 2
-```
+> **After any edit to `run_act.py`**, sync it before running inference:
+> ```bash
+> cp $AIC_ROOT/team_policy/team_policy/run_act.py \
+>    $AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/team_policy/run_act.py
+> ```
 
 ---
 
 ## Folder layout
 
 ```
-team_policy/team_policy/training_robot/
-  episodes/
-    run_001/   ← old 33D data — do not use
-    run_002/   ← old 27D data — do not use
-    run_003/   ← current 30D YOLO data ★
-      episode_00000.hdf5
-      episode_00001.hdf5
+<repo_root>/
+  team_policy/team_policy/training_robot/
+    configs/
+      sessions/
+        session_01.yaml   ← board pose variant 1 of 100
+        session_02.yaml
+        ...
+        session_100.yaml
+    episodes/
+      run_001/            ← up to 3 episodes from session 1
+        episode_00000.hdf5
+        episode_00001.hdf5
+        episode_00002.hdf5   (SC, if quality gate passed)
+      run_002/
       ...
-  lerobot_datasets/
-    aic_act_run_003/   ← converted LeRobot dataset ★
+      all/                ← symlinks to all episodes, created before Step 3
+    lerobot_datasets/
+      aic_act_yolo_v1/    ← LeRobot format, created by Step 3
+    episode_recorder.py   ← records observations, applies quality gates
+    cheatcode_collector.py ← wraps CheatCode, drives the collection loop
+    convert_to_lerobot.py  ← HDF5 → LeRobot dataset
 
-outputs/train/
-  aic_act_run_003/
-    checkpoints/
-      100000/pretrained_model/   ← checkpoint to deploy
+  outputs/train/
+    aic_act_yolo_v1/
+      checkpoints/
+        020000/pretrained_model/
+        040000/pretrained_model/
+        ...
+        100000/pretrained_model/   ← use this for inference
 ```
 
 ---
 
-## Common issues
+## HDF5 episode structure
 
-**Controller spawner errors at sim startup**
-Normal. Wait for `Retrying...` — that is the only signal that matters.
+Each `.hdf5` file contains:
 
-**`port_xyz=[0.0, 0.0, 0.0]` during collection or inference**
-YOLO planner is not detecting the port. Check Terminal 2 is printing detections. If not, restart Terminal 2.
+```
+observations/
+  tcp_pose          (T, 7)   — end-effector pose [x,y,z,qx,qy,qz,qw] in base_link
+  tcp_velocity      (T, 6)   — end-effector velocity [vx,vy,vz,wx,wy,wz]
+  joint_positions   (T, 7)   — joint angles [rad]
+  joint_velocity    (T, 7)   — joint velocities [rad/s]
+  wrist_force       (T, 6)   — F/T sensor [fx,fy,fz,tx,ty,tz]
+  tcp_error         (T, 6)   — controller tracking error (near-zero; NOT GT distance)
+  relative_pose     (T, 7)   — port pose in plug-tip frame (GT privileged, for analysis)
+  yolo_port_xyz     (T, 3)   — YOLO-detected port position in base_link [x,y,z]
+  yolo_port_valid   (T,)     — bool: did YOLO have a detection this frame?
+  privileged_tf/
+    transforms      (T,5,7)  — selected TF pairs for debugging
+    valid           (T,5)    — bool: was each TF available?
+    frame_pairs     (5,)     — string labels for the 5 TF pairs
+  images/
+    center          (T,H,W,3) — center camera RGB
+    left            (T,H,W,3) — left camera RGB
+    right           (T,H,W,3) — right camera RGB
 
-**Collector shows `resuming from episode 0` but files already exist**
-`$TRAIN_ROOT` is not set correctly. Verify the env vars are set in that terminal and relaunch.
+actions/
+  commanded_pose    (T, 7)   — CheatCode's target pose each step
+  delta_pose        (T, 6)   — finite difference of commanded poses (velocity-like)
+  velocity          (T, 6)   — same as delta_pose, last step = zeros
 
-**Episode count not going up after restart**
-The collector counts existing files at startup — if `output_dir` is wrong it starts from 0 and overwrites. Always double-check `$TRAIN_ROOT` is set before launching Terminal 3.
+metadata/
+  schema_version              — "5"
+  port_type / port_name       — "sfp" / "sfp_port_0" etc.
+  success                     — 1 if CheatCode reported success
+  final_error                 — plug-to-port distance [m] at end of trial
+  max_force                   — peak baseline-subtracted contact force [N]
+  sustained_penalty_duration_s — seconds above 20 N contact force
+  force_baseline_n            — resting F/T reading subtracted from all force metrics
+  yolo_valid_fraction         — fraction of frames with real YOLO detections (1.0 = perfect)
+```
 
-**`TF_OLD_DATA ignoring data from the past` flood in YOLO terminal after sim restart**
-Normal. When the sim restarts, the Gazebo clock resets to ~5 seconds. YOLO's TF buffer still holds transforms from the previous session at higher timestamps, so TF complains for a few seconds until the new sim time catches up. Ignore these — do not Ctrl+C YOLO.
+---
 
-**Gazebo cleanup messages after trial 3**
-Normal — the engine exits cleanly. Not an error.
+## Troubleshooting
 
-**`final_error` NaN or very large in convert output**
-CheatCode failed to get close to the port. Episode is still valid data unless you pass `--success_only`, which drops it.
+**`aic_engine` starts but never prints `Retrying...`**
+The session YAML path is wrong. Most common cause: `$TRAIN_ROOT` was not set in the terminal where you ran the distrobox command, so the path became empty. Always use a hardcoded absolute path in Terminal 1.
+
+**Collector exits immediately with `Reached target of N episodes`**
+The `output_dir` folder already has `.hdf5` files from a previous run. The collector counts existing files and adds to them. Either use a new `run_NNN` folder or delete the existing episodes.
+
+**`TF_OLD_DATA` spam in Terminal 2 — during restart AND during active trials**
+Normal in both cases, for different reasons:
+- **At sim restart**: The sim clock resets to 0. The YOLO node's TF buffer still has cached robot joint transforms from the previous session (e.g. timestamped at t=180s). These appear "from the future" relative to the new clock and are flushed.
+- **During active trials**: The cable physics plugin (`cable_0/link_9`, `cable_0/link_10`, `cable_0/cable_connection_1`, etc.) publishes TF slightly late relative to the main sim clock. These frames are never needed for YOLO port detection — YOLO only uses robot joint TFs to transform image detections to base_link. The cable TF lag is a Gazebo physics plugin timing issue and is completely harmless.
+
+In both cases: do not restart just because of this warning. YOLO port detection is unaffected when saved episodes show high `yolo_valid_fraction`.
+
+**All SC episodes rejected by quality gate**
+CheatCode descends a fixed 15 mm below the SC port frame origin (`sc_port_base_link`). This frame is at the housing chassis, not the optical fiber connection point, so the final insertion error is sometimes > 10 mm. Whether SC passes depends on the board pose in the session YAML. Sessions where CheatCode's fixed descent aligns well with the SC port geometry pass; others do not. This is expected. SFP episodes (which are the majority of training data) are unaffected.
+
+**Controller spawner errors at startup**
+Normal. Gazebo brings up joint controllers in stages. The spawner retries until they are ready. These errors always appear and are always harmless.
+
+**Episode count stuck — files not appearing**
+Run `echo $TRAIN_ROOT` to verify the variable is set. If empty, set it and relaunch Terminal 2.
+
+**`/fused_yolo/detections_json` looks like it contains only `task_board`**
+This is often just output truncation. That topic publishes one long JSON list and `task_board` is intentionally sorted first, so a shortened console line can hide the later `fix`, `nic_card`, `sc_port`, or `sfp_port_*` entries. Expand/copy the full JSON or check the saved episode's `yolo_valid_fraction` before assuming the other detections are missing.
+
+**Force gate rejects every episode**
+The baseline subtraction may have failed. Check the log for `force_baseline=XX.XN` — it should read 18–22 N. If it reads 0 N, the observation was not available at episode start (sim still loading). Try increasing the `time.sleep` in the baseline measurement loop in `cheatcode_collector.py`.
+
+**Gazebo performance is slow (< 50% real-time)**
+Close the Gazebo side panels (Entity tree, Component inspector, Visualize contacts). Each panel runs an additional render pass. Set `gazebo_gui:=false` in Terminal 1 if you do not need the 3D view at all — this gives the fastest collection speed.

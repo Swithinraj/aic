@@ -150,6 +150,8 @@ class RunACT(Policy):
         self._yolo_lock        = threading.Lock()
         self._port_xyz         = np.zeros(3, dtype=np.float32)  # port position in base_link
         self._target_port_name = ""                              # set in insert_cable per task
+        self._target_port_type = ""
+        self._target_module_name = ""
 
         parent_node.create_subscription(
             String, "/fused_yolo/detections_json",
@@ -177,11 +179,15 @@ class RunACT(Policy):
         except Exception:
             return
         with self._yolo_lock:
-            target = self._target_port_name.lower()
+            target_port = self._target_port_name
+            target_type = self._target_port_type
+            target_module = self._target_module_name
+        best_rank = None
+        best_conf = float("-inf")
+        best_xyz = None
         for det in dets:
-            name = str(det.get("instance_name", "")).lower()
-            cls  = str(det.get("class_name",    "")).lower()
-            if target and not (target in name or target in cls):
+            rank = self._target_match_rank(det, target_type, target_port, target_module)
+            if rank is None:
                 continue
             pose = det.get("pose_base_link", {}).get("position", {})
             if not pose:
@@ -191,9 +197,49 @@ class RunACT(Policy):
                 float(pose.get("y", 0.0)),
                 float(pose.get("z", 0.0)),
             ], dtype=np.float32)
+            conf = float(det.get("confidence", 0.0))
+            if best_rank is None or rank < best_rank or (rank == best_rank and conf > best_conf):
+                best_rank = rank
+                best_conf = conf
+                best_xyz = xyz
+        if best_xyz is not None:
             with self._yolo_lock:
-                self._port_xyz = xyz
-            return  # take first match
+                self._port_xyz = best_xyz
+
+    @staticmethod
+    def _norm_name(value: object) -> str:
+        return str(value).strip().lower()
+
+    def _target_match_rank(
+        self,
+        det: dict,
+        target_type: str,
+        target_port: str,
+        target_module: str,
+    ) -> int | None:
+        names = {
+            self._norm_name(det.get("instance_name", "")),
+            self._norm_name(det.get("class_name", "")),
+        }
+        names.discard("")
+        if not names:
+            return None
+
+        exact_aliases = {target_port} if target_port else set()
+        if target_type == "sc" and target_module:
+            exact_aliases.add(target_module)
+        if any(name in exact_aliases for name in names):
+            return 0
+
+        if target_type == "sc":
+            if any(name == "sc_port" or name.startswith("sc_port_") for name in names):
+                return 1
+
+        if target_port and any(target_port in name or name in target_port for name in names):
+            return 2
+        if target_type == "sc" and target_module and any(target_module in name or name in target_module for name in names):
+            return 3
+        return None
 
     def _img_to_tensor(self, img_msg) -> torch.Tensor:
         arr = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
@@ -318,8 +364,10 @@ class RunACT(Policy):
     ) -> bool:
         self.policy.reset()
         with self._yolo_lock:
-            self._target_port_name = str(task.port_name).strip().lower()
-            self._port_xyz         = np.zeros(3, dtype=np.float32)  # reset until YOLO sees it
+            self._target_port_name   = str(task.port_name).strip().lower()
+            self._target_port_type   = str(task.port_type).strip().lower()
+            self._target_module_name = str(task.target_module_name).strip().lower()
+            self._port_xyz           = np.zeros(3, dtype=np.float32)  # reset until YOLO sees it
         self.get_logger().info(f"RunACT.insert_cable() start — task: {task}")
 
         TIME_LIMIT_S = 60.0

@@ -69,6 +69,7 @@ def validate(path: str) -> bool:
         has_v2_schema = schema_version_num >= 2
         has_v3_schema = schema_version_num >= 3
         has_v4_schema = schema_version_num >= 4
+        has_v5_schema = schema_version_num >= 5
         for key in (
             "schema_version",
             "episode_id",
@@ -82,6 +83,8 @@ def validate(path: str) -> bool:
             "final_error",
             "insertion_time",
             "contact_duration",
+            "sustained_penalty_duration_s",
+            "yolo_valid_fraction",
         ):
             val = meta.attrs.get(key, "MISSING")
             print(f"  {key}: {val}")
@@ -379,6 +382,31 @@ def validate(path: str) -> bool:
                     all_ok &= check(np.isfinite(value), f"{key} is finite")
                 else:
                     all_ok &= check(np.isfinite(value) and value >= 0.0, f"{key} is finite and non-negative")
+
+        if has_v5_schema:
+            print("\n--- Schema v5 quality metrics ---")
+            sus = float(meta.attrs.get("sustained_penalty_duration_s", float("nan")))
+            yolo_frac = float(meta.attrs.get("yolo_valid_fraction", float("nan")))
+            force_thr = float(meta.attrs.get("force_penalty_threshold_n", 20.0))
+            port_name_str = str(meta.attrs.get("port_name", ""))
+            print(f"  sustained_penalty_duration_s: {sus:.3f}s  (above {force_thr}N)")
+            print(f"  yolo_valid_fraction: {yolo_frac:.2%}")
+            all_ok &= check(
+                np.isfinite(sus) and sus >= 0.0,
+                "sustained_penalty_duration_s is finite and non-negative",
+                f"{sus:.3f}s",
+            )
+            all_ok &= check(
+                sus < 1.0,
+                "sustained_penalty_duration_s < 1.0s (competition penalty threshold)",
+                f"{sus:.3f}s",
+            )
+            if "sfp" in port_name_str.lower():
+                all_ok &= check(
+                    yolo_frac >= 0.5,
+                    "yolo_valid_fraction >= 50% for SFP port",
+                    f"{yolo_frac:.2%}",
+                )
 
         # ---- Timing ----
         print("\n--- Timing ---")
