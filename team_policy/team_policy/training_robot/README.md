@@ -354,6 +354,19 @@ PASS — episode looks valid (N frames, Xs, success=True)
 | Good | `success == 1` and `final_error <= 0.02` m |
 | Skip | `success == 0` or `final_error > 0.02` m |
 
+Correlate YOLO drops with the originating session YAML:
+```bash
+cd $AIC_ROOT
+pixi run python -m team_policy.training_robot.analyze_yolo_sessions \
+  --episodes-dir "$TRAIN_ROOT/episodes" \
+  --sessions-dir "$TRAIN_ROOT/configs/sessions" \
+  --yolo-threshold 0.98
+```
+
+This maps `run_NNN` back to its `session_XX.yaml`, reports whether low
+`yolo_valid_fraction` comes from a front-loaded startup gap or intermittent
+mid-episode loss, and groups weak episodes by board pose and clutter pattern.
+
 ---
 
 ## Step 3 — Convert to LeRobot Format

@@ -15,7 +15,13 @@ tcp_pose(7)  +  tcp_velocity(6)  +  joint_positions(7)  +  joint_velocity(7)  + 
      7               6                      7                      7                      3         = 30
 ```
 
-`port_xyz_in_base` is filled from YOLO detections during both collection and inference. If YOLO has no detection for a frame during collection, ground-truth port position + 2 cm Gaussian noise is substituted as a fallback.
+`port_xyz_in_base` is filled from YOLO detections during both collection and inference. The converter (`convert_to_lerobot.py`) reproduces the exact inference behaviour so there is no distribution shift:
+
+| Frame | Training value | Inference value |
+|-------|---------------|-----------------|
+| Before first YOLO detection | `[0, 0, 0]` (cold-start) | `[0, 0, 0]` (reset at trial start) |
+| YOLO valid | real YOLO position | real YOLO position |
+| YOLO temporarily lost mid-episode | last-known YOLO position | last-known YOLO position (callback holds last value) |
 
 ---
 
@@ -50,13 +56,25 @@ tcp_pose(7)  +  tcp_velocity(6)  +  joint_positions(7)  +  joint_velocity(7)  + 
 | **Episode** | One saved `.hdf5` file = one passing trial. |
 | **Quality gate** | Automatic checks that reject bad episodes before they enter the dataset. |
 
-### Trial order in every session
+### Trial order per session
+
+Sessions 1–10 and 21–100 use **NIC → NIC → SC** order:
 
 | Trial | Port type | Cable | Saved as |
 |-------|-----------|-------|----------|
 | 1 | SFP → NIC slot A | `sfp_sc_cable` | `episode_00000.hdf5` |
 | 2 | SFP → NIC slot B | `sfp_sc_cable` | `episode_00001.hdf5` |
 | 3 | SC fiber port | `sfp_sc_cable_reversed` | `episode_00002.hdf5` |
+
+Sessions 11–20 deliberately use **SC → NIC → NIC** order (see `generate_competition_sessions.py`) to add training diversity:
+
+| Trial | Port type | Cable | Saved as |
+|-------|-----------|-------|----------|
+| 1 | SC fiber port | `sfp_sc_cable_reversed` | `episode_00000.hdf5` |
+| 2 | SFP → NIC slot A | `sfp_sc_cable` | `episode_00001.hdf5` |
+| 3 | SFP → NIC slot B | `sfp_sc_cable` | `episode_00002.hdf5` |
+
+Because the episode filename matches the trial index (0-based), a rejected trial leaves a gap. For example if sessions 11-20 SC trial (trial 0) is rejected, you will see `episode_00001.hdf5` and `episode_00002.hdf5` with no `episode_00000.hdf5` — this is correct behaviour, not a bug.
 
 SFP trials almost always pass (final error ~1 mm). SC trials sometimes pass, sometimes are rejected — this is normal. The quality gate is working correctly either way.
 
@@ -220,7 +238,7 @@ Every episode must pass all three checks before it is saved:
 
 Force measurements are **baseline-subtracted**: the resting F/T reading (~20–21 N from gripper + cable weight) is measured at the start of each episode and subtracted from all force values. "Contact force 0.5 N" means 0.5 N above the resting baseline, not 0.5 N absolute.
 
-YOLO coverage (`yolo_valid_fraction`) is recorded but does **not** gate episode saving. An episode can be saved even if YOLO had 0% coverage (the GT+noise fallback is used during training).
+YOLO coverage (`yolo_valid_fraction`) is recorded but does **not** gate episode saving. An episode can be saved even if YOLO had 0% coverage — the converter will use zeros for all frames (matching inference cold-start), and the policy learns to handle that state.
 
 ---
 
@@ -299,7 +317,7 @@ Session 1 through 50 are sufficient for a first training run (~100 quality episo
 The SFP-SC cable has one end attached to the gripper (the plug being inserted) and one free end. The free end hangs from the gripper in a loop or sometimes gets flung to the side during physics initialization. This is normal and does not affect data quality — CheatCode uses TF poses, not cable positions, to control the arm.
 
 **No NIC card visible**
-Trial 3 (SC insertion) has no NIC cards in the scene — this is correct. NIC cards are only present in trials 1 and 2. If you see no NIC card at the start of what you think is trial 1, check whether trials 1 and 2 already completed while you were watching.
+The SC trial has no NIC cards in the scene — this is correct. For sessions 1–10 and 21–100 (NIC→NIC→SC order) this is trial 3. For sessions 11–20 (SC→NIC→NIC order) this is trial 1. If you see no NIC card at the start of what you expect to be a NIC trial, check whether the prior trials already completed while you were watching.
 
 **Pink/magenta bounding box on the board**
 A Gazebo visualization panel is open. Close it with the X in the Gazebo side panel — it uses GPU bandwidth but does not affect the simulation.
@@ -332,14 +350,16 @@ echo "Total episodes merged: $N"
 cd $AIC_ROOT
 pixi run python -m team_policy.training_robot.convert_to_lerobot \
     --input  $TRAIN_ROOT/episodes/all \
-    --output $TRAIN_ROOT/lerobot_datasets/aic_act_yolo_v1 \
+    --output $TRAIN_ROOT/lerobot_datasets/aic_act_yolo_v2 \
     --success_only
 ```
 
 The converter:
 - Builds a 30D state vector: `tcp_pose(7) + tcp_vel(6) + joint_pos(7) + joint_vel(7) + port_xyz(3)`
-- Fills `port_xyz` from `observations/yolo_port_xyz` (real YOLO) or GT+noise fallback for frames where YOLO had no detection
+- Fills `port_xyz` using the same logic as inference: zeros before first YOLO detection, real YOLO when valid, hold-last-known when YOLO is temporarily lost
 - Writes LeRobot-format Parquet files and video-encoded camera observations
+
+> **Dataset version**: Use `aic_act_yolo_v2` for any dataset converted after the port_xyz fix (2026-04-29). The old `aic_act_yolo_v1` used GT+noise for missing YOLO frames and should not be used for new training runs.
 
 ---
 
@@ -356,19 +376,19 @@ tmux new -s training
 ```bash
 cd $AIC_ROOT
 pixi run lerobot-train \
-    --dataset.repo_id=local/aic_act_yolo_v1 \
-    --dataset.root=$TRAIN_ROOT/lerobot_datasets/aic_act_yolo_v1 \
+    --dataset.repo_id=local/aic_act_yolo_v2 \
+    --dataset.root=$TRAIN_ROOT/lerobot_datasets/aic_act_yolo_v2 \
     --policy.type=act \
     --policy.push_to_hub=false \
-    --output_dir=outputs/train/aic_act_yolo_v1 \
-    --job_name=aic_act_yolo_v1 \
+    --output_dir=outputs/train/aic_act_yolo_v2 \
+    --job_name=aic_act_yolo_v2 \
     --policy.device=cuda \
     --wandb.enable=false \
     --steps=100000 \
     --save_freq=20000
 ```
 
-Checkpoints are saved every 20k steps at `outputs/train/aic_act_yolo_v1/checkpoints/XXXXXX/pretrained_model/`.
+Checkpoints are saved every 20k steps at `outputs/train/aic_act_yolo_v2/checkpoints/XXXXXX/pretrained_model/`.
 
 **When to stop**: Monitor training loss. For 100 episodes, loss typically plateaus around 80–100k steps. For 300 episodes, train to 150–200k steps.
 
@@ -397,7 +417,7 @@ cd $AIC_ROOT && pixi run ros2 run team_policy combined_yolo_depth_pose_planner
 cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.run_act \
-    -p checkpoint_path:=$AIC_ROOT/outputs/train/aic_act_yolo_v1/checkpoints/100000/pretrained_model
+    -p checkpoint_path:=$AIC_ROOT/outputs/train/aic_act_yolo_v2/checkpoints/100000/pretrained_model
 ```
 
 > **After any edit to `run_act.py`**, sync it before running inference:
@@ -428,13 +448,14 @@ cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
       ...
       all/                ← symlinks to all episodes, created before Step 3
     lerobot_datasets/
-      aic_act_yolo_v1/    ← LeRobot format, created by Step 3
-    episode_recorder.py   ← records observations, applies quality gates
+      aic_act_yolo_v2/    ← LeRobot format, created by Step 3
+    episode_recorder.py    ← records observations, applies quality gates
     cheatcode_collector.py ← wraps CheatCode, drives the collection loop
     convert_to_lerobot.py  ← HDF5 → LeRobot dataset
+    analyze_yolo_sessions.py ← inspects per-run YOLO coverage & quality
 
   outputs/train/
-    aic_act_yolo_v1/
+    aic_act_yolo_v2/
       checkpoints/
         020000/pretrained_model/
         040000/pretrained_model/

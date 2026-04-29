@@ -349,7 +349,18 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                 privileged_tf_valid = np.zeros((T, 0), dtype=bool)
                 ep_tf_frame_pairs = []
 
-            # Port xyz: prefer real YOLO detections; fall back to GT+noise for old episodes
+            # Port xyz: match inference behavior exactly so training distribution == deployment.
+            #
+            # Inference (run_act.py) behaviour:
+            #   - port_xyz resets to [0,0,0] at the start of every trial
+            #   - _cb_fused_yolo() only writes port_xyz when a matching detection arrives;
+            #     it never resets between callbacks, so the last valid value is held
+            #
+            # Therefore during training we must reproduce:
+            #   - zeros for all frames before the first YOLO detection   (cold-start)
+            #   - the real YOLO position when yolo_valid is True
+            #   - the last-known YOLO position when yolo_valid is False but YOLO has
+            #     already fired at least once (hold-last, not GT+noise)
             if "observations/yolo_port_xyz" in hf:
                 yolo_xyz   = hf["observations/yolo_port_xyz"][:][indices].astype(np.float32)
                 yolo_valid = (
@@ -357,14 +368,21 @@ def convert(input_dir: str, output_dir: str, success_only: bool,
                     if "observations/yolo_port_valid" in hf
                     else np.ones(T, dtype=bool)
                 )
-                gt_xyz  = _find_port_xyz_in_base(ep_tf_frame_pairs, privileged_tf, privileged_tf_valid, T)
-                # Where YOLO didn't detect, use GT + 2cm noise to simulate YOLO accuracy
-                noise   = np.random.normal(0.0, 0.02, gt_xyz.shape).astype(np.float32)
-                port_xyz = np.where(yolo_valid[:, None], yolo_xyz, gt_xyz + noise)
+                port_xyz = np.zeros((T, 3), dtype=np.float32)
+                last_xyz = np.zeros(3, dtype=np.float32)
+                seen_first = False
+                for t in range(T):
+                    if yolo_valid[t]:
+                        last_xyz = yolo_xyz[t]
+                        seen_first = True
+                    if seen_first:
+                        port_xyz[t] = last_xyz
+                    # else: stays zeros — matching inference cold-start
                 yolo_coverage = float(yolo_valid.mean()) * 100
-                print(f"    yolo_port_xyz: {yolo_coverage:.0f}% frames detected by YOLO")
+                pre_yolo = int(np.argmax(yolo_valid)) if yolo_valid.any() else T
+                print(f"    yolo_port_xyz: {yolo_coverage:.0f}% detected | {pre_yolo} cold-start zeros | hold-last for mid-episode gaps")
             else:
-                # Old episode — use GT + noise to simulate YOLO
+                # Old episode without YOLO data — GT+noise is the only approximation we have
                 gt_xyz   = _find_port_xyz_in_base(ep_tf_frame_pairs, privileged_tf, privileged_tf_valid, T)
                 noise    = np.random.normal(0.0, 0.02, gt_xyz.shape).astype(np.float32)
                 port_xyz = (gt_xyz + noise).astype(np.float32)
