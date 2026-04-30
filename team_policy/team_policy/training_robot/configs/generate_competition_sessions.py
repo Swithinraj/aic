@@ -16,11 +16,14 @@ Background mounts cycle through 3 sets for visual variety.
 Run:
     python generate_competition_sessions.py [--sessions 50] [--out-dir sessions]
     python generate_competition_sessions.py --sessions 50 --trials-per-session 1
+    python generate_competition_sessions.py --layout nic_triplets --sessions 100 --out-dir sessions_nic_3trial
 
 Output:
     sessions/session_01.yaml ... session_50.yaml
     or, with --trials-per-session 1:
     sessions/session_001.yaml ... session_150.yaml
+    or, with --layout nic_triplets:
+    sessions_nic_3trial/session_01.yaml ... session_100.yaml
 """
 from __future__ import annotations
 
@@ -223,6 +226,8 @@ robot:
     wrist_2_joint: 1.5710
     wrist_3_joint: 1.4110
 """
+
+NIC_TRIPLET_TARGETS = [(rail, trans) for rail in range(5) for trans in (0.015, -0.015)]
 
 
 def _pose_block(pose: dict, indent: int = 10) -> str:
@@ -483,6 +488,38 @@ def build_session(session_num: int, total: int, out_dir: Path) -> Path:
     return yaml_path
 
 
+def build_nic_triplet_session(session_num: int, total: int, out_dir: Path) -> Path:
+    _, pose, mounts, pose_label = _session_spec(session_num)
+    yaml_path = out_dir / f"session_{session_num:02d}.yaml"
+
+    round_idx = (session_num - 1) // len(POSES)
+    base = round_idx % len(NIC_TRIPLET_TARGETS)
+    targets = [NIC_TRIPLET_TARGETS[(base + offset) % len(NIC_TRIPLET_TARGETS)] for offset in (0, 3, 6)]
+    trial_str = " → ".join(f"NIC{rail}({trans:+.3f})" for rail, trans in targets)
+
+    header = HEADER_TMPL.format(
+        session_num=session_num,
+        total=total,
+        pose_label=pose_label,
+        trial_sequence=trial_str,
+        yaml_path=str(yaml_path),
+    )
+    header = header.replace("# Competition-format session — 3 trials, FIXED board pose.",
+                            "# NIC-only training session — 3 trials.")
+    header = header.replace("# Board does NOT move between trials within this session.",
+                            "# All three trials share one fixed board pose (consistent scene for the model).")
+    header = header.replace("# This prevents score drops from pose discontinuity.",
+                            "# Only the NIC rail target and translation change between trials.")
+
+    content = header
+    for trial_num, (nic_rail, nic_trans) in enumerate(targets, start=1):
+        content += build_nic_trial(trial_num, pose, nic_rail, nic_trans, mounts)
+    content += FOOTER
+
+    yaml_path.write_text(content)
+    return yaml_path
+
+
 def _session_spec(session_num: int) -> tuple[tuple[int, int, int], dict, dict, str]:
     pattern_idx = (session_num - 1) % len(SESSION_PATTERNS)
     pose_idx = (session_num - 1) % len(POSES)
@@ -560,12 +597,34 @@ def main() -> None:
                         help="Number of session YAMLs to generate (default: 50)")
     parser.add_argument("--trials-per-session", type=int, choices=(1, 3), default=3,
                         help="Use 3 for competition-format files, or 1 to relaunch Gazebo for every trial.")
+    parser.add_argument("--layout", choices=("mixed", "nic_triplets"), default="mixed",
+                        help="Session layout: 'mixed' for the original mixed-task generator, or 'nic_triplets' for NIC-only 3-trial sessions.")
     parser.add_argument("--out-dir", default="sessions",
                         help="Output directory (default: sessions/)")
     args = parser.parse_args()
 
     out_dir = Path(__file__).parent / args.out_dir
     out_dir.mkdir(exist_ok=True)
+
+    if args.layout == "nic_triplets":
+        if args.trials_per_session != 3:
+            raise ValueError("layout 'nic_triplets' requires --trials-per-session 3")
+        for i in range(1, args.sessions + 1):
+            build_nic_triplet_session(i, args.sessions, out_dir)
+            _, _, _, pose_label = _session_spec(i)
+            round_idx = (i - 1) // len(POSES)
+            base = round_idx % len(NIC_TRIPLET_TARGETS)
+            targets = [NIC_TRIPLET_TARGETS[(base + offset) % len(NIC_TRIPLET_TARGETS)] for offset in (0, 3, 6)]
+            trial_str = "→".join(f"NIC{rail}({trans:+.3f})" for rail, trans in targets)
+            print(f"  session_{i:02d}.yaml  pose={pose_label}  {trial_str}")
+
+        print(f"\nGenerated {args.sessions} NIC-only 3-trial session YAMLs in: {out_dir}/")
+        print("Each session = 3 NIC trials, FIXED table pose, lean entity spawn.")
+        print("Board z stays 1.14 and roll/pitch stay 0.0; only x/y/yaw vary between sessions.")
+        print(f"\nLaunch one session at a time:")
+        print(f"  aic_engine_config_file:={out_dir}/session_01.yaml")
+        print("Collector can use the default num_episodes=3.")
+        return
 
     if args.trials_per_session == 3:
         for i in range(1, args.sessions + 1):

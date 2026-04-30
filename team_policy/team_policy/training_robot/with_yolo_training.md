@@ -58,25 +58,23 @@ tcp_pose(7)  +  tcp_velocity(6)  +  joint_positions(7)  +  joint_velocity(7)  + 
 
 ### Trial order per session
 
-Sessions 1–10 and 21–100 use **NIC → NIC → SC** order:
-
-| Trial | Port type | Cable | Saved as |
-|-------|-----------|-------|----------|
-| 1 | SFP → NIC slot A | `sfp_sc_cable` | `episode_00000.hdf5` |
-| 2 | SFP → NIC slot B | `sfp_sc_cable` | `episode_00001.hdf5` |
-| 3 | SC fiber port | `sfp_sc_cable_reversed` | `episode_00002.hdf5` |
-
-Sessions 11–20 deliberately use **SC → NIC → NIC** order (see `generate_competition_sessions.py`) to add training diversity:
+The current files in `configs/sessions/` are **SC-only** sessions. Each session runs 3 SC insertion trials with one fixed board pose; only the target SC rail and translation vary between trials.
 
 | Trial | Port type | Cable | Saved as |
 |-------|-----------|-------|----------|
 | 1 | SC fiber port | `sfp_sc_cable_reversed` | `episode_00000.hdf5` |
-| 2 | SFP → NIC slot A | `sfp_sc_cable` | `episode_00001.hdf5` |
-| 3 | SFP → NIC slot B | `sfp_sc_cable` | `episode_00002.hdf5` |
+| 2 | SC fiber port | `sfp_sc_cable_reversed` | `episode_00001.hdf5` |
+| 3 | SC fiber port | `sfp_sc_cable_reversed` | `episode_00002.hdf5` |
 
-Because the episode filename matches the trial index (0-based), a rejected trial leaves a gap. For example if sessions 11-20 SC trial (trial 0) is rejected, you will see `episode_00001.hdf5` and `episode_00002.hdf5` with no `episode_00000.hdf5` — this is correct behaviour, not a bug.
+The active target alternates between `sc_port_0` and `sc_port_1` across trials and sessions. For example, `session_01.yaml` runs:
 
-SFP trials almost always pass (final error ~1 mm). SC trials sometimes pass, sometimes are rejected — this is normal. The quality gate is working correctly either way.
+- Trial 1: `sc_port_0` at translation `+0.042`
+- Trial 2: `sc_port_1` at translation `-0.042`
+- Trial 3: `sc_port_0` at translation `+0.030`
+
+Because the episode filename matches the trial index (0-based), a rejected trial leaves a gap. For example if trial 1 is rejected, you will see `episode_00001.hdf5` and `episode_00002.hdf5` with no `episode_00000.hdf5` — this is correct behaviour, not a bug.
+
+All 3 trials are SC trials, so it is normal to see only SC insertions in one run. Some SC trials pass and some are rejected by the quality gate; either outcome is expected.
 
 ---
 
@@ -137,6 +135,128 @@ python3 -c "from team_policy.training_robot.episode_recorder import SCHEMA_VERSI
 
 ---
 
+## Session sets
+
+There are now 3 useful session groups, depending on what you want to collect:
+
+| Path | What it contains | Trials per YAML | Collector setting |
+|------|------------------|-----------------|-------------------|
+| `configs/sessions/` | **SC-only** multi-trial sessions | 3 | default `num_episodes=3` |
+| `configs/sessions_nic_3trial/` | **NIC-only** multi-trial sessions | 3 | default `num_episodes=3` |
+| `configs/sessions_sc/` | **SC-only** dedicated single-task files | 1 | pass `-p num_episodes:=1` |
+| `configs/sessions_nic/` | **NIC-only** dedicated single-task files | 1 | pass `-p num_episodes:=1` |
+
+Use `configs/sessions/` when you want the current 3-trial SC collection flow.
+Use `configs/sessions_nic_3trial/` when you want 3 NIC trials per Gazebo launch.
+Use `configs/sessions_sc/` or `configs/sessions_nic/` when you want only one task per Gazebo launch.
+
+### Run SC-only 3-trial sessions
+
+This is the current default flow described in the rest of this README.
+
+Terminal 1:
+```bash
+distrobox enter -r aic_eval -- /entrypoint.sh \
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions/session_01.yaml
+```
+
+Terminal 2:
+```bash
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p output_dir:=$TRAIN_ROOT/episodes/run_001
+```
+
+### Run NIC-only 3-trial sessions
+
+Each YAML in `configs/sessions_nic_3trial/` has 3 NIC trials with one fixed board pose.
+
+Terminal 1:
+```bash
+distrobox enter -r aic_eval -- /entrypoint.sh \
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions_nic_3trial/session_01.yaml
+```
+
+Terminal 2:
+```bash
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p output_dir:=$TRAIN_ROOT/episodes/run_001
+```
+
+The collector default `num_episodes=3` already matches these files, so you do not need to pass `-p num_episodes:=3` unless you want to be explicit.
+
+### Run SC-only single-task files
+
+Each YAML in `configs/sessions_sc/` has exactly 1 trial, so set `num_episodes:=1`.
+
+Terminal 1:
+```bash
+distrobox enter -r aic_eval -- /entrypoint.sh \
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions_sc/session_001.yaml
+```
+
+Terminal 2:
+```bash
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p num_episodes:=1 \
+    -p output_dir:=$TRAIN_ROOT/episodes/run_001
+```
+
+Then move to `session_002.yaml` with `run_002`, `session_003.yaml` with `run_003`, and so on.
+
+### Run NIC-only single-task files
+
+`configs/sessions_nic/` works the same way as `configs/sessions_sc/`, but each YAML contains one NIC insertion target.
+
+Terminal 1:
+```bash
+distrobox enter -r aic_eval -- /entrypoint.sh \
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions_nic/session_001.yaml
+```
+
+Terminal 2:
+```bash
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p num_episodes:=1 \
+    -p output_dir:=$TRAIN_ROOT/episodes/run_001
+```
+
+Then move to `session_002.yaml` with `run_002`, `session_003.yaml` with `run_003`, and so on.
+
+### Bulk 100-trial files
+
+If you want long runs of a single task type in one Gazebo launch, these files also exist:
+
+- `configs/sessions/bulk_sc_100.yaml`
+- `configs/sessions/bulk_nic_100.yaml`
+
+For those, use `-p num_episodes:=100`. They are faster, but they keep Gazebo alive much longer, so RAM growth is more likely.
+
+---
+
 ## Step 1 — Collect episodes
 
 Open **2 terminals**. Set env vars in Terminal 2 before starting.
@@ -190,6 +310,7 @@ cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
 Change `run_001` → `run_002` → `run_003` … for each new session.
 
 You do not need to pass `num_episodes` or `success_only` here. The collector defaults to 3 episodes per run, and `success_only` defaults to `true`.
+Passing `-p num_episodes:=3` is also fine; it just restates the default.
 The collector starts the YOLO planner inside the same process by default, so do not run `combined_yolo_depth_pose_planner` separately during collection.
 
 **Expected output on startup:**
@@ -201,18 +322,18 @@ The collector starts the YOLO planner inside the same process by default, so do 
 
 **Expected output during a run:**
 ```
-[INFO] collector/episode=0 port=sfp/sfp_port_0
+[INFO] collector/episode=0 port=sc/sc_port_base
 [INFO] collector/episode=0 force_baseline=20.8N          ← resting F/T (gripper weight)
 [INFO] pfrac: 0.01 xy_error: 0.071 0.111  integrators: ...  ← CheatCode approaching
 [INFO] [1/3] Saved .../run_001/episode_00000.hdf5        ← episode passed all gates
 
-[INFO] collector/episode=1 port=sfp/sfp_port_0
+[INFO] collector/episode=1 port=sc/sc_port_base
 ...
 [INFO] [2/3] Saved .../run_001/episode_00001.hdf5
 
 [INFO] collector/episode=2 port=sc/sc_port_base
 ...
-[INFO] [3/3] Saved .../run_001/episode_00002.hdf5        ← SC also saved (if quality gate passes)
+[INFO] [3/3] Saved .../run_001/episode_00002.hdf5
 ```
 
 **If an episode is rejected:**
@@ -316,8 +437,10 @@ Session 1 through 50 are sufficient for a first training run (~100 quality episo
 **Cable "in the air"**
 The SFP-SC cable has one end attached to the gripper (the plug being inserted) and one free end. The free end hangs from the gripper in a loop or sometimes gets flung to the side during physics initialization. This is normal and does not affect data quality — CheatCode uses TF poses, not cable positions, to control the arm.
 
-**No NIC card visible**
-The SC trial has no NIC cards in the scene — this is correct. For sessions 1–10 and 21–100 (NIC→NIC→SC order) this is trial 3. For sessions 11–20 (SC→NIC→NIC order) this is trial 1. If you see no NIC card at the start of what you expect to be a NIC trial, check whether the prior trials already completed while you were watching.
+**Seeing multiple SC-looking parts**
+One active SC target is expected, and extra board hardware can still be visible. In `aic_engine`, the real SC targets come from `sc_rail_0` and `sc_rail_1`, while `sc_mount_rail_0` and `sc_mount_rail_1` are separate background mount rails. In the current `session_01.yaml`, both `sc_mount_rail_0` and `sc_mount_rail_1` are `False`, so the active SC target is only the selected `sc_rail_*` port for that trial.
+
+The board is also not spawning "very far" from the rail limits. `aic_engine` clamps SC rail translation to `[-0.06, 0.055]`, and `session_01.yaml` uses `+0.042`, `-0.042`, and `+0.030`, all safely inside that range.
 
 **Pink/magenta bounding box on the board**
 A Gazebo visualization panel is open. Close it with the X in the Gazebo side panel — it uses GPU bandwidth but does not affect the simulation.
@@ -440,10 +563,10 @@ cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
         ...
         session_100.yaml
     episodes/
-      run_001/            ← up to 3 episodes from session 1
+      run_001/            ← up to 3 SC episodes from session 1
         episode_00000.hdf5
         episode_00001.hdf5
-        episode_00002.hdf5   (SC, if quality gate passed)
+        episode_00002.hdf5
       run_002/
       ...
       all/                ← symlinks to all episodes, created before Step 3
