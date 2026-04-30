@@ -199,6 +199,10 @@ class RunACT(Policy):
             f"  post_stats  = {'found' if post_stats else 'MISSING'}"
         )
 
+    def _now(self) -> float:
+        """Current time in seconds from the ROS clock (sim-time aware)."""
+        return self._parent_node.get_clock().now().nanoseconds / 1e9
+
     # ----------------------------------------------------------------
     # Observation → model input
     # ----------------------------------------------------------------
@@ -323,8 +327,8 @@ class RunACT(Policy):
 
         self.get_logger().info("=== PHASE 1: ACT approach (closed-loop) ===")
 
-        while time.time() - start_time < _ACT_TIMEOUT_S:
-            if time.time() - start_time > _TIME_LIMIT_S - 30:
+        while self._now() - start_time < _ACT_TIMEOUT_S:
+            if self._now() - start_time > _TIME_LIMIT_S - 30:
                 # Reserve 30s for insertion phase
                 self.get_logger().info("ACT phase: time budget exhausted, switching to insertion")
                 break
@@ -392,7 +396,7 @@ class RunACT(Policy):
 
             step_count += 1
             if step_count % 50 == 0:
-                elapsed = time.time() - start_time
+                elapsed = self._now() - start_time
                 send_feedback(
                     f"ACT step={step_count} t={elapsed:.0f}s F={force_n:.1f}N "
                     f"tcp=({pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:+.3f})"
@@ -452,7 +456,7 @@ class RunACT(Policy):
         insert_steps = 0
         contact_detected = False
 
-        while time.time() - start_time < _TIME_LIMIT_S:
+        while self._now() - start_time < _TIME_LIMIT_S:
             t0 = time.time()
 
             obs_msg = get_observation()
@@ -543,8 +547,8 @@ class RunACT(Policy):
 
         # Hold position for 3 seconds to let connector stabilize
         self.get_logger().info("Holding position for connector stabilization (3s)...")
-        hold_start = time.time()
-        while time.time() - hold_start < 3.0 and time.time() - start_time < _TIME_LIMIT_S:
+        hold_start = self._now()
+        while self._now() - hold_start < 3.0 and self._now() - start_time < _TIME_LIMIT_S:
             obs_msg = get_observation()
             if obs_msg is not None:
                 pos, quat, force_n, _ = self._get_tcp_state(obs_msg)
@@ -576,7 +580,7 @@ class RunACT(Policy):
         **kwargs,
     ) -> bool:
         self.get_logger().info(f"RunACT.insert_cable() HYBRID start — task: {task}")
-        start = time.time()
+        start = self._now()
 
         # Phase 1: ACT approach
         obs_msg, pos, quat, recent_actions, act_steps = self._run_act_phase(
@@ -584,18 +588,18 @@ class RunACT(Policy):
         )
 
         self.get_logger().info(
-            f"ACT phase complete: {act_steps} steps in {time.time()-start:.1f}s"
+            f"ACT phase complete: {act_steps} steps in {self._now()-start:.1f}s"
         )
 
         # Phase 2: Force-guided insertion (if we have valid state)
         insert_steps = 0
-        if pos is not None and time.time() - start < _TIME_LIMIT_S - 5:
+        if pos is not None and self._now() - start < _TIME_LIMIT_S - 5:
             insert_steps = self._run_insertion_phase(
                 get_observation, move_robot, send_feedback,
                 start, pos, quat, recent_actions
             )
 
-        elapsed = time.time() - start
+        elapsed = self._now() - start
         self.get_logger().info(
             f"RunACT HYBRID finished — ACT:{act_steps} + INSERT:{insert_steps} "
             f"steps in {elapsed:.1f}s"
