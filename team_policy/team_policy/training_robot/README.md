@@ -1,426 +1,601 @@
-# Training Robot — Imitation Learning Pipeline
+# Training Robot — YOLO-Guided Imitation Learning Pipeline
 
-Collect expert demos → validate → convert → train ACT → deploy.
+This is the single source of truth for collecting demonstrations, checking
+episode quality, converting data, training ACT, and running inference.
+
+The full workflow is:
+
+1. Set up the environment
+2. Collect HDF5 episodes with CheatCode + embedded YOLO
+3. Inspect and validate the saved episodes
+4. Merge all runs into one folder
+5. Convert HDF5 to LeRobot format
+6. Train an ACT policy
+7. Run inference with YOLO + the trained checkpoint
 
 ---
 
-## What We're Building
+## What this pipeline does
 
-### The goal
+CheatCode is the privileged expert used during data collection. It performs
+successful insertions in simulation while the recorder saves:
 
-Train a robot arm to autonomously insert cables into a server task board — specifically:
-- **NIC cards** (SFP plugs) into 5 rails on the board
-- **SC fiber mounts** into 2 rails on the board
+- 3 RGB camera streams
+- robot state
+- wrist force/torque
+- commanded actions
+- privileged TF data for analysis
+- YOLO-detected port positions
 
-The trained policy must work using only what the robot can see at competition time: **3 cameras + robot joint/force state**. No ground-truth positions, no hidden TF frames.
+The trained policy does not use ground truth. At inference time it uses only:
 
-### Why imitation learning?
+- camera images
+- robot state
+- YOLO port estimates
 
-Writing a hand-coded controller for precise cable insertion is brittle — small pose errors or visual variation cause failures. Instead we:
-1. Use a "cheating" expert (**CheatCode**) that has access to hidden ground-truth TF frames in simulation to execute perfect insertions
-2. Record everything the expert does as demonstrations
-3. Train a neural network to reproduce that behavior from camera + state alone
+### Why YOLO is part of the state
 
-This is **behaviour cloning** — the network learns to imitate the expert.
+Ground-truth TF is available only in simulation. If we trained on hidden TF
+data and deployed with YOLO, the policy would see a different input
+distribution at test time. Instead, we record and train with YOLO-style port
+position so collection and inference match.
 
-### The expert: CheatCode
+### Training state (30D)
 
-CheatCode is a privileged policy that only works in simulation with `ground_truth:=true`. It reads hidden TF frames that tell it the exact position of every port. It never misses an insertion. We use it purely as a data source — it is **never deployed** on the real robot or in competition.
+```text
+tcp_pose(7) + tcp_velocity(6) + joint_positions(7) + joint_velocity(7) + port_xyz_in_base(3) = 30
+```
 
-### How sessions are generated (getting diverse training data)
+`port_xyz_in_base` follows the same logic in conversion and inference:
 
-A single scene (fixed board pose, one cable type, one rail) is not enough to train a policy that generalises. We need diversity across board positions, which rails are targeted, and visual clutter. At the same time we can't randomise everything every trial — Gazebo leaks RAM when entities respawn too often, and CheatCode's TF lookups get stale if the board pose jumps mid-session.
+- before the first valid YOLO detection: `[0, 0, 0]`
+- while YOLO is valid: current YOLO position
+- if YOLO drops temporarily: hold the last known valid position
 
-The solution is **competition-format sessions**: one Gazebo launch = one fixed board pose, 3 trials back-to-back. Board pose varies *between* sessions instead of within them.
+---
 
-**Each session runs 3 trials:**
+## Architecture overview
 
-| Trial | Task | What spawns |
-|-------|------|-------------|
-| 1 | NIC insertion (SFP plug) | 1 NIC card on target rail + background mounts |
-| 2 | NIC insertion (SFP plug, different rail) | 1 NIC card on different rail + background mounts |
-| 3 | SC insertion | 1 SC mount on target rail + background mounts |
+```text
+Terminal 1: Gazebo + aic_engine
+  - one session YAML per run
+  - 3 trials, then exits
 
-(Sessions 11–20 reverse the order to `SC → NIC → NIC` so the policy also sees SC insertions as trial 1.)
+Terminal 2: cheatcode_collector
+  - starts embedded YOLO planner
+  - runs CheatCode
+  - records observations/actions
+  - applies quality gates
+  - saves episode_*.hdf5
+```
 
-**What varies across the 50 sessions:**
+At inference time:
 
-| Variable | Values | Purpose |
-|----------|--------|---------|
-| Board pose | 10 table poses A–J (x/y/yaw vary, z/roll/pitch fixed at `1.14 / 0 / 0`) | Force the policy to handle different board positions |
-| NIC rail target | cycles through all 5 rails | Cover every insertion site on the board |
-| SC rail target | alternates between rails 0 and 1 | Cover both SC sites |
-| Background mounts | 3 clutter arrangements | Visual variety — policy learns to ignore distractors |
-| NIC/SC translation | small offsets (±15–42 mm) | Sub-rail position variation |
+```text
+Terminal 1: Gazebo + aic_engine (ground_truth:=false)
+Terminal 2: YOLO planner
+Terminal 3: ACT policy (run_act.py)
+```
 
-**Why only `x`, `y`, and `yaw` vary — not `z`, `roll`, `pitch`:**
-The board must stay flat on the table. Changing `z` would float or sink it through the table, and `roll`/`pitch` would tilt it off — both cause physically invalid scenes that CheatCode cannot solve.
+---
 
+## Terminology
 
-**Setup the enviroment variables**
+| Term | Meaning |
+|------|---------|
+| Session | One `aic_engine` launch with one `session_XX.yaml` |
+| Run | One output folder such as `run_001` |
+| Trial | One insertion attempt inside a session |
+| Episode | One saved `.hdf5` file |
+| Quality gate | Automatic checks that reject bad episodes |
+
+---
+
+## Prerequisites
+
+Verify these before starting:
+
 ```bash
-export AIC_ROOT=$(git rev-parse --show-toplevel)
+# 1. pixi exists
+pixi --version
+
+# 2. distrobox container exists
+distrobox list | grep aic_eval
+
+# 3. YOLO weights exist
+ls $(git rev-parse --show-toplevel)/.pixi/envs/default/lib/python3.12/site-packages/team_policy/models/yolov12.pt
+
+# 4. Session YAMLs exist
+ls $(git rev-parse --show-toplevel)/team_policy/team_policy/training_robot/configs/sessions/ | wc -l
+```
+
+---
+
+## Step 0 — Set environment variables
+
+Add these to `~/.bashrc` so every terminal has the same paths:
+
+```bash
+export AIC_ROOT=$(git -C ~/ros2_ws/src/aic rev-parse --show-toplevel)
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export EPISODES_DIR="$TRAIN_ROOT/episodes"
+export DATASET_ROOT="$TRAIN_ROOT/lerobot_datasets"
 export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
 ```
-**Generating the session YAMLs:**
 
-The 50 YAMLs in `configs/sessions/` are auto-generated — don't edit them by hand:
+Reload the shell:
+
+```bash
+source ~/.bashrc
+```
+
+If you save episodes on an external drive such as Seagate, override only
+`EPISODES_DIR` in the terminal where you collect/analyze data:
+
+```bash
+export EPISODES_DIR="/media/$USER/seagate/aic_episodes"
+```
+
+Create the folder if needed and verify it is writable:
+
+```bash
+mkdir -p "$EPISODES_DIR"
+touch "$EPISODES_DIR/.write_test" && rm "$EPISODES_DIR/.write_test"
+```
+
+Validate that the export points where you expect:
+
+```bash
+echo $EPISODES_DIR
+ls -ld "$EPISODES_DIR"
+```
+
+If you want to keep both local and external options handy:
+
+```bash
+export EPISODES_DIR_LOCAL="$TRAIN_ROOT/episodes"
+export EPISODES_DIR_SEAGATE="/media/$USER/seagate/aic_episodes"
+```
+
+Important:
+
+- Terminal 1 uses a hardcoded absolute path for `aic_engine_config_file`
+- Terminals 2 and 3 can safely use `$AIC_ROOT`, `$TRAIN_ROOT`, and `$EPISODES_DIR`
+
+---
+
+## Step 1 — Prepare the environment
+
+### 1.1 Sync code into the pixi environment after edits
+
+The collector and inference code run from the pixi-installed package. After
+editing these files, sync them into site-packages:
+
+```bash
+SITE=$AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/team_policy
+cp $TRAIN_ROOT/episode_recorder.py    $SITE/training_robot/episode_recorder.py
+cp $TRAIN_ROOT/cheatcode_collector.py $SITE/training_robot/cheatcode_collector.py
+cp $TRAIN_ROOT/convert_to_lerobot.py  $SITE/training_robot/convert_to_lerobot.py
+cp $AIC_ROOT/team_policy/team_policy/run_act.py $SITE/run_act.py
+```
+
+Quick check:
+
+```bash
+python3 -c "from team_policy.training_robot.episode_recorder import SCHEMA_VERSION; print('schema:', SCHEMA_VERSION)"
+```
+
+Expected:
+
+```text
+schema: 5
+```
+
+If you want a full reinstall instead of targeted copies:
+
+```bash
+cd $AIC_ROOT
+pixi reinstall ros-kilted-team-policy
+```
+
+### 1.2 Optional: regenerate session YAMLs
+
+If the session files are missing or you want to regenerate them:
 
 ```bash
 cd $AIC_ROOT
 python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py --sessions 50
 ```
 
-This writes `session_01.yaml … session_50.yaml`. See `generate_competition_sessions.py` for the pose list (`POSES`), rail pattern (`SESSION_PATTERNS`), and mount arrangements (`MOUNT_SETS`) — edit those constants to change the diversity.
+### 1.3 Session groups
 
-**Alternate mode — one trial per Gazebo launch:**
-If the eval container leaves the gripper in a bad state between trials (e.g. stuck open), use `--trials-per-session 1`. This generates 150 single-trial files (`session_001.yaml … session_150.yaml`), one for each trial in the original 50×3 plan. Slower because Gazebo restarts every episode, but every episode starts from a fully reset robot, gripper, cable, and board:
+Use the session folder that matches the dataset you want:
 
-```bash
-cd $AIC_ROOT
-rm -f team_policy/team_policy/training_robot/configs/sessions/session_*.yaml
-python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py \
-  --sessions 50 \
-  --trials-per-session 1
-```
+| Path | What it contains | Trials per YAML | Collector setting |
+|------|------------------|-----------------|-------------------|
+| `configs/sessions/` | SC-only multi-trial sessions | 3 | default `num_episodes=3` |
+| `configs/sessions_nic_3trial/` | NIC-only multi-trial sessions | 3 | default `num_episodes=3` |
+| `configs/sessions_sc/` | SC-only single-task sessions | 1 | pass `-p num_episodes:=1` |
+| `configs/sessions_nic/` | NIC-only single-task sessions | 1 | pass `-p num_episodes:=1` |
 
-### What gets recorded per episode
+The rest of this README uses the current default flow:
 
-At 10 Hz, for every timestep:
-
-| Data | Shape | What it is |
-|------|-------|------------|
-| Left / center / right camera | (T, H, W, 3) | RGB images from 3 wrist/head cameras |
-| TCP pose | (T, 7) | Tool position + quaternion in robot base frame |
-| TCP velocity | (T, 6) | Cartesian linear + angular velocity |
-| TCP error | (T, 6) | Pose error to current CheatCode target |
-| Joint positions | (T, 7) | All 7 joint angles in radians |
-| Joint velocity | (T, 7) | Per-joint velocity |
-| Wrist force/torque | (T, 6) | F/T sensor readings |
-| Delta action | (T, 6) | What CheatCode commanded — this is the training label |
-
-**30D robot state vector used for training:**
-```
-tcp_pose(7) + tcp_velocity(6) + joint_positions(7) + joint_velocity(7) + port_xyz(3) = 30
-```
-`port_xyz` is the port position in `base_link` — from YOLO at inference, from GT+noise fallback for old episodes.
-
-### The policy: ACT (Action Chunking with Transformers)
-
-```
-At each 10 Hz step:
-
-  Inputs
-  ------
-  3x camera images  -->  ResNet-18 encoder  -->  image feature tokens
-  30D robot state   -->  linear projection  -->  state token
-
-  Transformer encoder-decoder
-  ---------------------------
-  Attends over all tokens
-  Predicts a CHUNK of 100 future actions at once
-
-  Output
-  ------
-  100 x [dx, dy, dz, drx, dry, drz]   (6D delta TCP pose)
-  Applied at 10 Hz = 10 seconds of planned motion
-```
-
-**Why action chunking?** Predicting one action at a time compounds errors — small mistakes at step 1 corrupt step 2. Predicting 100 steps as one coherent plan is much more stable. The policy replans every 10 seconds to correct any drift.
-
-**At deployment:** the policy receives a camera frame + robot state, outputs the 100-step chunk, executes it, then replans. No ground truth, no TF frames — only what a real competition robot would have.
-
-### End-to-end data flow
-
-```
-Gazebo simulation (ground_truth:=true)
-  |
-  |  CheatCode executes insertions using hidden TF frames
-  |  EpisodeRecorder captures images + state + actions at 10 Hz
-  v
-episodes/run_001/ ... run_050/
-  150 HDF5 files  (50 sessions x 3 trials)
-  |
-  |  validate_episode.py  -- checks shapes, timing, success flag
-  v
-episodes/merged/
-  150 renumbered HDF5 files
-  |
-  |  convert_to_lerobot.py  -- HDF5 -> parquet + MP4, builds stats
-  v
-lerobot_datasets/aic_dataset_v1/
-  |
-  |  lerobot-train (ACT)
-  |  Input:  3x images + 30D state
-  |  Output: 100 x 6D delta actions
-  |  100k gradient steps, checkpoints every 20k
-  v
-outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model/
-  |
-  |  team_policy.run_act  (deployed in competition)
-  |  Runs at 10 Hz using only cameras + robot state
-  v
-Robot inserts cable autonomously
-```
+- `configs/sessions/`
+- 3 trials per run
+- SC-only collection
 
 ---
 
-## Quick Start (first-time setup)
+## Step 2 — Collect episodes
 
-### Step A — Set environment variables (run in every terminal you open)
+Open 2 terminals.
 
-```bash
-export AIC_ROOT=$(git rev-parse --show-toplevel)
-export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
-export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
-```
+### 2.1 Terminal 1 — start simulation
 
-`git rev-parse --show-toplevel` finds the repo root automatically — works for any username and any clone location. The FastDDS profile disables shared memory to prevent htop from showing inflated real RAM usage for aic_model on 16GB machines. **Paste these three lines at the top of every terminal you open for this pipeline.**
-
-### Step B — Build after any code change
-
-If you edit `cheatcode_collector.py`, `episode_recorder.py`, or `run_act.py`, rebuild before running:
+Restart Terminal 1 at the beginning of every run. Use a hardcoded absolute
+path for the session YAML:
 
 ```bash
-cd $AIC_ROOT && pixi reinstall ros-kilted-team-policy
-```
-
-### Step C — Pipeline overview
-
-| Step | What happens |
-|------|-------------|
-| [1. Collect](#step-1----collect-episodes-50-sessions--3-trials--150-episodes) | Run 50 Gazebo sessions × 3 trials → 150 HDF5 episode files |
-| [2. Validate](#step-2----count-and-validate) | Check every HDF5 file passes quality thresholds |
-| [3. Convert](#step-3----convert-to-lerobot-format) | Merge + convert HDF5 (auto-downsamples ~20 Hz to 10 Hz) → LeRobot parquet + MP4 dataset |
-| [4. Train](#step-4----train-act-policy) | Train ACT neural network on the dataset |
-| [5. Deploy](#step-5----deploy-and-test-the-trained-policy) | Load checkpoint, run policy in simulation |
-
-> **Important:** Steps 1–2 require `ground_truth:=true` in Terminal 1 (Gazebo side).
-> The deployed policy (Step 5) uses only cameras + robot state — no ground truth needed.
-
----
-
-## Step 1 — Collect Episodes (50 sessions × 3 trials = 150 episodes)
-
-Run one session at a time. Each session takes ~10–15 minutes.
-
-#### Terminal 1 — Start Simulation + Engine
-
-```bash
-export AIC_ROOT=$(git rev-parse --show-toplevel)
-export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
-export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
-
 distrobox enter -r aic_eval -- /entrypoint.sh \
-  ground_truth:=true \
-  start_aic_engine:=true \
-  aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_01.yaml
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions/session_01.yaml
 ```
 
+Wait for this line before starting Terminal 2:
 
-
-Wait until Gazebo opens and you see:
+```text
+[aic_engine] No node with name 'aic_model' found. Retrying...
 ```
-No node with name 'aic_model' found. Retrying...
+
+These startup messages are normal and can be ignored:
+
+```text
+[joint_state_broadcaster_spawner]: Waiting for controller_manager ...
+[gz_sim]: Unable to create renderer ...
+[spawner_joint_state_broadcaster]: Controller spawner couldn't activate controllers ...
 ```
 
+Why the absolute path matters:
 
+- distrobox receives the path after shell expansion
+- if `$TRAIN_ROOT` is empty in that terminal, the path becomes invalid
+- `aic_engine` then fails with very little diagnostic output
 
+### 2.2 Terminal 2 — start collector + embedded YOLO
 
-#### Terminal 2 — Start CheatCode Collector + YOLO
+Restart Terminal 2 at the beginning of every run and increment the run folder:
 
 ```bash
-export AIC_ROOT=$(git rev-parse --show-toplevel)
-export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
-export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
-export RUN_ID=run_001
-export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
-
 cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
-  -p use_sim_time:=true \
-  -p policy:=team_policy.training_robot.cheatcode_collector \
-  -p output_dir:="$OUTPUT_DIR"
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p output_dir:=$EPISODES_DIR/run_001
 ```
 
-You do not need to pass `num_episodes` or `success_only`: each engine session has 3 trials, the collector defaults to `num_episodes=3`, and `success_only` defaults to `true`.
-The collector starts the YOLO planner inside the same process by default, so do not run `combined_yolo_depth_pose_planner` separately during collection.
+Then change:
 
-Expected output per episode:
-```
+- `run_001` to `run_002`, `run_003`, ...
+- `session_01.yaml` to `session_02.yaml`, `session_03.yaml`, ...
+
+Defaults during collection:
+
+- `num_episodes=3`
+- `success_only=true`
+- embedded YOLO planner starts automatically
+
+Do not run `combined_yolo_depth_pose_planner` separately during collection.
+
+Expected startup output:
+
+```text
 [INFO] Combined planner node started: YOLO + metric depth + CAD registration...
 [INFO] Embedded YOLO planner started
-[INFO] DataCollectionPolicy ready — target=3 episodes
-[INFO] collector/episode=0 port=sfp/sfp_port_0
+[INFO] DataCollectionPolicy ready — target=3 episodes, output=.../run_001, success_only=True
+```
+
+Expected saved-episode flow:
+
+```text
+[INFO] collector/episode=0 port=sc/sc_port_base
 [INFO] [1/3] Saved .../run_001/episode_00000.hdf5
-[INFO] collector/episode=1 port=sfp/sfp_port_0
+[INFO] collector/episode=1 port=sc/sc_port_base
 [INFO] [2/3] Saved .../run_001/episode_00001.hdf5
 [INFO] collector/episode=2 port=sc/sc_port_base
 [INFO] [3/3] Saved .../run_001/episode_00002.hdf5
 ```
 
-Terminal 2 finishes when the 3-trial session is done. Press `Ctrl+C` in Terminal 1.
+Rejected trials look like:
 
-#### Next session — only two things change
+```text
+collector/episode=N rejected by quality gate — discarded
+collector/episode=N FAILED — discarded
+collector/episode=N too short — discarded
+```
 
-**Terminal 1** — increment session number:
+Rejected episodes are not written to disk. The collector proceeds to the next
+trial automatically.
+
+### 2.3 Quality gates
+
+Every episode must pass these checks before it is saved:
+
+| Gate | SFP threshold | SC threshold | Rejection reason |
+|------|---------------|--------------|------------------|
+| Minimum frames | 10 | 10 | crash or immediate timeout |
+| Final insertion error | < 3 mm | < 10 mm | plug did not finish at the port |
+| Sustained contact force | < 20 N for < 0.5 s | < 20 N for < 0.5 s | robot pushed hard for too long |
+
+Notes:
+
+- force is baseline-subtracted at episode start
+- `yolo_valid_fraction` is recorded but does not gate saving
+- an episode with low YOLO coverage can still be valid for training
+
+### 2.4 End-of-run checklist
+
+After trial 3:
+
+1. Wait for Terminal 2 to stop printing new collector output
+2. Stop Terminal 1 with `Ctrl+C`
+3. Verify the saved files
+4. Increment the session YAML and run folder
+5. Start the next run
+
+Check one run:
+
+```bash
+ls -lh $EPISODES_DIR/run_001/
+```
+
+Example mapping:
+
+| Session YAML | Output folder |
+|--------------|---------------|
+| `session_01.yaml` | `run_001` |
+| `session_02.yaml` | `run_002` |
+| `session_03.yaml` | `run_003` |
+
+### 2.5 Alternative session groups
+
+NIC-only 3-trial sessions:
+
+Terminal 1:
+
 ```bash
 distrobox enter -r aic_eval -- /entrypoint.sh \
-  ground_truth:=true \
-  start_aic_engine:=true \
-  aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_02.yaml
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions_nic_3trial/session_01.yaml
 ```
 
-**Terminal 2** — increment RUN_ID (`AIC_ROOT` and `TRAIN_ROOT` stay set from before):
+Terminal 2:
+
 ```bash
-export RUN_ID=run_002
-export OUTPUT_DIR="$TRAIN_ROOT/episodes/$RUN_ID"
-
 cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
-  -p use_sim_time:=true \
-  -p policy:=team_policy.training_robot.cheatcode_collector \
-  -p output_dir:="$OUTPUT_DIR"
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p output_dir:=$EPISODES_DIR/run_001
 ```
 
-#### Session reference
+Single-task SC sessions:
 
-| Session | Terminal 1 config | Terminal 2 RUN_ID |
-|---------|-------------------|-------------------|
-| 1 | `session_01.yaml` | `run_001` |
-| 2 | `session_02.yaml` | `run_002` |
-| 3 | `session_03.yaml` | `run_003` |
-| … | … | … |
-| 50 | `session_50.yaml` | `run_050` |
+Terminal 1:
 
-#### Expected folder layout after all 50 sessions
-
-```
-training_robot/episodes/
-  run_001/
-    episode_00000.hdf5   <- NIC0, pose A
-    episode_00001.hdf5   <- NIC2, pose A
-    episode_00002.hdf5   <- SC0,  pose A
-  run_002/
-    episode_00000.hdf5   <- NIC1, pose B
-    episode_00001.hdf5   <- NIC3, pose B
-    episode_00002.hdf5   <- SC1,  pose B
-  ...
-  run_050/
-    episode_00000.hdf5
-    episode_00001.hdf5
-    episode_00002.hdf5
+```bash
+distrobox enter -r aic_eval -- /entrypoint.sh \
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false \
+    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions_sc/session_001.yaml
 ```
 
-**50 sessions × 3 trials = 150 HDF5 files total.**
+Terminal 2:
 
-If a trial fails (CheatCode returns False), `success_only:=true` discards it — no file saved.
-Just rerun that session with a new `RUN_ID`.
+```bash
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector \
+    -p num_episodes:=1 \
+    -p output_dir:=$EPISODES_DIR/run_001
+```
+
+Single-task NIC sessions work the same way, but use
+`configs/sessions_nic/session_001.yaml`.
+
+### 2.6 Visual notes during Gazebo runs
+
+These are normal:
+
+- the free cable end hanging in the air or flinging around during startup
+- extra SC-looking background hardware
+- a pink or magenta board outline from a visualization panel
+- steep board yaw in some sessions
+
+The session YAMLs intentionally vary the board pose to create training
+diversity.
 
 ---
 
-## Step 2 — Count and Validate
+## Step 3 — Inspect and validate the collected episodes
 
-Count all collected episodes across all runs:
+### 3.1 Count all saved episodes
+
 ```bash
-find $TRAIN_ROOT/episodes -name 'episode_*.hdf5' | wc -l
+find $EPISODES_DIR -name 'episode_*.hdf5' | wc -l
 ```
 
-Validate all episodes (stops on first failure):
+If you are validating data from Seagate, first point `EPISODES_DIR` there:
+
+```bash
+export EPISODES_DIR="/media/$USER/seagate/aic_episodes"
+find $EPISODES_DIR -name 'episode_*.hdf5' | wc -l
+```
+
+### 3.2 Quick quality summary across all runs
+
+```bash
+cd $AIC_ROOT && pixi run python3 -c "
+import h5py, numpy as np, pathlib
+
+base = pathlib.Path('$EPISODES_DIR')
+runs = sorted(base.glob('run_*'))
+total = 0
+for run in runs:
+    eps = sorted(run.glob('episode_*.hdf5'))
+    if not eps: continue
+    print(f'\n=== {run.name} ({len(eps)} eps) ===')
+    for ep in eps:
+        with h5py.File(ep) as f:
+            m = f['metadata']
+            port_t = m.attrs.get('port_type','?')
+            port   = m.attrs.get('port_name','?')
+            frames = f['observations/tcp_pose'].shape[0]
+            err    = m.attrs.get('final_error', float('nan'))
+            force  = m.attrs.get('max_force', float('nan'))
+            sust   = m.attrs.get('sustained_penalty_duration_s', float('nan'))
+            yolo   = m.attrs.get('yolo_valid_fraction', float('nan'))
+            ok     = '✓' if m.attrs.get('success',0) else '✗'
+            print(f'  {ok} {ep.name}  {port_t}/{port:<14} frames={frames:3d}  err={err*1000:4.1f}mm  force={force:.2f}N  sust={sust:.2f}s  yolo={yolo:.0%}')
+            total += 1
+print(f'\nTotal saved: {total} episodes across {len(runs)} runs')
+"
+```
+
+Typical good output:
+
+```text
+✓ episode_00000.hdf5  sfp/sfp_port_0   frames=447  err= 1.1mm  force=0.38N  sust=0.00s  yolo=100%
+✓ episode_00001.hdf5  sfp/sfp_port_0   frames=492  err= 1.1mm  force=0.28N  sust=0.00s  yolo=100%
+✓ episode_00002.hdf5  sc/sc_port_base  frames=496  err= 0.6mm  force=1.88N  sust=0.00s  yolo=100%
+```
+
+### 3.3 Validate all episodes structurally
+
+Validate every file and stop on the first failure:
+
 ```bash
 cd $AIC_ROOT
-for f in $TRAIN_ROOT/episodes/run_*/episode_*.hdf5; do
+for f in $EPISODES_DIR/run_*/episode_*.hdf5; do
   echo "--- $f ---"
   pixi run python -m team_policy.training_robot.validate_episode --file "$f" || break
 done
 ```
 
-Validate a single episode:
+Validate one episode:
+
 ```bash
 cd $AIC_ROOT
 pixi run python -m team_policy.training_robot.validate_episode \
-  --file $TRAIN_ROOT/episodes/run_001/episode_00000.hdf5
+  --file $EPISODES_DIR/run_001/episode_00000.hdf5
 ```
 
-A good episode ends with:
+External drive example:
+
+```bash
+export EPISODES_DIR="/media/$USER/seagate/aic_episodes"
+cd $AIC_ROOT
+pixi run python -m team_policy.training_robot.validate_episode \
+  --file $EPISODES_DIR/run_001/episode_00000.hdf5
 ```
+
+Expected ending:
+
+```text
 PASS — episode looks valid (N frames, Xs, success=True)
 ```
 
-#### Episode quality thresholds
+Quality interpretation:
 
 | Quality | Rule |
-|---|---|
+|---------|------|
 | Excellent | `success == 1` and `final_error <= 0.005` m |
 | Good | `success == 1` and `final_error <= 0.02` m |
 | Skip | `success == 0` or `final_error > 0.02` m |
 
-Correlate YOLO drops with the originating session YAML:
+### 3.4 Analyze YOLO coverage by run and session
+
 ```bash
 cd $AIC_ROOT
 pixi run python -m team_policy.training_robot.analyze_yolo_sessions \
-  --episodes-dir "$TRAIN_ROOT/episodes" \
-  --sessions-dir "$TRAIN_ROOT/configs/sessions" \
-  --yolo-threshold 0.98
+    --episodes-dir "$EPISODES_DIR" \
+    --sessions-dir "$AIC_ROOT/team_policy/team_policy/training_robot/configs/sessions" \
+    --yolo-threshold 0.98
 ```
 
-This maps `run_NNN` back to its `session_XX.yaml`, reports whether low
-`yolo_valid_fraction` comes from a front-loaded startup gap or intermittent
-mid-episode loss, and groups weak episodes by board pose and clutter pattern.
+This maps `run_NNN` back to session YAMLs and helps separate:
+
+- startup cold-start YOLO gaps
+- intermittent mid-episode YOLO loss
+- weak sessions caused by pose or clutter
 
 ---
 
-## Step 3 — Convert to LeRobot Format
+## Step 4 — Merge all runs into one folder
 
-Merge all runs into one renumbered folder, then convert:
+Before conversion, merge every `run_*` folder into one renumbered folder with
+symlinks. This avoids duplicating large HDF5 files.
 
 ```bash
-export LEROBOT=$TRAIN_ROOT/lerobot_datasets
-
-# Merge all runs into one folder using symlinks (avoids duplicating ~60GB of HDF5 data)
-# Using symlinks instead of cp saves disk space — convert reads through them identically
-MERGED="$TRAIN_ROOT/episodes/merged"
+MERGED="$EPISODES_DIR/all"
 rm -rf "$MERGED" && mkdir -p "$MERGED"
-idx=0
-for f in $TRAIN_ROOT/episodes/run_*/episode_*.hdf5; do
-  ln -s "$f" "$MERGED/episode_$(printf '%05d' $idx).hdf5"
-  idx=$((idx + 1))
+N=0
+for f in $(ls $EPISODES_DIR/run_*/*.hdf5 | sort); do
+    ln -s "$f" "$MERGED/episode_$(printf '%05d' $N).hdf5"
+    N=$((N+1))
 done
-echo "Merged $idx episodes"
+echo "Total episodes merged: $N"
+```
 
-# Convert to LeRobot format
+If your episodes live on Seagate, this merged folder will also be created on
+that drive because it uses `$EPISODES_DIR`.
+
+---
+
+## Step 5 — Convert HDF5 to LeRobot format
+
+```bash
 cd $AIC_ROOT
 pixi run python -m team_policy.training_robot.convert_to_lerobot \
-  --input  "$MERGED" \
-  --output "$LEROBOT/aic_dataset_v1" \
-  --success_only \
-  --max_final_error 0.02 \
-  --target_hz 10
+    --input "$EPISODES_DIR/all" \
+    --output "$DATASET_ROOT/aic_act_yolo_v2" \
+    --success_only
 ```
 
-Output structure:
-```
-lerobot_datasets/aic_dataset_v1/
+What the converter does:
+
+- builds the 30D state vector
+- reproduces inference-time YOLO behavior
+- writes LeRobot-format parquet data
+- writes encoded camera videos
+
+Dataset naming:
+
+- use `aic_act_yolo_v2` for datasets converted after the `port_xyz` fix
+- do not create new training runs from older `aic_act_yolo_v1` data
+
+Expected output layout:
+
+```text
+lerobot_datasets/aic_act_yolo_v2/
   meta/
-    info.json           <- 30D state, 6D action, video feature schema
-    stats.json          <- mean/std/min/max for normalisation
-    tasks.parquet
-    episodes/chunk-000/file-000.parquet
-  data/chunk-000/
-    file-000.parquet
+  data/
   videos/
-    observation.images.left/chunk-000/file-000.mp4
-    observation.images.center/chunk-000/file-000.mp4
-    observation.images.right/chunk-000/file-000.mp4
 ```
 
 ---
 
-## Step 4 — Train ACT Policy
+## Step 6 — Train ACT
 
-### Required fix before first run (lerobot 0.5.1 bug)
+### 6.1 One-time lerobot 0.5.1 patch
 
-lerobot 0.5.1 ships with a broken GR00T policy file that crashes on import even though
-GR00T is never used for ACT training. Apply this one-time patch before running training:
+`lerobot` 0.5.1 ships with a broken GR00T policy file that can crash import
+even when training ACT. Apply this patch before the first training run:
 
 ```bash
 sed -i \
@@ -431,211 +606,240 @@ sed -i \
   $AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/lerobot/policies/groot/groot_n1.py
 ```
 
-Verify it worked:
+Verify the patch:
+
 ```bash
 grep "default=None, init=False" \
   $AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/lerobot/policies/groot/groot_n1.py | head -1
-# Should print a line — if empty, re-run the sed command above
 ```
 
-This patch is applied to the pixi environment only — it is NOT part of the source tree and
-will revert if pixi reinstalls the environment. Re-apply whenever you see:
-`TypeError: non-default argument 'backbone_cfg' follows default argument`
+If pixi reinstalls the environment later, re-apply this patch.
 
-### Run training (inside tmux to survive terminal close)
+### 6.2 Start training inside tmux
 
 ```bash
-tmux new -s training   # create session — detach with Ctrl+B then D, reattach with: tmux attach -t training
+tmux new -s training
 ```
 
-```bash
-export LEROBOT=$TRAIN_ROOT/lerobot_datasets
+Useful tmux shortcuts:
 
-cd $AIC_ROOT
-pixi run lerobot-train \
-  --dataset.repo_id=local/aic_dataset_v1 \
-  --dataset.root="$LEROBOT/aic_dataset_v1" \
-  --policy.type=act \
-  --policy.push_to_hub=false \
-  --output_dir=outputs/train/aic_act_run_001 \
-  --job_name=aic_act_run_001 \
-  --policy.device=cuda \
-  --wandb.enable=false \
-  --steps=100000 \
-  --save_freq=20000
-```
+- detach: `Ctrl+B` then `D`
+- reattach: `tmux attach -t training`
 
-For CPU-only machines replace `--policy.device=cuda` with `--policy.device=cpu`.
+### 6.3 Run the training command
 
-Training writes checkpoints every 20 000 steps:
-```
-outputs/train/aic_act_run_001/checkpoints/
-  020000/pretrained_model/   <- deploy this folder
-    config.json
-    model.safetensors
-    policy_preprocessor_step_3_normalizer_processor.safetensors
-    policy_postprocessor_step_0_unnormalizer_processor.safetensors
-  020000/training_state/     <- resume training only
-```
-
-Resume training from a checkpoint:
 ```bash
 cd $AIC_ROOT
 pixi run lerobot-train \
-  --config_path=outputs/train/aic_act_run_001/checkpoints/020000/pretrained_model/train_config.json \
+    --dataset.repo_id=local/aic_act_yolo_v2 \
+    --dataset.root=$DATASET_ROOT/aic_act_yolo_v2 \
+    --policy.type=act \
+    --policy.push_to_hub=false \
+    --output_dir=outputs/train/aic_act_yolo_v2 \
+    --job_name=aic_act_yolo_v2 \
+    --policy.device=cuda \
+    --wandb.enable=false \
+    --steps=100000 \
+    --save_freq=20000
+```
+
+Checkpoints are written to:
+
+```text
+outputs/train/aic_act_yolo_v2/checkpoints/XXXXXX/pretrained_model/
+```
+
+Guidance:
+
+- for about 100 episodes, loss often plateaus near 80k to 100k steps
+- for about 300 episodes, 150k to 200k steps is common
+- for CPU-only training, replace `--policy.device=cuda` with `--policy.device=cpu`
+
+Resume training example:
+
+```bash
+cd $AIC_ROOT
+pixi run lerobot-train \
+  --config_path=outputs/train/aic_act_yolo_v2/checkpoints/020000/pretrained_model/train_config.json \
   --resume=true \
   --steps=100000
 ```
 
 ---
 
-## Step 5 — Deploy and Test the Trained Policy
+## Step 7 — Run inference
 
-#### Terminal 1 — Start Simulation (no ground_truth needed)
+Open 3 terminals.
+
+### 7.1 Terminal 1 — simulation without ground truth
 
 ```bash
-export AIC_ROOT=$(git rev-parse --show-toplevel)
-export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
-export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
-
 distrobox enter -r aic_eval -- /entrypoint.sh \
-  ground_truth:=false \
-  start_aic_engine:=true \
-  aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_01.yaml
+    ground_truth:=false \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    launch_rviz:=false
 ```
 
-#### Terminal 2 — Run the Trained Policy
+### 7.2 Terminal 2 — YOLO planner
 
 ```bash
-export AIC_ROOT=$(git rev-parse --show-toplevel)
-export FASTRTPS_DEFAULT_PROFILES_FILE=$AIC_ROOT/team_policy/fastdds_no_shm.xml
-export CKPT=$AIC_ROOT/outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model
-
-cd $AIC_ROOT
-pixi reinstall ros-kilted-team-policy
-
-pixi run ros2 run aic_model aic_model --ros-args \
-  -p use_sim_time:=true \
-  -p policy:=team_policy.run_act \
-  -p checkpoint_path:="$CKPT"
+cd $AIC_ROOT && pixi run ros2 run team_policy combined_yolo_depth_pose_planner
 ```
 
-The robot will attempt cable insertion using only cameras and robot state — no ground truth.
-Watch Gazebo to see whether it succeeds.
+### 7.3 Terminal 3 — ACT policy
 
----
-
-## How Many Episodes You Need
-
-| Episodes | Expected outcome |
-|---|---|
-| 5–10 | Smoke test only — overfits, does not generalise |
-| 50 | Minimum viable — works on seen board poses |
-| 150 | Good starting point — covers all 10 poses + all rails |
-| 300–500 | Recommended for robust generalisation |
-| 1000+ | Research-grade, full pose and rail distribution |
-
----
-
-## Run log — `aic_act_run_001` (current checkpoint)
-
-| Field | Value |
-|---|---|
-| Sessions collected | 67 (`run_001` … `run_067`) |
-| Raw HDF5 episodes | ~402 |
-| Episodes after filter (`success_only` + `max_final_error 0.02`) | **157** |
-| Frames in dataset | 70,764 @ 10 Hz |
-| Training steps | 100,000 / 100,000 |
-| Final loss | 0.033 (grad norm ≈ 2.85) |
-| Duration | ~8 h 56 min on CUDA |
-| Checkpoints | every 20k → `020000`, `040000`, `060000`, `080000`, `100000`, `last` |
-| Deployed checkpoint | `outputs/train/aic_act_run_001/checkpoints/100000/pretrained_model/` |
-
-This sits between the "Good starting point" and "Recommended" rows above — expect occasional collisions on unseen poses; more sessions or a force-stop guard in `run_act.py` are the next levers.
-
----
-
-## Common Issues
-
-### `AIC_ROOT` or `TRAIN_ROOT` is empty / path not found
-
-You opened a new terminal without running the exports. Paste these at the top of every terminal:
 ```bash
-export AIC_ROOT=$(git rev-parse --show-toplevel)
-export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.run_act \
+    -p checkpoint_path:=$AIC_ROOT/outputs/train/aic_act_yolo_v2/checkpoints/100000/pretrained_model
 ```
 
-### RAM fills up / PC freezes mid-run
+If you edited `run_act.py`, sync it before running inference:
 
-You are using the old `orientation_sweep_50_trials.yaml` which spawns all 5 NICs + 2 SC mounts
-for 50 trials without restarting Gazebo. Switch to the session YAMLs in `configs/sessions/`.
-Each session is only 3 trials with 1 entity spawned per trial.
-
-### Score drops to ~30 after trial 1
-
-Board pose was jumping between trials, causing stale TF lookups.
-The session YAMLs fix this by keeping the board pose fixed for all 3 trials.
-
-### Fewer than 3 episodes saved after a session
-
-Some trials failed (CheatCode returned False). Normal for difficult poses.
-Start a new session with an incremented `RUN_ID` and the same session YAML to retry,
-or skip to the next session YAML — the missed episodes are not critical.
-
-### `Collector cannot find ground truth TF`
-
-Terminal 1 must have `ground_truth:=true`. Without it, `relative_pose` and `privileged_tf`
-save as zeros and validation will flag the episode.
-
-### `joint_velocity` is all zeros after validation
-
-Recorded before schema v4 or controller was not publishing joint velocities. Re-collect after:
 ```bash
-cd $AIC_ROOT && pixi reinstall ros-kilted-team-policy
+cp $AIC_ROOT/team_policy/team_policy/run_act.py \
+   $AIC_ROOT/.pixi/envs/default/lib/python3.12/site-packages/team_policy/run_act.py
 ```
 
-### `success=1` but `final_error` is large (e.g. 0.045 m)
+The deployed policy should now attempt insertion using only:
 
-Episode is suspicious. Keep `--max_final_error 0.02` in the converter to skip it.
-
-### Reusing the same `RUN_ID`
-
-Do not. The recorder always starts from `episode_00000.hdf5` and silently overwrites existing
-files. Always increment `RUN_ID` for each new collection run.
-
-### `checkpoint_path` parameter not set
-
-`team_policy.run_act` requires:
-```bash
--p checkpoint_path:=/absolute/path/to/pretrained_model
-```
-The path must point to the `pretrained_model/` subfolder, not the checkpoint root or
-`training_state/` folder.
+- cameras
+- robot state
+- YOLO detections
 
 ---
 
-## Historical note — the old 50-trial config
+## Folder layout
 
-Earlier iterations used `orientation_sweep_50_trials.yaml`, which ran all 50 trials in a single Gazebo session with all 5 NICs + 2 SC mounts spawned simultaneously every trial. That caused RAM leaks (Gazebo accumulates entities across respawns) and score drops (CheatCode's TF lookups went stale when the board pose jumped mid-session). The competition-session YAMLs described above replace it.
+```text
+team_policy/team_policy/training_robot/
+  README.md
+  configs/
+    sessions/
+    sessions_nic/
+    sessions_nic_3trial/
+    sessions_sc/
+  episodes/
+    run_001/
+    run_002/
+    all/
+  lerobot_datasets/
+    aic_act_yolo_v2/
+  cheatcode_collector.py
+  episode_recorder.py
+  convert_to_lerobot.py
+  analyze_yolo_sessions.py
 
-If you find that config, delete it — it is not used anywhere in the current pipeline.
+outputs/train/
+  aic_act_yolo_v2/
+    checkpoints/
+      020000/pretrained_model/
+      040000/pretrained_model/
+      ...
+```
+
+If you use Seagate, the `episodes/` tree may live under your external mount
+instead of inside `training_robot/`.
 
 ---
 
-## Files
+## HDF5 episode structure
 
-| File | Purpose |
-|---|---|
-| `cheatcode_collector.py` | Policy wrapper — records expert demos via CheatCode |
-| `episode_recorder.py` | Buffers and saves one episode as HDF5 (schema v4) |
-| `validate_episode.py` | Validates one HDF5 episode file |
-| `convert_to_lerobot.py` | Converts HDF5 episodes to LeRobot v3.0 parquet + MP4 videos |
-| `configs/generate_competition_sessions.py` | Generates competition session YAMLs |
-| `configs/sessions/session_01.yaml ... session_NN.yaml` | Session configs (3 trials each) |
-| `../run_act.py` | Deployment policy — loads local ACT checkpoint, runs at 10 Hz |
+Each episode stores:
 
-Generated data is git-ignored:
+```text
+observations/
+  tcp_pose
+  tcp_velocity
+  joint_positions
+  joint_velocity
+  wrist_force
+  tcp_error
+  relative_pose
+  yolo_port_xyz
+  yolo_port_valid
+  privileged_tf/
+  images/
+
+actions/
+  commanded_pose
+  delta_pose
+  velocity
+
+metadata/
+  schema_version
+  port_type
+  port_name
+  success
+  final_error
+  max_force
+  sustained_penalty_duration_s
+  force_baseline_n
+  yolo_valid_fraction
 ```
-training_robot/episodes/
-training_robot/lerobot_datasets/
+
+Important notes:
+
+- `tcp_error` is controller tracking error, not GT port distance
+- `relative_pose` is privileged and is kept for analysis/debugging
+- `yolo_valid_fraction` is the fraction of frames with real YOLO detections
+
+---
+
+## Troubleshooting
+
+### `aic_engine` never prints `Retrying...`
+
+The session YAML path is wrong. Use a hardcoded absolute path in Terminal 1.
+
+### Collector exits immediately with `Reached target of N episodes`
+
+That run folder already contains episodes. Use a new `run_NNN` folder or remove
+the old files first.
+
+### `TF_OLD_DATA` spam appears in Terminal 2
+
+This is usually harmless:
+
+- at sim restart, the sim clock resets and stale TF is flushed
+- during active runs, cable TF often lags slightly behind the main sim clock
+
+If saved episodes still show good `yolo_valid_fraction`, YOLO is fine.
+
+### All SC episodes are rejected
+
+Some SC poses are simply harder for CheatCode because of how the SC port frame
+is defined. This can be session-dependent and is not unusual.
+
+### Episode count is stuck and files are not appearing
+
+Check:
+
+```bash
+echo $EPISODES_DIR
 ```
+
+If it is empty or wrong, export it again and restart Terminal 2.
+
+### `/fused_yolo/detections_json` looks like it only contains `task_board`
+
+Console output may be truncated. The topic publishes one long JSON list, so a
+shortened printout can hide later detections. Check full output or inspect the
+saved episode metrics instead.
+
+### Force gate rejects every episode
+
+Check the logged `force_baseline=XX.XN`. A healthy value is usually about
+18 to 22 N. If it is 0 N, observations were likely unavailable when the
+baseline was measured.
+
+### Gazebo is slow
+
+Close side panels in the GUI or use `gazebo_gui:=false` for maximum speed.
+
+### `checkpoint_path` is not set correctly
+
+`run_act.py` expects the path to the `pretrained_model/` folder, not the parent
+checkpoint directory and not `training_state/`.
