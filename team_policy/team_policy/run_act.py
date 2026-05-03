@@ -314,7 +314,8 @@ class RunACT(Policy):
 
         self._yolo_lock = threading.Lock()
         self._yolo_port_xyz = np.zeros(3, dtype=np.float32)
-        self._yolo_port_valid = False
+        self._yolo_seen_target = False
+        self._yolo_last_det_time: Optional[float] = None
         self._yolo_reported_once = False
         parent_node.create_subscription(String, "/fused_yolo/detections_json", self._cb_fused_yolo, 10)
 
@@ -393,9 +394,19 @@ class RunACT(Policy):
             t = F.interpolate(t, size=(_IMG_H, _IMG_W), mode="bilinear", align_corners=False)
         return (t - self._img_mean) / self._img_std
 
-    def _current_port_xyz(self) -> tuple[np.ndarray, bool]:
+    def _current_port_state(self) -> tuple[np.ndarray, bool, float, bool]:
         with self._yolo_lock:
-            return self._yolo_port_xyz.copy(), bool(self._yolo_port_valid)
+            xyz = self._yolo_port_xyz.copy()
+            seen_target = bool(self._yolo_seen_target)
+            last_det_time = self._yolo_last_det_time
+        if not seen_target or last_det_time is None:
+            return xyz, False, 10.0, False
+        age_s = self._now() - last_det_time
+        return xyz, bool(age_s < 0.15), float(min(10.0, max(0.0, age_s))), True
+
+    def _current_port_xyz(self) -> tuple[np.ndarray, bool]:
+        xyz, fresh_valid, _, _ = self._current_port_state()
+        return xyz, fresh_valid
 
     def _build_state(self, obs_msg) -> torch.Tensor:
         cs = obs_msg.controller_state
@@ -467,8 +478,6 @@ class RunACT(Policy):
             return None
 
         exact_aliases = {target_port} if target_port else set()
-        if target_module:
-            exact_aliases.add(target_module)
         if any(name in exact_aliases for name in names):
             return 0
         if target_type == "sfp" and any(name == "sfp_port" or name.startswith("sfp_port_") for name in names):
@@ -477,8 +486,6 @@ class RunACT(Policy):
             return 1
         if target_port and any(target_port in name or name in target_port for name in names):
             return 2
-        if target_module and any(target_module in name or name in target_module for name in names):
-            return 3
         return None
 
     def _cb_fused_yolo(self, msg: String) -> None:
@@ -518,7 +525,8 @@ class RunACT(Policy):
         if best_xyz is not None:
             with self._yolo_lock:
                 self._yolo_port_xyz = best_xyz
-                self._yolo_port_valid = True
+                self._yolo_seen_target = True
+                self._yolo_last_det_time = self._now()
                 should_report = not self._yolo_reported_once
                 self._yolo_reported_once = True
             if should_report:
@@ -535,7 +543,8 @@ class RunACT(Policy):
             self._target_module_name = self._norm_name(getattr(task, "target_module_name", ""))
             self._target_plug_type = self._norm_name(getattr(task, "plug_type", ""))
             self._yolo_port_xyz = np.zeros(3, dtype=np.float32)
-            self._yolo_port_valid = False
+            self._yolo_seen_target = False
+            self._yolo_last_det_time = None
             self._yolo_reported_once = False
         self._prev_action = None
         self._is_sc_task = self._target_plug_type == "sc"

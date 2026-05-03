@@ -1,17 +1,22 @@
 """
-Convert v6 HDF5 episodes to LeRobot v3.0 dataset format — 63D state.
+Convert schema v5/v6/v7/v8/v9 HDF5 episodes to LeRobot v3.0 dataset format — 77D state.
 
-State layout (63 dimensions):
+State layout (77 dimensions):
   [0:7]   tcp_pose        7D  x y z qx qy qz qw
   [7:13]  tcp_velocity    6D  vx vy vz wx wy wz
   [13:19] tcp_error       6D  controller tracking error (available at inference)
   [19:26] joint_positions 7D
   [26:33] joint_velocity  7D
   [33:36] port_xyz        3D  fused YOLO xyz in base_link (hold-last, zeros before first det)
-  [36:42] wrist_force     6D  fx fy fz tx ty tz
-  [42:49] yolo_left       7D  conf cx cy w h valid age
-  [49:56] yolo_center     7D
-  [56:63] yolo_right      7D
+  [36:37] yolo_valid      1D  fresh target detection flag, not hold-last existence
+  [37:38] yolo_age        1D  seconds since last valid target detection
+  [38:41] port_delta_tcp  3D  port_xyz - tcp position in base_link
+  [41:47] tared_wrist_force_torque 6D  tare-subtracted fx fy fz tx ty tz
+  [47:54] yolo_left       7D  conf cx cy w h valid age
+  [54:61] yolo_center     7D
+  [61:68] yolo_right      7D
+  [68:70] plug_type_onehot 2D  [is_sfp, is_sc]
+  [70:77] target_module_onehot 7D exact target module identity
 
 Action (6D): delta TCP pose [dx dy dz drx dry drz] (current→commanded)
 
@@ -20,15 +25,19 @@ Backward compatibility:
     - tcp_error, wrist_force always present in HDF5 → used as-is
     - yolo_per_camera: filled with zeros [0,0,0,0,0,0,MAX_AGE]
     - port_xyz: YOLO hold-last from yolo_port_xyz/yolo_port_valid as usual
+    - tared_wrist_force_torque: falls back to raw wrist_force
+    - plug_type_onehot: inferred from metadata when possible
+    - target_module_onehot: inferred from metadata when possible
+    - yolo_valid/yolo_age: only schema v9 records true fused freshness; older schemas are legacy approximations
 
 Usage:
     cd ~/ros2_ws/src/aic
     pixi run python -m team_policy.training_robot.convert_to_lerobot_v2 \\
         --input /media/$USER/seagate/aic_episodes/run_001 \\
-        --output ./datasets/aic_v3_63d \\
+        --output ./datasets/aic_v3_77d \\
         --success_only
 
-Output: LeRobot v3.0 dataset with observation.state shape=[63], action shape=[6]
+Output: LeRobot v3.0 dataset with observation.state shape=[77], action shape=[6]
 """
 from __future__ import annotations
 
@@ -45,13 +54,19 @@ import numpy as np
 
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
+from team_policy.training_robot.episode_recorder_v2 import (
+    TARGET_MODULE_NAMES,
+    build_plug_type_onehot,
+    build_target_module_onehot,
+)
+
 CODEBASE_VERSION = "v3.0"
 DEFAULT_DATA_PATH     = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 DEFAULT_VIDEO_PATH    = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
 DEFAULT_EPISODES_PATH = "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 DEFAULT_TASKS_PATH    = "meta/tasks.parquet"
 
-STATE_DIM  = 63
+STATE_DIM  = 77
 ACTION_DIM = 6
 CAMERAS    = ("left", "center", "right")
 
@@ -171,26 +186,46 @@ def compute_stats(all_states: List[np.ndarray], all_actions: List[np.ndarray]) -
 
 
 # ---------------------------------------------------------------------------
-# Per-episode 57D state builder
+# Per-episode 77D state builder
 # ---------------------------------------------------------------------------
 
-def _build_state_63d(
+def _build_state_77d(
     tcp_poses:    np.ndarray,   # (T, 7)
     tcp_vels:     np.ndarray,   # (T, 6)
     tcp_errors:   np.ndarray,   # (T, 6)
     joint_pos:    np.ndarray,   # (T, 7)
     joint_vel:    np.ndarray,   # (T, 7)
     port_xyz:     np.ndarray,   # (T, 3)  YOLO hold-last
-    wrist_force:  np.ndarray,   # (T, 6)
+    yolo_valid:   np.ndarray,   # (T, 1)  fresh detection flag
+    yolo_age:     np.ndarray,   # (T, 1)  staleness seconds
+    port_delta_tcp: np.ndarray, # (T, 3)  port_xyz - tcp position
+    tared_wrist_force: np.ndarray,   # (T, 6)
     yolo_left:    np.ndarray,   # (T, 7)
     yolo_center:  np.ndarray,   # (T, 7)
     yolo_right:   np.ndarray,   # (T, 7)
+    plug_type_onehot: np.ndarray,  # (T, 2)
+    target_module_onehot: np.ndarray,  # (T, 7)
 ) -> np.ndarray:
     return np.concatenate(
-        [tcp_poses, tcp_vels, tcp_errors, joint_pos, joint_vel, port_xyz,
-         wrist_force, yolo_left, yolo_center, yolo_right],
+        [
+            tcp_poses,
+            tcp_vels,
+            tcp_errors,
+            joint_pos,
+            joint_vel,
+            port_xyz,
+            yolo_valid,
+            yolo_age,
+            port_delta_tcp,
+            tared_wrist_force,
+            yolo_left,
+            yolo_center,
+            yolo_right,
+            plug_type_onehot,
+            target_module_onehot,
+        ],
         axis=1,
-    ).astype(np.float32)  # (T, 63)
+    ).astype(np.float32)  # (T, 77)
 
 
 def _yolo_hold_last(yolo_xyz_raw: np.ndarray, yolo_valid: np.ndarray) -> np.ndarray:
@@ -206,6 +241,56 @@ def _yolo_hold_last(yolo_xyz_raw: np.ndarray, yolo_valid: np.ndarray) -> np.ndar
         if seen_first:
             port_xyz[t] = last_xyz
     return port_xyz
+
+
+def _legacy_fused_freshness_from_held_xyz(
+    yolo_xyz_raw: np.ndarray,
+    seen_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Approximate fresh-valid and age for legacy schemas with held-last semantics.
+
+    Pre-v9 episodes stored held yolo_port_xyz and a latched yolo_port_valid. We
+    conservatively treat the first seen frame and frames where held xyz changes
+    as fresh updates, then age everything else until the next change.
+    """
+    T = yolo_xyz_raw.shape[0]
+    fresh = np.zeros(T, dtype=bool)
+    age = np.full(T, _MAX_AGE_S, dtype=np.float32)
+    last_fresh_idx: int | None = None
+    prev_xyz: np.ndarray | None = None
+    eps = 1e-6
+    for t in range(T):
+        if not seen_mask[t]:
+            prev_xyz = None
+            continue
+        xyz = yolo_xyz_raw[t]
+        is_fresh = prev_xyz is None or float(np.linalg.norm(xyz - prev_xyz)) > eps
+        if is_fresh:
+            fresh[t] = True
+            age[t] = 0.0
+            last_fresh_idx = t
+        elif last_fresh_idx is not None:
+            age[t] = min(_MAX_AGE_S, 0.10 * float(t - last_fresh_idx))
+        prev_xyz = xyz
+    return fresh, age
+
+
+def _infer_plug_type(meta) -> str:
+    plug_type = str(meta.attrs.get("plug_type", "")).strip().lower()
+    if plug_type in {"sfp", "sc"}:
+        return plug_type
+
+    port_type = str(meta.attrs.get("port_type", "")).strip().lower()
+    if "sc" in port_type:
+        return "sc"
+    if "sfp" in port_type or "nic" in port_type:
+        return "sfp"
+    return ""
+
+
+def _infer_target_module_name(meta) -> str:
+    value = str(meta.attrs.get("target_module_name", "")).strip().lower()
+    return value if value in TARGET_MODULE_NAMES else ""
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +323,7 @@ def convert(
 
     VIDEO_KEYS = [f"observation.images.{cam}" for cam in CAMERAS]
     target_hw  = (image_height, image_width) if (image_height and image_width) else None
-    print(f"State: 57D  |  Images: {'%dx%d (HxW)' % (image_height, image_width) if target_hw else 'original'}")
+    print(f"State: 77D  |  Images: {'%dx%d (HxW)' % (image_height, image_width) if target_hw else 'original'}")
 
     all_states:  List[np.ndarray] = []
     all_actions: List[np.ndarray] = []
@@ -289,6 +374,11 @@ def convert(
                 if "observations/wrist_force" in hf
                 else np.zeros((len(indices), 6), dtype=np.float32)
             )
+            tared_wrist_force = (
+                hf["observations/tared_wrist_force_torque"][:][indices].astype(np.float32)
+                if "observations/tared_wrist_force_torque" in hf
+                else wrist_force.copy()
+            )
             tcp_errors = (
                 hf["observations/tcp_error"][:][indices].astype(np.float32)
                 if "observations/tcp_error" in hf
@@ -298,23 +388,49 @@ def convert(
 
             task_id = str(meta.attrs.get("task_id", "insert_cable"))
 
-            # --- port_xyz (fused YOLO hold-last) ---
+            # --- port_xyz (fused YOLO hold-last) + fresh valid/age ---
             if "observations/yolo_port_xyz" in hf:
                 yolo_xyz_raw = hf["observations/yolo_port_xyz"][:][indices].astype(np.float32)
-                yolo_valid   = (
+                yolo_seen = (
                     hf["observations/yolo_port_valid"][:][indices].astype(bool)
                     if "observations/yolo_port_valid" in hf
                     else np.ones(T, dtype=bool)
                 )
-                port_xyz = _yolo_hold_last(yolo_xyz_raw, yolo_valid)
+                if "observations/yolo_port_age" in hf:
+                    yolo_valid = yolo_seen.copy()
+                    yolo_age = hf["observations/yolo_port_age"][:][indices].astype(np.float32)
+                else:
+                    yolo_valid, yolo_age = _legacy_fused_freshness_from_held_xyz(
+                        yolo_xyz_raw,
+                        yolo_seen,
+                    )
+                    print(
+                        "    fused_yolo_age: not found — "
+                        "legacy schema, freshness/staleness reconstructed from held xyz changes"
+                    )
+                port_xyz = _yolo_hold_last(yolo_xyz_raw, yolo_seen)
                 yolo_cov = float(yolo_valid.mean()) * 100
                 pre_yolo = int(np.argmax(yolo_valid)) if yolo_valid.any() else T
-                print(f"    fused_yolo: {yolo_cov:.0f}% det | {pre_yolo} cold-start zeros")
+                print(
+                    f"    fused_yolo: {yolo_cov:.0f}% fresh | {pre_yolo} cold-start zeros"
+                )
             else:
                 port_xyz = np.zeros((T, 3), dtype=np.float32)
+                yolo_valid = np.zeros(T, dtype=bool)
+                yolo_age = np.full(T, _MAX_AGE_S, dtype=np.float32)
                 print(f"    fused_yolo: not found — using zeros")
+            port_delta_tcp = np.zeros((T, 3), dtype=np.float32)
+            if yolo_valid.any():
+                first_valid = int(np.argmax(yolo_valid))
+                port_delta_tcp[first_valid:] = (
+                    port_xyz[first_valid:] - tcp_poses[first_valid:, :3].astype(np.float32)
+                )
+            if "observations/tared_wrist_force_torque" not in hf:
+                print("    tared_wrench: not found — falling back to raw wrist_force")
 
             # --- per-camera YOLO features (v6) or zeros fallback ---
+            # These features are already normalized in HDF5, so video resizing during
+            # conversion does not require any bbox recomputation here.
             per_cam: dict[str, np.ndarray] = {}
             has_per_cam = "observations/yolo_per_camera" in hf
             for cam in CAMERAS:
@@ -327,9 +443,38 @@ def convert(
             if not has_per_cam:
                 print(f"    per_camera_yolo: v5 episode — zero-filled 21D")
 
-            state = _build_state_63d(
+            if "observations/plug_type_onehot" in hf:
+                plug_type_onehot = hf["observations/plug_type_onehot"][:][indices].astype(np.float32)
+            else:
+                inferred_plug_type = _infer_plug_type(meta)
+                plug_type_onehot = np.tile(build_plug_type_onehot(inferred_plug_type), (T, 1))
+                print(
+                    "    plug_type_onehot: not found — "
+                    f"inferred from metadata as '{inferred_plug_type or 'unknown'}'"
+                )
+
+            if "observations/target_module_onehot" in hf:
+                target_module_onehot = (
+                    hf["observations/target_module_onehot"][:][indices].astype(np.float32)
+                )
+            else:
+                inferred_target_module = _infer_target_module_name(meta)
+                target_module_onehot = np.tile(
+                    build_target_module_onehot(inferred_target_module),
+                    (T, 1),
+                )
+                print(
+                    "    target_module_onehot: not found — "
+                    f"inferred from metadata as '{inferred_target_module or 'unknown'}'"
+                )
+
+            state = _build_state_77d(
                 tcp_poses, tcp_vels, tcp_errors, joint_pos, joint_vel, port_xyz,
-                wrist_force, per_cam["left"], per_cam["center"], per_cam["right"],
+                yolo_valid.astype(np.float32).reshape(T, 1),
+                yolo_age.reshape(T, 1),
+                port_delta_tcp, tared_wrist_force,
+                per_cam["left"], per_cam["center"], per_cam["right"],
+                plug_type_onehot, target_module_onehot,
             )
             assert state.shape == (T, STATE_DIM), (
                 f"State shape mismatch: got {state.shape}, expected ({T}, {STATE_DIM})"
@@ -376,7 +521,20 @@ def convert(
             })
             episode_meta_rows.append({
                 "episode_index":           lerobot_idx,
-                "tasks":                   [f"insert {meta.attrs.get('port_type','cable')} cable"],
+                "tasks":                   [
+                    "insert "
+                    f"{meta.attrs.get('plug_type', 'plug')} "
+                    f"{meta.attrs.get('plug_name', 'plug')} "
+                    f"into {meta.attrs.get('target_module_name', 'module')}/"
+                    f"{meta.attrs.get('port_name', 'port')}"
+                ],
+                "task_id":                 str(meta.attrs.get("task_id", "")),
+                "cable_name":              str(meta.attrs.get("cable_name", "")),
+                "plug_type":               str(meta.attrs.get("plug_type", "")),
+                "plug_name":               str(meta.attrs.get("plug_name", "")),
+                "port_type":               str(meta.attrs.get("port_type", "")),
+                "port_name":               str(meta.attrs.get("port_name", "")),
+                "target_module_name":      str(meta.attrs.get("target_module_name", "")),
                 "length":                  T,
                 "data/chunk_index":        0,
                 "data/file_index":         0,
@@ -509,11 +667,16 @@ def convert(
             "13:19": "tcp_error (6D controller tracking error)",
             "19:26": "joint_positions (7D)",
             "26:33": "joint_velocity (7D)",
-            "33:36": "port_xyz_fused (YOLO hold-last in base_link)",
-            "36:42": "wrist_force (fx fy fz tx ty tz)",
-            "42:49": "yolo_left (conf cx cy w h valid age)",
-            "49:56": "yolo_center (conf cx cy w h valid age)",
-            "56:63": "yolo_right (conf cx cy w h valid age)",
+            "33:36": "yolo_port_xyz_fused (held target port xyz in base_link)",
+            "36:37": "yolo_valid_fresh (1=fresh target detection, 0=stale/absent)",
+            "37:38": "yolo_age_seconds (staleness of held target port xyz)",
+            "38:41": "port_delta_tcp (held yolo_port_xyz - tcp position)",
+            "41:47": "tared_wrist_force_torque (fx fy fz tx ty tz)",
+            "47:54": "yolo_left (conf cx cy w h valid age)",
+            "54:61": "yolo_center (conf cx cy w h valid age)",
+            "61:68": "yolo_right (conf cx cy w h valid age)",
+            "68:70": "plug_type_onehot ([is_sfp, is_sc])",
+            "70:77": "target_module_onehot (" + ", ".join(TARGET_MODULE_NAMES) + ")",
         },
     }
     with open(out / "meta" / "info.json", "w") as f:
@@ -521,15 +684,18 @@ def convert(
 
     print(f"\nDone — {lerobot_idx} episodes, {total_frames} frames → {output_dir}")
     print(f"  format : LeRobot {CODEBASE_VERSION}")
-    print(f"  state  : {STATE_DIM}D  (30D base + 6D tcp_error + 6D F/T + 21D per-cam YOLO)")
+    print(
+        f"  state  : {STATE_DIM}D  "
+        "(30D base + 6D tcp_error + 3D held fused xyz + 1D fresh valid + 1D age + 3D port_delta_tcp + 6D tared F/T + 21D per-cam YOLO + 2D plug type + 7D target module)"
+    )
     print(f"  action : {ACTION_DIM}D  delta TCP pose")
     print(f"  videos : {'written + concatenated' if has_video else 'not found'}")
-    print("Next step: pixi run lerobot-train --dataset.repo_id=local/aic_v3_57d ...")
+    print("Next step: pixi run lerobot-train --dataset.repo_id=local/aic_v3_77d ...")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert HDF5 v6 episodes to LeRobot v3.0 — 57D state"
+        description="Convert HDF5 schema v5/v6/v7/v8/v9 episodes to LeRobot v3.0 — 77D state"
     )
     parser.add_argument("--input",           required=True)
     parser.add_argument("--output",          required=True)

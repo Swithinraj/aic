@@ -1,5 +1,19 @@
 """
-Records one episode of (observation, action) pairs to HDF5 — Schema v6.
+Records one episode of (observation, action) pairs to HDF5 — Schema v9.
+
+New in v9 vs v8:
+  * fused observations/yolo_port_valid now means fresh target detection, not hold-last existence
+  * fused observations/yolo_port_age (1D) stores staleness seconds for the held target port position
+
+New in v8 vs v7:
+  * target_module_onehot (7D) stored under observations/target_module_onehot
+  * metadata stores the exact target_module_name and its deterministic onehot encoding
+
+New in v7 vs v6:
+  * tared_wrist_force_torque (6D) stored under observations/tared_wrist_force_torque
+  * port_delta_tcp (3D) stored under observations/port_delta_tcp
+  * plug_type_onehot (2D) stored under observations/plug_type_onehot
+  * metadata stores the ROS task goal fields and the 6D wrist wrench tare used during collection
 
 New in v6 vs v5:
   * Per-camera YOLO feature vectors stored under
@@ -8,7 +22,7 @@ New in v6 vs v5:
                   bbox_h_norm, valid_float, age_seconds]
     - valid_float = 1.0 when age < AGE_VALID_S, else 0.0
     - age_seconds clamped to [0, MAX_AGE_S]
-    - bbox coordinates are normalised by the origial image (H, W) at collection time
+    - bbox coordinates are normalised by the original image (H, W) at collection time
   * wrist_force (6D force/torque) is included in all prior schemas but is NOW
     explicitly incorporated into the training state via convert_to_lerobot_v2.py
   * Image dimensions stored as attributes on observations/images group
@@ -28,7 +42,7 @@ import numpy as np
 
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "9"
 
 CONTACT_FORCE_THRESHOLD_N = 0.5
 AGE_VALID_S  = 0.15   # detection fresher than this → valid_float = 1.0
@@ -43,6 +57,15 @@ DEFAULT_MAX_SUSTAINED_FORCE_DURATION_S: float = 0.5
 FORCE_PENALTY_N: float = 20.0
 
 CAMERAS = ("left", "center", "right")
+TARGET_MODULE_NAMES = (
+    "nic_card_mount_0",
+    "nic_card_mount_1",
+    "nic_card_mount_2",
+    "nic_card_mount_3",
+    "nic_card_mount_4",
+    "sc_port_0",
+    "sc_port_1",
+)
 IMAGE_COMPRESSION_OPTS = 1
 
 
@@ -141,6 +164,27 @@ def build_yolo_feature(
     return np.array([confidence, cx, cy, bw, bh, valid, age], dtype=np.float32)
 
 
+def build_plug_type_onehot(plug_type: object) -> np.ndarray:
+    """Return [is_sfp, is_sc] for the task plug type."""
+    value = str(plug_type).strip().lower()
+    if value == "sfp":
+        return np.array([1.0, 0.0], dtype=np.float32)
+    if value == "sc":
+        return np.array([0.0, 1.0], dtype=np.float32)
+    return np.array([0.0, 0.0], dtype=np.float32)
+
+
+def build_target_module_onehot(target_module_name: object) -> np.ndarray:
+    """Return exact onehot for supported target_module_name values."""
+    value = str(target_module_name).strip().lower()
+    vec = np.zeros(len(TARGET_MODULE_NAMES), dtype=np.float32)
+    try:
+        vec[TARGET_MODULE_NAMES.index(value)] = 1.0
+    except ValueError:
+        pass
+    return vec
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -155,11 +199,17 @@ class Frame:
     joint_positions: np.ndarray   # (7,)
     joint_velocity: np.ndarray    # (7,)
     wrist_force: np.ndarray       # (6,) fx fy fz tx ty tz
+    tared_wrist_force_torque: np.ndarray  # (6,) tare-subtracted fx fy fz tx ty tz
+    port_delta_tcp: np.ndarray    # (3,) fused yolo_port_xyz - tcp position in base_link
+    plug_type_onehot: np.ndarray  # (2,) [is_sfp, is_sc]
+    target_module_onehot: np.ndarray  # (7,) exact target_module_name onehot
     relative_pose: Optional[np.ndarray] = None
     privileged_tf: Optional[np.ndarray] = None
     privileged_tf_valid: Optional[np.ndarray] = None
     commanded_pose: Optional[np.ndarray] = None
     yolo_port_xyz: Optional[np.ndarray] = None   # (3,) fused xyz for v5 compat
+    yolo_port_valid: bool = False   # fresh fused target detection flag, not hold-last existence
+    yolo_port_age: float = MAX_AGE_S
     yolo_per_camera: Optional[Dict[str, np.ndarray]] = None  # {"left"/"center"/"right": (7,)}
 
 
@@ -167,8 +217,14 @@ class Frame:
 class Episode:
     episode_id: int
     task_id: str
+    cable_type: str
+    cable_name: str
     port_type: str
     port_name: str
+    plug_type: str
+    plug_name: str
+    target_module_name: str
+    time_limit_s: int
     privileged_tf_frame_pairs: List[str] = field(default_factory=list)
     frames: List[Frame] = field(default_factory=list)
     success: bool = False
@@ -181,7 +237,7 @@ class Episode:
 # ---------------------------------------------------------------------------
 
 class EpisodeRecorderV2:
-    """HDF5 episode recorder — writes Schema v6."""
+    """HDF5 episode recorder — writes Schema v9."""
 
     def __init__(self, output_dir: str):
         self._output_dir = output_dir
@@ -195,6 +251,9 @@ class EpisodeRecorderV2:
         self._img_ds: dict = {}
         self._img_h: int = 0
         self._img_w: int = 0
+        self._wrist_force_tare = np.zeros(6, dtype=np.float32)
+        self._plug_type_onehot = np.zeros(2, dtype=np.float32)
+        self._target_module_onehot = np.zeros(len(TARGET_MODULE_NAMES), dtype=np.float32)
         self._cleanup_stale_partials()
 
     def _cleanup_stale_partials(self) -> None:
@@ -208,8 +267,19 @@ class EpisodeRecorderV2:
         except FileNotFoundError:
             pass
 
-    def start_episode(self, episode_id: int, task_id: str,
-                      port_type: str, port_name: str) -> None:
+    def start_episode(
+        self,
+        episode_id: int,
+        task_id: str,
+        port_type: str,
+        port_name: str,
+        cable_type: str = "",
+        cable_name: str = "",
+        plug_type: str = "",
+        plug_name: str = "",
+        target_module_name: str = "",
+        time_limit_s: int = 0,
+    ) -> None:
         if self._hf is not None:
             self._abort_current()
         try:
@@ -220,12 +290,21 @@ class EpisodeRecorderV2:
         self._current = Episode(
             episode_id=episode_id,
             task_id=task_id,
+            cable_type=str(cable_type),
+            cable_name=str(cable_name),
             port_type=port_type,
             port_name=port_name,
+            plug_type=str(plug_type),
+            plug_name=str(plug_name),
+            target_module_name=str(target_module_name),
+            time_limit_s=int(time_limit_s),
             start_time=time.time(),
         )
         with self._commanded_pose_lock:
             self._last_commanded_pose = None
+        self._wrist_force_tare = np.zeros(6, dtype=np.float32)
+        self._plug_type_onehot = build_plug_type_onehot(plug_type)
+        self._target_module_onehot = build_target_module_onehot(target_module_name)
 
         self._final_path = os.path.join(
             self._output_dir, f"episode_{episode_id:05d}.hdf5"
@@ -238,6 +317,9 @@ class EpisodeRecorderV2:
         self._img_ds = {}
         self._img_h = 0
         self._img_w = 0
+
+    def set_wrist_force_tare(self, wrench_6d: np.ndarray) -> None:
+        self._wrist_force_tare = np.asarray(wrench_6d, dtype=np.float32).reshape(6).copy()
 
     def update_commanded_pose(self, pose: np.ndarray) -> None:
         with self._commanded_pose_lock:
@@ -273,6 +355,8 @@ class EpisodeRecorderV2:
         privileged_tf: Optional[np.ndarray] = None,
         privileged_tf_valid: Optional[np.ndarray] = None,
         yolo_port_xyz: Optional[np.ndarray] = None,
+        yolo_port_valid: bool = False,
+        yolo_port_age: float = MAX_AGE_S,
         yolo_per_camera: Optional[Dict[str, np.ndarray]] = None,
     ) -> None:
         """Stream one frame to HDF5. yolo_per_camera = {"left"/"center"/"right": (7,)}."""
@@ -302,6 +386,18 @@ class EpisodeRecorderV2:
         vel = cs.tcp_velocity
         js  = obs.joint_states
         w   = obs.wrist_wrench.wrench
+        raw_wrist_force = np.array([
+            w.force.x, w.force.y, w.force.z,
+            w.torque.x, w.torque.y, w.torque.z,
+        ], dtype=np.float32)
+        tared_wrist_force = raw_wrist_force - self._wrist_force_tare
+        tcp_xyz = np.array([
+            tcp.position.x, tcp.position.y, tcp.position.z,
+        ], dtype=np.float32)
+        port_delta_tcp = (
+            np.asarray(yolo_port_xyz, dtype=np.float32)[:3] - tcp_xyz
+            if yolo_port_xyz is not None else np.zeros(3, dtype=np.float32)
+        )
 
         with self._commanded_pose_lock:
             cmd = self._last_commanded_pose.copy() if self._last_commanded_pose is not None else None
@@ -320,10 +416,11 @@ class EpisodeRecorderV2:
             tcp_error=np.array(list(cs.tcp_error), dtype=np.float32),
             joint_positions=np.array(list(js.position[:7]), dtype=np.float32),
             joint_velocity=np.array(list(js.velocity[:7]), dtype=np.float32),
-            wrist_force=np.array([
-                w.force.x, w.force.y, w.force.z,
-                w.torque.x, w.torque.y, w.torque.z,
-            ], dtype=np.float32),
+            wrist_force=raw_wrist_force,
+            tared_wrist_force_torque=tared_wrist_force,
+            port_delta_tcp=port_delta_tcp,
+            plug_type_onehot=self._plug_type_onehot.copy(),
+            target_module_onehot=self._target_module_onehot.copy(),
             relative_pose=(
                 None if relative_pose is None
                 else np.asarray(relative_pose, dtype=np.float32).copy()
@@ -341,6 +438,8 @@ class EpisodeRecorderV2:
                 None if yolo_port_xyz is None
                 else np.asarray(yolo_port_xyz, dtype=np.float32).copy()
             ),
+            yolo_port_valid=bool(yolo_port_valid),
+            yolo_port_age=float(np.clip(yolo_port_age, 0.0, MAX_AGE_S)),
             yolo_per_camera=(
                 None if yolo_per_camera is None
                 else {k: np.asarray(v, dtype=np.float32).copy()
@@ -456,6 +555,10 @@ class EpisodeRecorderV2:
         joint_pos    = np.stack([f.joint_positions for f in ep.frames])
         joint_vel    = np.stack([f.joint_velocity  for f in ep.frames])
         wrist_forces = np.stack([f.wrist_force     for f in ep.frames])
+        tared_wrist_forces = np.stack([f.tared_wrist_force_torque for f in ep.frames])
+        port_delta_tcp = np.stack([f.port_delta_tcp for f in ep.frames])
+        plug_type_onehot = np.stack([f.plug_type_onehot for f in ep.frames])
+        target_module_onehot = np.stack([f.target_module_onehot for f in ep.frames])
         timestamps   = np.array([f.timestamp       for f in ep.frames], dtype=np.float64)
         task_ids     = [f.task_id for f in ep.frames]
 
@@ -517,9 +620,8 @@ class EpisodeRecorderV2:
         )
 
         # --- legacy fused YOLO xyz (v5 compat) ---
-        yolo_port_valid = np.array(
-            [f.yolo_port_xyz is not None for f in ep.frames], dtype=np.bool_
-        )
+        yolo_port_valid = np.array([f.yolo_port_valid for f in ep.frames], dtype=np.bool_)
+        yolo_port_age = np.array([f.yolo_port_age for f in ep.frames], dtype=np.float32)
         yolo_port_xyz = np.stack([
             f.yolo_port_xyz if f.yolo_port_xyz is not None
             else np.zeros(3, dtype=np.float32)
@@ -550,11 +652,22 @@ class EpisodeRecorderV2:
         obs.create_dataset("joint_positions", data=joint_pos)
         obs.create_dataset("joint_velocity",  data=joint_vel)
         obs.create_dataset("wrist_force",     data=wrist_forces)
+        obs.create_dataset("tared_wrist_force_torque", data=tared_wrist_forces)
         obs.create_dataset("timestamps",      data=timestamps)
         obs.create_dataset("relative_pose",       data=relative_poses)
         obs.create_dataset("relative_pose_valid", data=relative_valid)
         obs.create_dataset("yolo_port_xyz",   data=yolo_port_xyz)
-        obs.create_dataset("yolo_port_valid", data=yolo_port_valid)
+        yolo_valid_ds = obs.create_dataset("yolo_port_valid", data=yolo_port_valid)
+        yolo_valid_ds.attrs["semantics"] = "fresh_target_detection_not_hold_last_existence"
+        yolo_age_ds = obs.create_dataset("yolo_port_age",   data=yolo_port_age)
+        yolo_age_ds.attrs["units"] = "seconds"
+        yolo_age_ds.attrs["max_age_s"] = MAX_AGE_S
+        yolo_age_ds.attrs["age_valid_threshold_s"] = AGE_VALID_S
+        obs.create_dataset("port_delta_tcp",  data=port_delta_tcp)
+        plug_type_ds = obs.create_dataset("plug_type_onehot", data=plug_type_onehot)
+        plug_type_ds.attrs["encoding"] = "is_sfp,is_sc"
+        target_module_ds = obs.create_dataset("target_module_onehot", data=target_module_onehot)
+        target_module_ds.attrs["encoding"] = ",".join(TARGET_MODULE_NAMES)
 
         tf_group = obs.create_group("privileged_tf")
         tf_group.create_dataset("transforms", data=privileged_tf)
@@ -578,16 +691,29 @@ class EpisodeRecorderV2:
             cam_group.attrs["max_age_s"] = MAX_AGE_S
 
         act = self._hf.create_group("actions")
-        act.create_dataset("commanded_pose", data=cmd_poses)
-        act.create_dataset("delta_pose",     data=delta_actions)
-        act.create_dataset("velocity",       data=velocity_actions)
+        cmd_ds = act.create_dataset("commanded_pose", data=cmd_poses)
+        cmd_ds.attrs["feature_names"] = "x,y,z,qx,qy,qz,qw"
+        cmd_ds.attrs["description"] = "Expert commanded TCP pose sent via MotionUpdate.pose in base_link"
+        delta_ds = act.create_dataset("delta_pose", data=delta_actions)
+        delta_ds.attrs["feature_names"] = "dx,dy,dz,drx,dry,drz"
+        delta_ds.attrs["description"] = "6D delta pose from current tcp_pose to commanded_pose"
+        vel_ds = act.create_dataset("velocity", data=velocity_actions)
+        vel_ds.attrs["feature_names"] = "vx,vy,vz,wx,wy,wz"
+        vel_ds.attrs["description"] = "Finite-difference expert target velocity derived from commanded_pose"
 
         meta = self._hf.create_group("metadata")
         meta.attrs["schema_version"]     = SCHEMA_VERSION
         meta.attrs["episode_id"]         = ep.episode_id
         meta.attrs["task_id"]            = ep.task_id
+        meta.attrs["cable_type"]         = ep.cable_type
+        meta.attrs["cable_name"]         = ep.cable_name
         meta.attrs["port_type"]          = ep.port_type
         meta.attrs["port_name"]          = ep.port_name
+        meta.attrs["plug_type"]          = ep.plug_type
+        meta.attrs["plug_name"]          = ep.plug_name
+        meta.attrs["target_module_name"] = ep.target_module_name
+        meta.attrs["target_module_onehot_encoding"] = ",".join(TARGET_MODULE_NAMES)
+        meta.attrs["time_limit_s"]       = ep.time_limit_s
         meta.attrs["success"]            = int(ep.success)
         meta.attrs["num_frames"]         = T
         meta.attrs["duration_s"]         = ep.end_time - ep.start_time
@@ -599,6 +725,8 @@ class EpisodeRecorderV2:
         meta.attrs["sustained_penalty_duration_s"] = sustained_penalty
         meta.attrs["force_penalty_threshold_n"] = FORCE_PENALTY_N
         meta.attrs["force_baseline_n"]   = force_baseline_n
+        meta.attrs["wrist_force_tare"]   = self._wrist_force_tare
         meta.attrs["yolo_valid_fraction"] = yolo_valid_fraction
+        meta.attrs["yolo_fresh_valid_fraction"] = yolo_valid_fraction
         meta.attrs["image_height"]       = self._img_h
         meta.attrs["image_width"]        = self._img_w

@@ -3,10 +3,13 @@
 # aic_collect_v2.sh — Automated multi-trial episode collection (v2 pipeline)
 # =============================================================================
 #
-# Uses cheatcode_collector_v2 which records Schema v6 episodes:
+# Uses cheatcode_collector_v2 which records Schema v9 episodes:
 #   - Per-camera YOLO features (7D × 3 cameras)
-#   - Force/torque (6D)
-#   - Fused YOLO port_xyz (hold-last)
+#   - Tared wrist force/torque (6D)
+#   - Held fused YOLO port_xyz (3D)
+#   - Fresh fused yolo_valid (1D)
+#   - Fused yolo_age staleness (1D)
+#   - target_module_onehot (7D)
 # Episodes are saved to EPISODES_DIR (Seagate hard drive by default).
 #
 # HOW IT WORKS

@@ -1,5 +1,5 @@
 """
-Autonomous data collection policy — v2 (Schema v6).
+Autonomous data collection policy — v2 (Schema v9).
 
 Differences from cheatcode_collector.py (v1):
   * Subscribes to per-camera YOLO topics instead of only /fused_yolo/detections_json:
@@ -10,6 +10,8 @@ Differences from cheatcode_collector.py (v1):
   * Builds a 7D per-camera feature vector per frame:
         [confidence, bbox_cx_norm, bbox_cy_norm, bbox_w_norm, bbox_h_norm,
          valid_float, age_seconds]
+  * Records tared_wrist_force_torque (6D), raw port_delta_tcp (3D), plug_type_onehot (2D),
+    target_module_onehot (7D), and fused YOLO freshness/staleness
   * Uses EpisodeRecorderV2 which writes observations/yolo_per_camera/{left,center,right}
   * Image dimensions are read from the first observation frame for bbox normalisation
 
@@ -92,7 +94,8 @@ class DataCollectionPolicyV2(Policy):
         # --- Fused YOLO (port_xyz hint, kept for 30D base state) ---
         self._fused_lock       = threading.Lock()
         self._yolo_port_xyz    = np.zeros(3, dtype=np.float32)
-        self._yolo_port_valid  = False
+        self._yolo_seen_target = False
+        self._yolo_last_det_time: Optional[float] = None
 
         # --- Per-camera YOLO state ---
         self._cam_lock: threading.Lock = threading.Lock()
@@ -136,7 +139,7 @@ class DataCollectionPolicyV2(Policy):
             f"DataCollectionPolicyV2 ready — "
             f"target={self._num_episodes} eps, "
             f"output={self._output_dir}, "
-            f"schema=v6 (per-camera YOLO + force/torque)"
+            f"schema=v9 (per-camera YOLO + tared force/torque + plug type + target module + fresh fused YOLO validity)"
         )
 
     # ------------------------------------------------------------------
@@ -202,8 +205,6 @@ class DataCollectionPolicyV2(Policy):
             return None
 
         exact_aliases = {target_port} if target_port else set()
-        if target_type == "sc" and target_module:
-            exact_aliases.add(target_module)
         if any(name in exact_aliases for name in names):
             return 0
         if target_type == "sc":
@@ -214,10 +215,6 @@ class DataCollectionPolicyV2(Policy):
                 return 1
         if target_port and any(target_port in name or name in target_port for name in names):
             return 2
-        if target_type == "sc" and target_module and any(
-            target_module in name or name in target_module for name in names
-        ):
-            return 3
         return None
 
     def _cb_fused_yolo(self, msg: String) -> None:
@@ -253,7 +250,8 @@ class DataCollectionPolicyV2(Policy):
         if best_xyz is not None:
             with self._fused_lock:
                 self._yolo_port_xyz   = best_xyz
-                self._yolo_port_valid = True
+                self._yolo_seen_target = True
+                self._yolo_last_det_time = time.time()
 
     def _cb_per_cam_yolo(self, msg: String, cam: str) -> None:
         """Parse per-camera detections_json and cache the best matching bbox."""
@@ -390,7 +388,12 @@ class DataCollectionPolicyV2(Policy):
 
         port_type          = str(getattr(task, "port_type",          "unknown"))
         port_name          = str(getattr(task, "port_name",          "unknown"))
+        cable_name         = str(getattr(task, "cable_name",         "unknown"))
+        plug_name          = str(getattr(task, "plug_name",          "unknown"))
+        cable_type         = str(getattr(task, "cable_type",         "unknown"))
+        plug_type          = str(getattr(task, "plug_type",          "unknown"))
         target_module_name = str(getattr(task, "target_module_name", "unknown"))
+        time_limit_s       = int(getattr(task, "time_limit",         0))
         task_id            = str(getattr(task, "id", str(episode_id)))
 
         send_feedback(
@@ -403,14 +406,26 @@ class DataCollectionPolicyV2(Policy):
             self._current_port_type   = port_type.strip().lower()
             self._current_module_name = target_module_name.strip().lower()
             self._yolo_port_xyz       = np.zeros(3, dtype=np.float32)
-            self._yolo_port_valid     = False
+            self._yolo_seen_target    = False
+            self._yolo_last_det_time  = None
         with self._cam_lock:
             for cam in _CAMERAS:
                 self._cam_last_det_time[cam] = None
                 self._cam_last_conf[cam]     = 0.0
                 self._cam_last_bbox[cam]     = None
 
-        self._recorder.start_episode(episode_id, task_id, port_type, port_name)
+        self._recorder.start_episode(
+            episode_id,
+            task_id,
+            port_type,
+            port_name,
+            cable_type=cable_type,
+            cable_name=cable_name,
+            plug_type=plug_type,
+            plug_name=plug_name,
+            target_module_name=target_module_name,
+            time_limit_s=time_limit_s,
+        )
         tf_pairs = self._privileged_tf_pairs(task)
         self._recorder.set_privileged_tf_frame_pairs(
             [self._format_tf_pair(t, s) for t, s in tf_pairs]
@@ -436,11 +451,18 @@ class DataCollectionPolicyV2(Policy):
 
         # Measure resting force baseline (10 attempts, first success wins)
         force_baseline_n = 0.0
+        tare_wrench = np.zeros(6, dtype=np.float32)
         for _ in range(10):
             obs0 = get_observation()
             if obs0 is not None:
-                w = obs0.wrist_wrench.wrench.force
+                wrench = obs0.wrist_wrench.wrench
+                w = wrench.force
+                tare_wrench = np.array([
+                    wrench.force.x, wrench.force.y, wrench.force.z,
+                    wrench.torque.x, wrench.torque.y, wrench.torque.z,
+                ], dtype=np.float32)
                 force_baseline_n = float(np.sqrt(w.x*w.x + w.y*w.y + w.z*w.z))
+                self._recorder.set_wrist_force_tare(tare_wrench)
                 # Update image dims from first observation
                 self._img_h = obs0.left_image.height or _CAM_H
                 self._img_w = obs0.left_image.width  or _CAM_W
@@ -449,6 +471,8 @@ class DataCollectionPolicyV2(Policy):
         self.get_logger().info(
             f"collector_v2/episode={episode_id} "
             f"force_baseline={force_baseline_n:.1f}N "
+            f"tare={[round(float(v), 3) for v in tare_wrench.tolist()]} "
+            f"plug={plug_type} "
             f"img={self._img_h}x{self._img_w}"
         )
 
@@ -465,15 +489,24 @@ class DataCollectionPolicyV2(Policy):
                     relative_pose = self._relative_pose_plug_to_target(task)
                     priv_tf, priv_tf_valid = self._privileged_tf_snapshot(tf_pairs)
                     with self._fused_lock:
-                        yolo_xyz   = self._yolo_port_xyz.copy()
-                        yolo_valid = self._yolo_port_valid
+                        yolo_xyz = self._yolo_port_xyz.copy()
+                        yolo_seen = self._yolo_seen_target
+                        last_det_time = self._yolo_last_det_time
+                    if yolo_seen and last_det_time is not None:
+                        yolo_age = min(MAX_AGE_S, time.time() - last_det_time)
+                        yolo_valid = yolo_age < AGE_VALID_S
+                    else:
+                        yolo_age = MAX_AGE_S
+                        yolo_valid = False
                     yolo_per_camera = self._snapshot_per_camera_features()
                     self._recorder.record_frame(
                         obs,
                         relative_pose=relative_pose,
                         privileged_tf=priv_tf,
                         privileged_tf_valid=priv_tf_valid,
-                        yolo_port_xyz=yolo_xyz if yolo_valid else None,
+                        yolo_port_xyz=yolo_xyz if yolo_seen else None,
+                        yolo_port_valid=yolo_valid,
+                        yolo_port_age=yolo_age,
                         yolo_per_camera=yolo_per_camera,
                     )
                 time.sleep(max(0.0, _step - (time.time() - t0)))
