@@ -55,6 +55,27 @@ from aic_control_interfaces.msg import (
     TrajectoryGenerationMode,
 )
 
+# ── LeRobot SmolVLA import workaround (bypass GROOT dataclass error) ───────────
+# lerobot/policies/__init__.py imports ALL policies including groot, which has
+# a broken @dataclass definition. We register stub modules so the __init__ is
+# never executed, then import SmolVLA directly.
+import lerobot as _lerobot_pkg
+import types
+import sys as _sys
+
+_lerobot_root = Path(_lerobot_pkg.__file__).resolve().parent
+_policies_dir = _lerobot_root / "policies"
+_smolvla_dir  = _policies_dir / "smolvla"
+
+_policies_pkg = types.ModuleType("lerobot.policies")
+_policies_pkg.__path__ = [str(_policies_dir)]
+_sys.modules["lerobot.policies"] = _policies_pkg
+
+_smolvla_pkg = types.ModuleType("lerobot.policies.smolvla")
+_smolvla_pkg.__path__ = [str(_smolvla_dir)]
+_sys.modules["lerobot.policies.smolvla"] = _smolvla_pkg
+# ──────────────────────────────────────────────────────────────────────────────
+
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
