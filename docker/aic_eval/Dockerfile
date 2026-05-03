@@ -11,7 +11,7 @@ COPY --chmod=u=rwX,go=rX --parents **/package.xml /ws_aic/src/aic
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked --mount=type=cache,target=/var/lib/apt,sharing=locked \
   apt update && apt upgrade -y && \
   # undeclared deps
-  apt install python3-numpy && \
+  apt -y install python3-numpy python3-toml && \
   cd /ws_aic/src && \
   vcs import . < /ws_aic/src/aic/aic.repos --recursive && \
   # Install Gazebo dependencies.
@@ -43,7 +43,7 @@ should_enable_acl() {
 
 # prepare the credentials file
 if should_enable_acl; then
-  if [[ ! (-n "$AIC_EVAL_PASSWD" && -n "AIC_MODEL_PASSWD") ]]; then
+  if [[ ! (-n "$AIC_EVAL_PASSWD" && -n "$AIC_MODEL_PASSWD") ]]; then
     echo "AIC_EVAL_PASSWD, AIC_MODEL_PASSWD must be provided"
     exit 1
   fi
