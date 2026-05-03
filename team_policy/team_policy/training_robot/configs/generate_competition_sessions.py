@@ -100,7 +100,7 @@ HEADER_TMPL = """\
 # Board stays on the table: z=1.14, roll=0.0, pitch=0.0.
 # Only x/y and yaw vary between sessions.
 #
-# Session {session_num:02d} of {total}
+# Session {session_num:03d} of {total}
 # Board pose: {pose_label}
 # Trials: {trial_sequence}
 #
@@ -461,7 +461,7 @@ def build_session(session_num: int, total: int, out_dir: Path) -> Path:
     sc_trans_c  = SC_TRANS_OPTIONS[sc_c  % len(SC_TRANS_OPTIONS)]
 
     pose_label = "ABCDEFGHIJ"[pose_idx]
-    yaml_path  = out_dir / f"session_{session_num:02d}.yaml"
+    yaml_path  = out_dir / f"session_{session_num:03d}.yaml"
 
     if 11 <= session_num <= 20:
         trial_str = f"SC{sc_c} → NIC{nic_a} → NIC{nic_b}"
@@ -495,7 +495,7 @@ def build_session(session_num: int, total: int, out_dir: Path) -> Path:
 
 def build_nic_triplet_session(session_num: int, total: int, out_dir: Path) -> Path:
     _, pose, mounts, pose_label = _session_spec(session_num)
-    yaml_path = out_dir / f"session_{session_num:02d}.yaml"
+    yaml_path = out_dir / f"session_{session_num:03d}.yaml"
 
     round_idx = (session_num - 1) // len(POSES)
     base = round_idx % len(NIC_TRIPLET_TARGETS)
@@ -683,7 +683,7 @@ def main() -> None:
             base = round_idx % len(NIC_TRIPLET_TARGETS)
             targets = [NIC_TRIPLET_TARGETS[(base + offset) % len(NIC_TRIPLET_TARGETS)] for offset in (0, 3, 6)]
             trial_str = "→".join(f"NIC{rail}({trans:+.3f})" for rail, trans in targets)
-            print(f"  session_{i:02d}.yaml  pose={pose_label}  {trial_str}")
+            print(f"  session_{i:03d}.yaml  pose={pose_label}  {trial_str}")
 
         print(f"\nGenerated {args.sessions} NIC-only 3-trial session YAMLs in: {out_dir}/")
         print(
@@ -706,7 +706,7 @@ def main() -> None:
                 trial_str = f"SC{sc_c}→NIC{nic_a}→NIC{nic_b}"
             else:
                 trial_str = f"NIC{nic_a}→NIC{nic_b}→SC{sc_c}"
-            print(f"  session_{i:02d}.yaml  pose={pose_label}  {trial_str}")
+            print(f"  session_{i:03d}.yaml  pose={pose_label}  {trial_str}")
 
         print(f"\nGenerated {args.sessions} session YAMLs in: {out_dir}/")
         print(
