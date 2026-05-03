@@ -229,9 +229,40 @@ cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
 
 ## 4. Validation
 
+Always validate before converting. The validator checks shapes, ranges, timestamps, images, YOLO features, and schema version.
+
+### Full check — all episodes, all fields (recommended)
+
+```bash
+cd $AIC_ROOT
+pixi run python team_policy/team_policy/training_robot/check_episodes.py
+```
+
+For a specific run directory:
+
+```bash
+pixi run python team_policy/team_policy/training_robot/check_episodes.py $SEAGATE/run_session_01
+```
+
+This prints per-episode:
+- Schema version, frame count, duration, success flag
+- Port type / plug type / target module
+- Final error (mm)
+- `insertion_success` dataset — how many frames are 0 vs 1, which frame the event fired
+- `insertion_event_data` — the exact port string from `/scoring/insertion_event`
+- All schema v9 dataset checks (shapes, ranges, timestamps, images, YOLO features)
+
+### Schema-only validation
+
 ```bash
 pixi run python -m team_policy.training_robot.validate_episode_v2 \
-    $SEAGATE/run_001/
+    $SEAGATE/run_session_*/
+```
+
+### Check episode count
+
+```bash
+find $SEAGATE -name "episode_*.hdf5" | wc -l
 ```
 
 ## 5. Conversion

@@ -114,12 +114,20 @@ class DataCollectionPolicyV2(Policy):
         self._current_port_type:  str = ""
         self._current_module_name: str = ""
 
+        # insertion event from /scoring/insertion_event
+        self._insertion_lock = threading.Lock()
+        self._insertion_event_received: bool = False
+        self._insertion_event_data: str = ""
+
         # dynamic image dims (updated from first observation to avoid hardcoding)
         self._img_h = _CAM_H
         self._img_w = _CAM_W
 
         parent_node.create_subscription(
             String, "/fused_yolo/detections_json", self._cb_fused_yolo, 10
+        )
+        parent_node.create_subscription(
+            String, "/scoring/insertion_event", self._cb_insertion_event, 10
         )
         for cam in _CAMERAS:
             topic = _CAM_TOPICS[cam]
@@ -293,6 +301,12 @@ class DataCollectionPolicyV2(Policy):
                 self._cam_last_conf[cam]     = best_conf
                 self._cam_last_bbox[cam]     = best_bbox
 
+    def _cb_insertion_event(self, msg: String) -> None:
+        with self._insertion_lock:
+            self._insertion_event_received = True
+            self._insertion_event_data = msg.data
+        self.get_logger().info(f"Insertion event received: {msg.data}")
+
     # ------------------------------------------------------------------
     # Per-camera feature snapshot (called at record time)
     # ------------------------------------------------------------------
@@ -413,6 +427,9 @@ class DataCollectionPolicyV2(Policy):
                 self._cam_last_det_time[cam] = None
                 self._cam_last_conf[cam]     = 0.0
                 self._cam_last_bbox[cam]     = None
+        with self._insertion_lock:
+            self._insertion_event_received = False
+            self._insertion_event_data     = ""
 
         self._recorder.start_episode(
             episode_id,
@@ -499,6 +516,8 @@ class DataCollectionPolicyV2(Policy):
                         yolo_age = MAX_AGE_S
                         yolo_valid = False
                     yolo_per_camera = self._snapshot_per_camera_features()
+                    with self._insertion_lock:
+                        ins_success = float(self._insertion_event_received)
                     self._recorder.record_frame(
                         obs,
                         relative_pose=relative_pose,
@@ -508,6 +527,7 @@ class DataCollectionPolicyV2(Policy):
                         yolo_port_valid=yolo_valid,
                         yolo_port_age=yolo_age,
                         yolo_per_camera=yolo_per_camera,
+                        insertion_success=ins_success,
                     )
                 time.sleep(max(0.0, _step - (time.time() - t0)))
 
@@ -538,11 +558,14 @@ class DataCollectionPolicyV2(Policy):
                     max_err = threshold
                     break
 
+            with self._insertion_lock:
+                insertion_event_data = self._insertion_event_data
             path = self._recorder.end_episode(
                 success=success,
                 max_final_error_m=max_err,
                 max_sustained_force_duration_s=self._max_sustained_force_s,
                 force_baseline_n=force_baseline_n,
+                insertion_event_data=insertion_event_data,
             )
             if path:
                 self._saved_count += 1

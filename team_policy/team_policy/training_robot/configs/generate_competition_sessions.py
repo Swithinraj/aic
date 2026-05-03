@@ -28,6 +28,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -228,6 +229,10 @@ robot:
 """
 
 NIC_TRIPLET_TARGETS = [(rail, trans) for rail in range(5) for trans in (0.015, -0.015)]
+
+_SESSION_PATTERN_ORDER: list[int] | None = None
+_POSE_ORDER: list[int] | None = None
+_MOUNT_ORDER: list[int] | None = None
 
 
 def _pose_block(pose: dict, indent: int = 10) -> str:
@@ -520,10 +525,50 @@ def build_nic_triplet_session(session_num: int, total: int, out_dir: Path) -> Pa
     return yaml_path
 
 
+def _expanded_index_order(total: int, base_len: int, rng: random.Random | None) -> list[int]:
+    if rng is None:
+        return [i % base_len for i in range(total)]
+
+    out: list[int] = []
+    remaining = total
+    while remaining > 0:
+        chunk = list(range(base_len))
+        rng.shuffle(chunk)
+        take = min(base_len, remaining)
+        out.extend(chunk[:take])
+        remaining -= take
+    return out
+
+
+def configure_session_schedule(
+    total_sessions: int,
+    randomize: bool = False,
+    seed: int | None = None,
+) -> int | None:
+    global _SESSION_PATTERN_ORDER, _POSE_ORDER, _MOUNT_ORDER
+
+    rng = None
+    actual_seed = None
+    if randomize:
+        actual_seed = seed if seed is not None else random.SystemRandom().randrange(0, 2**32)
+        rng = random.Random(actual_seed)
+
+    _SESSION_PATTERN_ORDER = _expanded_index_order(total_sessions, len(SESSION_PATTERNS), rng)
+    _POSE_ORDER = _expanded_index_order(total_sessions, len(POSES), rng)
+    _MOUNT_ORDER = _expanded_index_order(total_sessions, len(MOUNT_SETS), rng)
+    return actual_seed
+
+
 def _session_spec(session_num: int) -> tuple[tuple[int, int, int], dict, dict, str]:
-    pattern_idx = (session_num - 1) % len(SESSION_PATTERNS)
-    pose_idx = (session_num - 1) % len(POSES)
-    mount_idx = (session_num - 1) % len(MOUNT_SETS)
+    idx = session_num - 1
+    if _SESSION_PATTERN_ORDER is None or _POSE_ORDER is None or _MOUNT_ORDER is None:
+        pattern_idx = idx % len(SESSION_PATTERNS)
+        pose_idx = idx % len(POSES)
+        mount_idx = idx % len(MOUNT_SETS)
+    else:
+        pattern_idx = _SESSION_PATTERN_ORDER[idx]
+        pose_idx = _POSE_ORDER[idx]
+        mount_idx = _MOUNT_ORDER[idx]
     return (
         SESSION_PATTERNS[pattern_idx],
         POSES[pose_idx],
@@ -601,10 +646,32 @@ def main() -> None:
                         help="Session layout: 'mixed' for the original mixed-task generator, or 'nic_triplets' for NIC-only 3-trial sessions.")
     parser.add_argument("--out-dir", default="sessions",
                         help="Output directory (default: sessions/)")
+    parser.add_argument("--randomize", action="store_true",
+                        help="Randomize session-to-pose/pattern/mount assignment while preserving overall coverage.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed for randomized generation. Omit to use a fresh system-random seed.")
     args = parser.parse_args()
 
     out_dir = Path(__file__).parent / args.out_dir
     out_dir.mkdir(exist_ok=True)
+    actual_seed = configure_session_schedule(
+        args.sessions,
+        randomize=args.randomize,
+        seed=args.seed,
+    )
+    manifest_path = out_dir / "generation_manifest.txt"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                f"layout={args.layout}",
+                f"sessions={args.sessions}",
+                f"trials_per_session={args.trials_per_session}",
+                f"randomize={args.randomize}",
+                f"seed={actual_seed if actual_seed is not None else 'deterministic'}",
+            ]
+        )
+        + "\n"
+    )
 
     if args.layout == "nic_triplets":
         if args.trials_per_session != 3:
@@ -619,6 +686,10 @@ def main() -> None:
             print(f"  session_{i:02d}.yaml  pose={pose_label}  {trial_str}")
 
         print(f"\nGenerated {args.sessions} NIC-only 3-trial session YAMLs in: {out_dir}/")
+        print(
+            f"Generation mode: {'randomized' if args.randomize else 'deterministic'}"
+            + (f" (seed={actual_seed})" if actual_seed is not None else "")
+        )
         print("Each session = 3 NIC trials, FIXED table pose, lean entity spawn.")
         print("Board z stays 1.14 and roll/pitch stay 0.0; only x/y/yaw vary between sessions.")
         print(f"\nLaunch one session at a time:")
@@ -638,6 +709,10 @@ def main() -> None:
             print(f"  session_{i:02d}.yaml  pose={pose_label}  {trial_str}")
 
         print(f"\nGenerated {args.sessions} session YAMLs in: {out_dir}/")
+        print(
+            f"Generation mode: {'randomized' if args.randomize else 'deterministic'}"
+            + (f" (seed={actual_seed})" if actual_seed is not None else "")
+        )
         print(f"Each session = 3 trials, FIXED table pose, lean entity spawn.")
         print(f"Board z stays 1.14 and roll/pitch stay 0.0; only x/y/yaw vary between sessions.")
         print(f"\nLaunch one session at a time:")
@@ -660,6 +735,10 @@ def main() -> None:
             file_num += 1
 
     print(f"\nGenerated {total_files} single-trial YAMLs in: {out_dir}/")
+    print(
+        f"Generation mode: {'randomized' if args.randomize else 'deterministic'}"
+        + (f" (seed={actual_seed})" if actual_seed is not None else "")
+    )
     print("Each file = 1 trial. Relaunch Gazebo for every file so the gripper starts closed.")
     print("Board z stays 1.14 and roll/pitch stay 0.0; only x/y/yaw vary between source sessions.")
     print(f"\nLaunch one file at a time:")

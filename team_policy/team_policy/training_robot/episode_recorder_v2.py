@@ -211,6 +211,7 @@ class Frame:
     yolo_port_valid: bool = False   # fresh fused target detection flag, not hold-last existence
     yolo_port_age: float = MAX_AGE_S
     yolo_per_camera: Optional[Dict[str, np.ndarray]] = None  # {"left"/"center"/"right": (7,)}
+    insertion_success: float = 0.0  # 1.0 from the frame when /scoring/insertion_event fires
 
 
 @dataclass
@@ -358,6 +359,7 @@ class EpisodeRecorderV2:
         yolo_port_valid: bool = False,
         yolo_port_age: float = MAX_AGE_S,
         yolo_per_camera: Optional[Dict[str, np.ndarray]] = None,
+        insertion_success: float = 0.0,
     ) -> None:
         """Stream one frame to HDF5. yolo_per_camera = {"left"/"center"/"right": (7,)}."""
         if self._current is None or self._hf is None:
@@ -445,6 +447,7 @@ class EpisodeRecorderV2:
                 else {k: np.asarray(v, dtype=np.float32).copy()
                       for k, v in yolo_per_camera.items()}
             ),
+            insertion_success=float(insertion_success),
         )
         self._current.frames.append(frame)
 
@@ -454,6 +457,7 @@ class EpisodeRecorderV2:
         max_final_error_m: Optional[float] = None,
         max_sustained_force_duration_s: Optional[float] = DEFAULT_MAX_SUSTAINED_FORCE_DURATION_S,
         force_baseline_n: float = 0.0,
+        insertion_event_data: str = "",
     ) -> Optional[str]:
         if self._current is None or self._hf is None:
             return None
@@ -510,7 +514,8 @@ class EpisodeRecorderV2:
 
         assert self._partial_path is not None and self._final_path is not None
         try:
-            self._write_state_and_metadata(ep, force_baseline_n=force_baseline_n)
+            self._write_state_and_metadata(ep, force_baseline_n=force_baseline_n,
+                                           insertion_event_data=insertion_event_data)
             self._hf.close()
             os.replace(self._partial_path, self._final_path)
             saved_path = self._final_path
@@ -543,7 +548,8 @@ class EpisodeRecorderV2:
         self._final_path = None
         self._img_ds = {}
 
-    def _write_state_and_metadata(self, ep: Episode, force_baseline_n: float = 0.0) -> None:
+    def _write_state_and_metadata(self, ep: Episode, force_baseline_n: float = 0.0,
+                                   insertion_event_data: str = "") -> None:
         import h5py
 
         assert self._hf is not None
@@ -629,6 +635,11 @@ class EpisodeRecorderV2:
         ])
         yolo_valid_fraction = float(yolo_port_valid.mean()) if T else 0.0
 
+        # --- insertion success flag ---
+        insertion_success_arr = np.array(
+            [f.insertion_success for f in ep.frames], dtype=np.float32
+        )
+
         # --- per-camera YOLO features (v6) ---
         zero7 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, MAX_AGE_S], dtype=np.float32)
         per_cam_features: Dict[str, np.ndarray] = {}
@@ -668,6 +679,9 @@ class EpisodeRecorderV2:
         plug_type_ds.attrs["encoding"] = "is_sfp,is_sc"
         target_module_ds = obs.create_dataset("target_module_onehot", data=target_module_onehot)
         target_module_ds.attrs["encoding"] = ",".join(TARGET_MODULE_NAMES)
+        ins_ds = obs.create_dataset("insertion_success", data=insertion_success_arr)
+        ins_ds.attrs["semantics"] = "0=before_insertion 1=insertion_event_received"
+        ins_ds.attrs["source_topic"] = "/scoring/insertion_event"
 
         tf_group = obs.create_group("privileged_tf")
         tf_group.create_dataset("transforms", data=privileged_tf)
@@ -730,3 +744,5 @@ class EpisodeRecorderV2:
         meta.attrs["yolo_fresh_valid_fraction"] = yolo_valid_fraction
         meta.attrs["image_height"]       = self._img_h
         meta.attrs["image_width"]        = self._img_w
+        meta.attrs["insertion_event_received"] = int(bool(insertion_event_data))
+        meta.attrs["insertion_event_data"]     = str(insertion_event_data)

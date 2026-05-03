@@ -235,6 +235,18 @@ wait_for() {
 
 ts() { date "+[%H:%M:%S]"; }
 
+AIC_RESULTS_DIR="${HOME}/aic_results"
+
+clear_aic_results() {
+    if [[ ! -d "$AIC_RESULTS_DIR" ]]; then return 0; fi
+    local bags; bags=$(find "$AIC_RESULTS_DIR" -maxdepth 1 -name "bag_trial_*" -type d 2>/dev/null)
+    if [[ -n "$bags" ]]; then
+        echo "$(ts) Clearing rosbags from $AIC_RESULTS_DIR ..."
+        find "$AIC_RESULTS_DIR" -maxdepth 1 -name "bag_trial_*" -type d -exec rm -rf {} + 2>/dev/null || true
+        echo "$(ts) Rosbags cleared."
+    fi
+}
+
 kill_lingering() {
     local patterns="component_container|aic_engine|ros_gz|aic_adapter|robot_state_publisher|zenoh"
     local pids; pids=$(pgrep -f "$patterns" 2>/dev/null) || pids=""
@@ -365,6 +377,7 @@ EOF
     sleep 3
     kill_lingering
     wait_for_port
+    clear_aic_results
     sleep "$POST_CTRLC_WAIT"
     echo "$(ts) Session done: $SESSION"
     echo ""
