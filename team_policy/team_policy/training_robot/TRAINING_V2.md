@@ -93,18 +93,20 @@ sudo apt install tmux
 
 The helper script runs `distrobox enter -r` which internally calls `sudo podman`. Without this setup it will prompt for a password on every session, blocking automation.
 
-Run once per machine (each user runs this themselves — `$USER` expands to their own username automatically):
+Run **once per machine** by any admin — covers all users on the machine:
 
 ```bash
-echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/podman" | sudo tee /etc/sudoers.d/podman-nopasswd
+echo "ALL ALL=(ALL) NOPASSWD: /usr/bin/podman" | sudo tee /etc/sudoers.d/podman-nopasswd
 sudo chmod 440 /etc/sudoers.d/podman-nopasswd
 ```
 
-Verify it works — this should print `OK, no password needed` with no prompt:
+Verify it works — should print `OK, no password needed` with no prompt:
 
 ```bash
 distrobox enter -r aic_eval -- echo "OK, no password needed"
 ```
+
+This persists across reboots and terminal restarts. It only needs to be done once on each machine.
 
 ### Monitoring the script with tmux
 
