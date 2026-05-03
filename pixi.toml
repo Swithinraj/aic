@@ -22,7 +22,6 @@ ros-kilted-aic-model = { path = "aic_model" }
 ros-kilted-aic-model-interfaces = { path = "aic_interfaces/aic_model_interfaces" }
 ros-kilted-aic-task-interfaces = { path = "aic_interfaces/aic_task_interfaces" }
 ros-kilted-aic-teleoperation = { path = "aic_utils/aic_teleoperation" }
-ros-kilted-aic-training-interfaces = { path = "aic_utils/aic_training_interfaces" }
 ros-kilted-control-msgs = "*"                                                          # lerobot_robot_ros
 ros-kilted-geometry-msgs = "*"                                                         # lerobot_robot_ros
 ros-kilted-lerobot-robot-aic = { path = "aic_utils/lerobot_robot_aic" }
@@ -35,6 +34,8 @@ ros-kilted-std-msgs = "*"                                                       
 ros-kilted-std-srvs = "*"
 ros-kilted-tf2-ros-py = "*"
 setuptools = ">=71.0.0,<81.0.0"                                                        # required by lerobot==0.4.3
+ros-kilted-team-policy = { path = "team_policy" }
+open3d = "*"
 
 [pypi-dependencies]
 huggingface-hub = { version = "~=1.7" }
@@ -44,6 +45,44 @@ lerobot_teleoperator_devices = { git = "https://github.com/koonpeng/lerobot-ros"
 mujoco = "==3.5.0"
 pynput = ">=1.7.6,<2"
 pyspacemouse = ">=2.0.0, <3"
+transformers = ">=4.49"
+pillow = "*"
+safetensors = "*"
+trimesh = "*"
+ultralytics = "*"
+pyrender = "*"
+pyglet = "*"
+PyOpenGL= "*"
+h5py = "*"
+pandas = "*"
+
 
 [activation]
 scripts = ["pixi_env_setup.sh"]
+
+
+
+[tasks.download_model]
+description = "Downloads the Depth-Anything-V2 model locally if it doesn't exist"
+cmd = """
+python -c '
+import os
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+out_dir = "team_policy/models/depth_anything_v2_small"
+if not os.path.exists(out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    print("Downloading model...")
+    model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+    AutoImageProcessor.from_pretrained(model_id).save_pretrained(out_dir)
+    AutoModelForDepthEstimation.from_pretrained(model_id).save_pretrained(out_dir)
+    print("Model saved to " + out_dir)
+else:
+    print("Model already exists at " + out_dir)
+'
+"""
+
+[tasks.test_depth]
+description = "Runs the stereo depth node with Depth-Anything-V2 environment variables"
+depends-on = ["download_model"]
+cmd = "unset DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB && export DEPTH_ANYTHING_V2_MODEL_ID_OR_PATH=$PWD/team_policy/models/Depth-Anything-V2-Metric-Indoor-Base-hf && export DEPTH_ANYTHING_V2_LOCAL_ONLY=1 && export DEPTH_ANYTHING_V2_DEVICE=auto && export DEPTH_ANYTHING_V2_GPU_MIN_VRAM_GB=2 && export DEPTH_ANYTHING_V2_MAX_SIDE_CPU=448 && export DEPTH_ANYTHING_V2_MAX_SIDE_GPU=700 && export DEPTH_ANYTHING_V2_MAX_INFERENCE_HZ=2.0 && export DEPTH_ANYTHING_V2_USE_FP16=1 && ros2 run team_policy test_stereo_center_depth && export YOLOV12_MODEL_PATH=$PWD/team_policy/models/yolov12.pt && export YOLOV12_DEVICE=auto && export YOLOV12_CONF=0.25 && export YOLOV12_IOU=0.45 && export YOLOV12_IMGSZ=640 && export YOLOV12_MAX_HZ=5.0"
