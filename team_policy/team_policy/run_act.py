@@ -119,6 +119,10 @@ _ACT_NEAR_PORT_SFP_M = 0.085
 _ACT_NEAR_PORT_SC_M = 0.120
 _ACT_PORT_WORSEN_M = 0.020
 _ACT_PORT_WORSEN_STEPS = 4
+_ACT_YOLO_ASSIST_MIN_STEPS = 10
+_ACT_YOLO_ASSIST_MAX_PORT_DIST_M = 0.22
+_ACT_YOLO_ASSIST_GAIN = 0.35
+_ACT_YOLO_ASSIST_STEP_M = 0.004
 
 _YOLO_FINE_MAX_STEPS = 25
 _YOLO_FINE_TOL_M = 0.006
@@ -128,8 +132,8 @@ _YOLO_FINE_GAIN = 0.6
 _YOLO_FINE_TOTAL_CAP_M = 0.080
 _YOLO_FINE_NO_IMPROVE_STEPS = 6
 _YOLO_FINE_IMPROVE_EPS_M = 0.0015
-_YOLO_INSERT_LATERAL_MAX_SFP_M = 0.035
-_YOLO_INSERT_LATERAL_MAX_SC_M = 0.045
+_YOLO_INSERT_LATERAL_MAX_SFP_M = 0.018
+_YOLO_INSERT_LATERAL_MAX_SC_M = 0.025
 
 _INSERT_STALL_WINDOW = 30
 _INSERT_STALL_PROGRESS_M = 0.0005
@@ -653,6 +657,40 @@ class RunACT(Policy):
             return _YOLO_INSERT_LATERAL_MAX_SC_M
         return _YOLO_INSERT_LATERAL_MAX_SFP_M
 
+    def _apply_yolo_approach_assist(
+        self,
+        target_pose: Pose,
+        tcp_pos: np.ndarray,
+        tcp_quat: np.ndarray,
+        recent_actions,
+        step_count: int,
+    ) -> tuple[float | None, float]:
+        if step_count < _ACT_YOLO_ASSIST_MIN_STEPS or not recent_actions or len(recent_actions) < 5:
+            return None, 0.0
+        port_xyz, port_valid = self._current_port_xyz()
+        if not port_valid:
+            return None, 0.0
+        port_dist = float(np.linalg.norm(port_xyz.astype(np.float64) - tcp_pos))
+        if port_dist > _ACT_YOLO_ASSIST_MAX_PORT_DIST_M:
+            return None, 0.0
+
+        axis, _ = self._pick_insertion_axis(tcp_quat, recent_actions)
+        lateral = self._lateral_error_to_port(tcp_pos, port_xyz, axis)
+        lateral_norm = float(np.linalg.norm(lateral))
+        if lateral_norm <= self._insert_lateral_threshold_m():
+            return lateral_norm, 0.0
+
+        correction = lateral * _ACT_YOLO_ASSIST_GAIN
+        corr_norm = float(np.linalg.norm(correction))
+        if corr_norm > _ACT_YOLO_ASSIST_STEP_M:
+            correction *= _ACT_YOLO_ASSIST_STEP_M / corr_norm
+            corr_norm = _ACT_YOLO_ASSIST_STEP_M
+
+        target_pose.position.x += float(correction[0])
+        target_pose.position.y += float(correction[1])
+        target_pose.position.z += float(correction[2])
+        return lateral_norm, corr_norm
+
     # ------------------------------------------------------------------
     # Phase 1: ACT approach
     # ------------------------------------------------------------------
@@ -698,6 +736,13 @@ class RunACT(Policy):
             recent_actions.append(shaped.copy())
 
             target_pose = self._delta_to_pose(obs_msg, shaped)
+            assist_lateral, assist_corr = self._apply_yolo_approach_assist(
+                target_pose,
+                pos,
+                quat,
+                recent_actions,
+                step_count,
+            )
             mu = self._make_motion(target_pose, _STIFFNESS_APPROACH, _DAMPING_APPROACH)
             move_robot(motion_update=mu)
 
@@ -767,6 +812,11 @@ class RunACT(Policy):
                     port_s = f" | port_d={port_d*1000:.1f}mm"
                     if lateral_norm is not None:
                         port_s += f" lateral={lateral_norm*1000:.1f}mm"
+                if assist_lateral is not None:
+                    port_s += (
+                        f" assist_lat={assist_lateral*1000:.1f}mm"
+                        f" assist={assist_corr*1000:.1f}mm"
+                    )
                 self.get_logger().info(
                     f"ACT step={step_count:4d} | "
                     f"tcp=({pos[0]:+.4f},{pos[1]:+.4f},{pos[2]:+.4f}) | "
@@ -1221,38 +1271,54 @@ class RunACT(Policy):
             f"module={self._target_module_name or '?'}"
         )
 
-        obs_msg, pos, quat, recent_actions, act_steps = self._run_act_phase(
-            get_observation, move_robot, send_feedback, start
-        )
-        self.get_logger().info(
-            f"ACT phase complete: {act_steps} steps in {self._now() - start:.1f}s"
-        )
-
+        pos = None
+        quat = None
+        recent_actions = deque(maxlen=30)
         insert_dir = None
-        if pos is not None and quat is not None and self._now() - start < self.time_limit_s - 20.0:
-            _, fine_pos, fine_quat, insert_dir, fine_lateral = self._run_yolo_fine_align(
-                get_observation,
-                move_robot,
-                start,
-                pos,
-                quat,
-                recent_actions,
+        act_steps_total = 0
+        aligned_for_insert = False
+
+        for approach_pass in range(3):
+            if self._now() - start > self.time_limit_s - 35.0:
+                break
+
+            obs_msg, pos, quat, recent_actions, act_steps = self._run_act_phase(
+                get_observation, move_robot, send_feedback, start
             )
-            if fine_pos is not None and fine_quat is not None:
-                pos, quat = fine_pos, fine_quat
-            if (
-                fine_lateral is not None
-                and fine_lateral > self._insert_lateral_threshold_m()
-            ):
-                self.get_logger().info(
-                    "Fine align is still outside insertion gate; insertion will continue "
-                    "but cannot declare success until lateral improves "
-                    f"lateral={fine_lateral*1000:.1f}mm "
-                    f"limit={self._insert_lateral_threshold_m()*1000:.1f}mm"
+            act_steps_total += act_steps
+            self.get_logger().info(
+                f"ACT phase pass {approach_pass + 1} complete: "
+                f"{act_steps} steps in {self._now() - start:.1f}s"
+            )
+            if pos is None or quat is None:
+                break
+
+            fine_lateral = None
+            if self._now() - start < self.time_limit_s - 20.0:
+                _, fine_pos, fine_quat, insert_dir, fine_lateral = self._run_yolo_fine_align(
+                    get_observation,
+                    move_robot,
+                    start,
+                    pos,
+                    quat,
+                    recent_actions,
                 )
+                if fine_pos is not None and fine_quat is not None:
+                    pos, quat = fine_pos, fine_quat
+
+            if fine_lateral is None or fine_lateral <= self._insert_lateral_threshold_m():
+                aligned_for_insert = True
+                break
+
+            self.get_logger().info(
+                "Fine align is still outside insertion gate; running another "
+                "model approach pass instead of inserting "
+                f"lateral={fine_lateral*1000:.1f}mm "
+                f"limit={self._insert_lateral_threshold_m()*1000:.1f}mm"
+            )
 
         insert_steps = 0
-        if pos is not None and self._now() - start < self.time_limit_s - 5.0:
+        if aligned_for_insert and pos is not None and self._now() - start < self.time_limit_s - 5.0:
             if insert_dir is None:
                 insert_dir, _ = self._pick_insertion_axis(quat, recent_actions)
             insert_steps = self._run_insertion_phase(
@@ -1265,10 +1331,28 @@ class RunACT(Policy):
                 recent_actions,
                 insert_dir,
             )
+        elif pos is not None:
+            self.get_logger().info(
+                "Insertion skipped because YOLO alignment never reached the gate; "
+                "holding until trial budget instead of returning early"
+            )
+            hold_pose = Pose(
+                position=Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2])),
+                orientation=Quaternion(
+                    x=float(quat[0]),
+                    y=float(quat[1]),
+                    z=float(quat[2]),
+                    w=float(quat[3]),
+                ),
+            )
+            while self._now() - start < self.time_limit_s - 1.0:
+                mu = self._make_motion(hold_pose, _STIFFNESS_APPROACH, _DAMPING_APPROACH)
+                move_robot(motion_update=mu)
+                time.sleep(_STEP_S)
 
         elapsed = self._now() - start
         self.get_logger().info(
-            f"RunACT clean hybrid finished — ACT:{act_steps} + INSERT:{insert_steps} "
+            f"RunACT clean hybrid finished — ACT:{act_steps_total} + INSERT:{insert_steps} "
             f"in {elapsed:.1f}s"
         )
         return True
