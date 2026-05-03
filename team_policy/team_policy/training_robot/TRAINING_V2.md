@@ -89,6 +89,47 @@ If `tmux` is missing:
 sudo apt install tmux
 ```
 
+### One-time sudo setup — remove password prompt for distrobox
+
+The helper script runs `distrobox enter -r` which internally calls `sudo podman`. Without this setup it will prompt for a password on every session, blocking automation.
+
+Run once per machine:
+
+```bash
+echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/podman" | sudo tee /etc/sudoers.d/podman-nopasswd
+sudo chmod 440 /etc/sudoers.d/podman-nopasswd
+```
+
+Verify it works (no password prompt):
+
+```bash
+sudo -n /usr/bin/podman version
+```
+
+If that prints the podman version without asking for a password, you are done.
+
+### Monitoring the script with tmux
+
+The script runs inside a tmux session named `aic_collect_v2`. To attach from any terminal:
+
+```bash
+env LD_LIBRARY_PATH="" tmux attach -t aic_collect_v2
+```
+
+The `env LD_LIBRARY_PATH=""` is required because the pixi environment sets a library path that conflicts with the system tmux binary. Without it you will see:
+
+```
+tmux: .pixi/envs/default/lib/libtinfo.so.6: version NCURSES6_TINFO_6.4.current not found
+```
+
+Always open a **fresh terminal window** (not one already inside a pixi shell) before running this attach command.
+
+To detach from tmux without stopping the script:
+
+```
+Ctrl+B  then  D
+```
+
 ### Where to run each command
 
 - Run the helper script `bash aic_collect_v2.sh` on the host, not inside the distrobox.
