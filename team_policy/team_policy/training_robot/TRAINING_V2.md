@@ -217,12 +217,9 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
 Terminal 2:
 
 ```bash
-cd $AIC_ROOT
-pixi shell
-
 export RUN=run_001
 
-ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.training_robot.cheatcode_collector_v2 \
     -p output_dir:=$SEAGATE/$RUN \
@@ -276,7 +273,7 @@ Then run the trained V2 checkpoint:
 ```bash
 export CHECKPOINT=./outputs/aic_v3_77d_run1/pretrained_model
 
-ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.run_act_v2 \
     -p checkpoint_path:=$CHECKPOINT
@@ -759,12 +756,9 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
 ### Minimal manual collection
 
 ```bash
-cd $AIC_ROOT
-pixi shell
-
 export RUN=run_001
 
-ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.training_robot.cheatcode_collector_v2 \
     -p output_dir:=$SEAGATE/$RUN \
@@ -826,7 +820,7 @@ $SEAGATE/
 ### SC-focused collection example
 
 ```bash
-ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.training_robot.cheatcode_collector_v2 \
     -p output_dir:=$SEAGATE/run_sc_001 \
@@ -836,7 +830,7 @@ ros2 run aic_model aic_model --ros-args \
 ### NIC-focused collection example
 
 ```bash
-ros2 run aic_model aic_model --ros-args \
+cd $AIC_ROOT && pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.training_robot.cheatcode_collector_v2 \
     -p output_dir:=$SEAGATE/run_nic_001 \
@@ -1207,7 +1201,7 @@ If you want the older stable baseline instead:
 | Record schema | `episode_recorder.py` (`v5`) | `episode_recorder_v2.py` (`v6`) |
 | Validate | `validate_episode.py` | `validate_episode_v2.py` |
 | Convert | `convert_to_lerobot.py` | `convert_to_lerobot_v2.py` |
-| State dim | `30` | `63` |
+| State dim | `30` | `77` |
 | Deploy | `run_act.py` | `run_act_v2.py` |
 
 V1 and V2 checkpoints are not interchangeable.

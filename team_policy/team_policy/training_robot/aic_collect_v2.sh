@@ -212,9 +212,10 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # =============================================================================
 
 tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
-tmux new-session  -d -s "$TMUX_SESSION" -x 240 -y 55
-tmux split-window -h -t "${TMUX_SESSION}:0"
-tmux select-pane  -t "${TMUX_SESSION}:0.0"
+T1_PANE=$(tmux new-session  -d -s "$TMUX_SESSION" -x 240 -y 55 -P -F "#{pane_id}")
+T2_PANE=$(tmux split-window -h -t "$T1_PANE" -P -F "#{pane_id}")
+tmux select-pane  -t "$T1_PANE"
+echo "T1 pane: $T1_PANE  T2 pane: $T2_PANE"
 
 echo "Monitor with: tmux attach -t $TMUX_SESSION"
 echo ""
@@ -332,19 +333,19 @@ EOF
     chmod +x "$T2_SCRIPT"
 
     # ── Launch T1 ──────────────────────────────────────────────────────
-    tmux send-keys -t "${TMUX_SESSION}:0.0" "bash ${T1_SCRIPT}" Enter
+    tmux send-keys -t "$T1_PANE" "bash ${T1_SCRIPT}" Enter
     echo "$(ts) T1 started. Waiting for aic_engine ready (timeout: ${READY_TIMEOUT}s)..."
 
     if ! wait_for "$T1_STATUS" "$TRIGGER_READY" "$READY_TIMEOUT" "$READY_POLL"; then
         echo "$(ts) [ERROR] aic_engine never became ready. Skipping $SESSION."
         FAILED+=("$SESSION (aic_engine never ready)")
-        tmux send-keys -t "${TMUX_SESSION}:0.0" C-c
+        tmux send-keys -t "$T1_PANE" C-c
         sleep 5; continue
     fi
     echo "$(ts) aic_engine ready."
 
     # ── Launch T2 ──────────────────────────────────────────────────────
-    tmux send-keys -t "${TMUX_SESSION}:0.1" "bash ${T2_SCRIPT}" Enter
+    tmux send-keys -t "$T2_PANE" "bash ${T2_SCRIPT}" Enter
     echo "$(ts) T2 started. Collecting (timeout: ${DONE_TIMEOUT}s)..."
 
     if ! wait_for "$T1_STATUS" "$TRIGGER_DONE" "$DONE_TIMEOUT" "$DONE_POLL"; then
@@ -357,10 +358,10 @@ EOF
 
     # ── Shutdown ───────────────────────────────────────────────────────
     echo "$(ts) Ctrl+C → T2 (collector)..."
-    tmux send-keys -t "${TMUX_SESSION}:0.1" C-c
+    tmux send-keys -t "$T2_PANE" C-c
     sleep 2
     echo "$(ts) Ctrl+C → T1 (aic_engine)..."
-    tmux send-keys -t "${TMUX_SESSION}:0.0" C-c
+    tmux send-keys -t "$T1_PANE" C-c
     sleep 3
     kill_lingering
     wait_for_port
