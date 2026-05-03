@@ -1,5 +1,17 @@
 # Training Robot — YOLO-Guided Imitation Learning Pipeline
 
+For the current V2 training/collection/deployment pipeline, use
+[TRAINING_V2.md](/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot/TRAINING_V2.md:1).
+
+That document contains the current:
+
+- schema v9 episode format
+- 77D state layout
+- Seagate storage setup
+- host/distrobox prechecks
+- helper script commands
+- convert/train/deploy commands
+
 This is the single source of truth for collecting demonstrations, checking
 episode quality, converting data, training ACT, and running inference.
 

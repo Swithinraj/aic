@@ -14,34 +14,230 @@ This guide is intentionally code-accurate. Older notes may still mention
 experimental **57D**, **63D**, **68D**, or **75D** variants, but the default
 synced V2 pipeline in the current repo is now **77D**.
 
-## Quick Start
+## Workflow Order
 
-If you just want the current end-to-end V2 flow, use this order:
+Read this file in this order:
 
-1. Launch simulation for collection:
+1. Precheck
+2. Exports
+3. Collection
+4. Validation
+5. Conversion
+6. Training
+7. Deployment
+
+The detailed state-layout and schema reference comes after these workflow steps.
+
+## 1. Precheck
+
+If someone else is running this pipeline on a different machine, these are the
+things they must verify first.
+
+### Host paths
+
+By default this guide assumes:
+
+```bash
+export AIC_ROOT=/home/$USER/ros2_ws/src/aic
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export SEAGATE=/media/$USER/seagate/aic_episodes
+export DATASET_DIR=$TRAIN_ROOT/lerobot_datasets/aic_v3_77d
+```
+
+If their workspace or mount point is different, they must change these first.
+The helper script defaults are based on the same assumptions:
+
+- `AIC_ROOT_DEFAULT="/home/${USER}/ros2_ws/src/aic"`
+- `EPISODES_DIR_DEFAULT="/media/${USER}/seagate/aic_episodes"`
+
+See [aic_collect_v2.sh](/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/training_robot/aic_collect_v2.sh:64).
+
+### Seagate precheck
+
+If episodes must be stored on Seagate, verify the drive is mounted and writable:
+
+```bash
+mkdir -p /media/$USER/seagate/aic_episodes
+touch /media/$USER/seagate/aic_episodes/.write_test
+rm /media/$USER/seagate/aic_episodes/.write_test
+ls -ld /media/$USER/seagate/aic_episodes
+```
+
+For manual collection, pass the Seagate path explicitly through
+`-p output_dir:=...`.
+
+For the helper script, episodes are intended to be written under:
+
+```bash
+/media/$USER/seagate/aic_episodes
+```
+
+### Software and environment precheck
+
+Run these in a normal host shell before collection:
+
+```bash
+pixi --version
+tmux -V
+distrobox list | grep aic_eval
+ls $AIC_ROOT
+```
+
+If `tmux` is missing:
+
+```bash
+sudo apt install tmux
+```
+
+### Where to run each command
+
+- Run the helper script `bash aic_collect_v2.sh` on the host, not inside the distrobox.
+- Terminal 1 launches the evaluation container through `distrobox enter -r aic_eval -- /entrypoint.sh ...`.
+- Terminal 2 is the host shell where `pixi` and `ros2 run aic_model ...` are launched.
+- Validation, conversion, training, and deployment commands are also run from the host shell.
+
+### Minimal preflight
+
+```bash
+export AIC_ROOT=/home/$USER/ros2_ws/src/aic
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export SEAGATE=/media/$USER/seagate/aic_episodes
+export DATASET_DIR=$TRAIN_ROOT/lerobot_datasets/aic_v3_77d
+
+mkdir -p $SEAGATE
+touch $SEAGATE/.write_test && rm $SEAGATE/.write_test
+pixi --version
+tmux -V
+distrobox list | grep aic_eval
+```
+
+## 2. Exports
+
+For repeat use, add these to `~/.bashrc`:
+
+```bash
+export AIC_ROOT=/home/$USER/ros2_ws/src/aic
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export EPISODES_DIR=/media/$USER/seagate/aic_episodes
+```
+
+Then reload:
+
+```bash
+source ~/.bashrc
+```
+
+For the current V2 pipeline, the working session exports are:
+
+```bash
+export AIC_ROOT=~/ros2_ws/src/aic
+export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
+export SEAGATE=/media/$USER/seagate/aic_episodes
+export DATASET_DIR=$TRAIN_ROOT/lerobot_datasets/aic_v3_77d
+```
+
+## 3. Collection
+
+### Launch simulation for collection
+
+For collection, Terminal 1 needs an `aic_engine_config_file:=...` session YAML.
+
+- If you use `bash aic_collect_v2.sh`, the helper script launches Terminal 1 and passes the session YAML automatically.
+- If you launch the sim manually, you must pass the YAML yourself.
+
+Manual example:
 
 ```bash
 distrobox enter -r aic_eval -- /entrypoint.sh \
     ground_truth:=true \
     start_aic_engine:=true \
-    gazebo_gui:=false
+    gazebo_gui:=false \
+    aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_01.yaml
 ```
 
-2. Collect schema v9 episodes:
+### Generate session YAMLs if they do not exist
+
+Deterministic generation, same files on every machine for the same code/version:
+
+```bash
+cd $AIC_ROOT
+python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py \
+    --sessions 50 \
+    --out-dir sessions
+```
+
+Randomized generation with a reproducible seed:
+
+```bash
+cd $AIC_ROOT
+python3 team_policy/team_policy/training_robot/configs/generate_competition_sessions.py \
+    --sessions 50 \
+    --out-dir sessions \
+    --randomize \
+    --seed 42
+```
+
+If you use `--randomize` without `--seed`, the generator uses a fresh
+system-random seed and writes the chosen settings to:
+
+```bash
+team_policy/team_policy/training_robot/configs/sessions/generation_manifest.txt
+```
+
+### Collect schema v9 episodes
+
+Helper script:
 
 ```bash
 cd $TRAIN_ROOT
 bash aic_collect_v2.sh
 ```
 
-3. Validate the recorded episodes:
+The helper script handles the session YAML automatically. It launches:
+
+```bash
+aic_engine_config_file:=${SESSIONS_DIR}/${SESSION}
+```
+
+inside the distrobox for each selected session file, so you do not need to pass
+the YAML manually in helper-script mode.
+
+Manual collection:
+
+Terminal 1:
+
+```bash
+distrobox enter -r aic_eval -- /entrypoint.sh \
+    ground_truth:=true \
+    start_aic_engine:=true \
+    gazebo_gui:=false \
+    aic_engine_config_file:=$TRAIN_ROOT/configs/sessions/session_01.yaml
+```
+
+Terminal 2:
+
+```bash
+cd $AIC_ROOT
+pixi shell
+
+export RUN=run_001
+
+ros2 run aic_model aic_model --ros-args \
+    -p use_sim_time:=true \
+    -p policy:=team_policy.training_robot.cheatcode_collector_v2 \
+    -p output_dir:=$SEAGATE/$RUN \
+    -p num_episodes:=3 \
+    -p success_only:=true
+```
+
+## 4. Validation
 
 ```bash
 pixi run python -m team_policy.training_robot.validate_episode_v2 \
     $SEAGATE/run_001/
 ```
 
-4. Convert to the synced 77D LeRobot dataset:
+## 5. Conversion
 
 ```bash
 pixi run python -m team_policy.training_robot.convert_to_lerobot_v2 \
@@ -50,7 +246,7 @@ pixi run python -m team_policy.training_robot.convert_to_lerobot_v2 \
     --success_only
 ```
 
-5. Train ACT on the converted dataset:
+## 6. Training
 
 ```bash
 pixi run lerobot-train \
@@ -65,13 +261,17 @@ pixi run lerobot-train \
     --output_dir=./outputs/aic_v3_77d_run1
 ```
 
-6. Deploy with the combined planner running:
+## 7. Deployment
+
+Start the combined planner:
 
 ```bash
 pixi run ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=team_policy.planner.combined_yolo_depth_pose_planner
 ```
+
+Then run the trained V2 checkpoint:
 
 ```bash
 export CHECKPOINT=./outputs/aic_v3_77d_run1/pretrained_model
