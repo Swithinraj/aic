@@ -177,7 +177,7 @@ elif [[ $# -ge 1 && "$1" =~ ^[0-9]+$ ]]; then
         echo "[ERROR] Range $START–$END invalid (total: $TOTAL)"; exit 1
     fi
     for i in $(seq "$START" "$END"); do
-        YAML_FILES+=("$(printf 'session_%02d.yaml' "$i")")
+        YAML_FILES+=("$(printf 'session_%03d.yaml' "$i")")
     done
 else
     # All yaml files

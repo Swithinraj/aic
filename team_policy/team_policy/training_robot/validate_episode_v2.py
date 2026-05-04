@@ -13,11 +13,20 @@ Extends the original validate_episode.py with v6/v7/v8/v9-specific checks:
 Usage:
     cd ~/ros2_ws/src/aic
     pixi run python -m team_policy.training_robot.validate_episode_v2 \\
-        /media/$USER/seagate/aic_episodes/run_001/episode_00000.hdf5
+        /media/$USER/seagate/aic_episodes/run_session_001/episode_00000.hdf5
 
     # Validate entire directory
     pixi run python -m team_policy.training_robot.validate_episode_v2 \\
-        /media/$USER/seagate/aic_episodes/run_001/
+        /media/$USER/seagate/aic_episodes/run_session_001/
+
+    # Validate all runs
+    pixi run python -m team_policy.training_robot.validate_episode_v2 \\
+        /media/$USER/seagate/aic_episodes/run_session_*/
+
+    # Full per-episode report (schema + insertion success + scores)
+    pixi run python -m team_policy.training_robot.check_episodes
+    pixi run python -m team_policy.training_robot.check_episodes \\
+        /media/$USER/seagate/aic_episodes/run_session_001
 """
 from __future__ import annotations
 

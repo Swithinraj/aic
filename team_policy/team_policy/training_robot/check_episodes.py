@@ -15,7 +15,7 @@ Checks per episode:
 Usage:
     cd ~/ros2_ws/src/aic
     pixi run python -m team_policy.training_robot.check_episodes
-    pixi run python -m team_policy.training_robot.check_episodes /media/$USER/seagate/aic_episodes/run_session_01
+    pixi run python -m team_policy.training_robot.check_episodes /media/$USER/seagate/aic_episodes/run_session_001
 """
 from __future__ import annotations
 
