@@ -15,7 +15,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from sensor_msgs.msg import Image, CameraInfo
 
 from team_policy.perception.yolov12_detector import YoloV12MultiCameraDetector
-from team_policy.perception.cad_depth_registration import CadDepthPoseEstimator
+# from team_policy.perception.cad_depth_registration import CadDepthPoseEstimator
 
 
 class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
@@ -56,6 +56,11 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         self._latest_depth_images: Dict[str, Optional[np.ndarray]] = {"left": None, "center": None, "right": None}
         self._latest_depth_stamps: Dict[str, float] = {"left": 0.0, "center": 0.0, "right": 0.0}
 
+        # Cross-camera SFP port label consensus
+        self._latest_processed_outputs: Dict[str, Dict] = {}
+        self._sfp_consensus_left_label: Optional[str] = None
+        self._sfp_consensus_last_time: float = 0.0
+
         self._depth_subs = {
             "left": self.create_subscription(Image, "/left_camera/stereo_depth/image", lambda msg: self._depth_cb("left", msg), 10),
             "center": self.create_subscription(Image, "/center_camera/stereo_depth/image", lambda msg: self._depth_cb("center", msg), 10),
@@ -63,13 +68,13 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         }
         self._tf_sub = self.create_subscription(TFMessage, "/tf", self._tf_callback, 100)
 
-        self._cad_estimator = CadDepthPoseEstimator(
-            assets_models_dir=self._assets_models_dir or None,
-            logger=lambda msg: self.get_logger().info(msg),
-            voxel_size_m=self._env_float("YOLO_DEPTH_POSE_VOXEL_M", 0.004),
-            min_points=max(40, int(self._env_float("YOLO_DEPTH_POSE_MIN_POINTS", 60))),
-        )
-
+#         self._cad_estimator = CadDepthPoseEstimator(
+#             assets_models_dir=self._assets_models_dir or None,
+#             logger=lambda msg: self.get_logger().info(msg),
+#             voxel_size_m=self._env_float("YOLO_DEPTH_POSE_VOXEL_M", 0.004),
+#             min_points=max(40, int(self._env_float("YOLO_DEPTH_POSE_MIN_POINTS", 60))),
+#         )
+# # 
         self.get_logger().info(
             f"Combined planner node started: YOLO + metric depth + CAD registration, TF camera={self._tf_camera}, base_frame={self._base_frame}"
         )
@@ -133,10 +138,19 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         if not camera_results:
             return
 
+        # Build the processed-outputs dict for cross-camera consensus, then
+        # apply consensus SFP port label normalization BEFORE publishing.
+        for camera_name, res in camera_results.items():
+            _, detections, _, _, _, _, _, _, _ = res["result"]
+            self._latest_processed_outputs[camera_name] = {"detections": detections}
+        self._normalize_sfp_port_labels_across_cameras(self._latest_processed_outputs)
+
         instance_obs = {}
         for camera_name, res in camera_results.items():
             msg = res["msg"]
             annotated, detections, classes, mask_overlay, mask_binary, mask_status, _, _, _ = res["result"]
+            # Recompute classes after consensus may have relabelled SFP ports.
+            classes = [str(det.get("instance_name", det.get("class_name", ""))) for det in detections]
 
             annotated_msg = self._bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
             annotated_msg.header = msg.header
@@ -564,9 +578,10 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
                 continue
             family = self._detection_family_name(det)
             raw_pose = None
-            if depth is not None:
-                mesh_family = family if family in {"nic", "sc", "sfp_module"} else None
-                raw_pose = self._cad_estimator.estimate_pose(info, depth, det, mesh_family, init_pose_camera=board_pose_camera)
+            # CAD estimator disabled (cad_depth_registration module not present on this branch)
+            # if depth is not None:
+            #     mesh_family = family if family in {"nic", "sc", "sfp_module"} else None
+            #     raw_pose = self._cad_estimator.estimate_pose(info, depth, det, mesh_family, init_pose_camera=board_pose_camera)
 
             pose = None
             if family == "sfp_module" and raw_pose is not None:
@@ -1443,6 +1458,161 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             ],
             dtype=np.float32,
         )
+
+    # ------------------------------------------------------------------
+    # Cross-camera SFP port label consensus
+    # ------------------------------------------------------------------
+
+    def _bbox_center_x(self, det: Dict) -> float:
+        """Return horizontal centre pixel of a detection's bounding box."""
+        bbox = det.get("bbox_xyxy")
+        if not bbox or len(bbox) < 4:
+            return 0.0
+        return (float(bbox[0]) + float(bbox[2])) / 2.0
+
+    def _is_sfp_port(self, det: Dict) -> bool:
+        """True when the detection belongs to the SFP-port family."""
+        base = str(det.get("base_class_name", ""))
+        cls = str(det.get("class_name", ""))
+        inst = str(det.get("instance_name", ""))
+        return base == "sfp_port" or cls.startswith("sfp_port") or inst.startswith("sfp_port")
+
+    def _is_nic_card(self, det: Dict) -> bool:
+        """True when the detection is a NIC card."""
+        return (
+            str(det.get("base_class_name", "")) == "nic_card"
+            or str(det.get("class_name", "")) == "nic_card"
+        )
+
+    def _find_best_nic(self, detections: List[Dict]) -> Optional[Dict]:
+        """Return the highest-confidence NIC card detection, or None."""
+        nics = [d for d in detections if self._is_nic_card(d)]
+        if not nics:
+            return None
+        return max(nics, key=lambda d: float(d.get("confidence", 0.0)))
+
+    def _find_two_sfp_ports_for_nic(
+        self, detections: List[Dict], nic_det: Optional[Dict]
+    ) -> List[Dict]:
+        """Return up to 2 SFP-port detections closest to *nic_det*, sorted
+        left-to-right by image-X so index 0 is the image-left port."""
+        ports = [d for d in detections if self._is_sfp_port(d)]
+        if not ports:
+            return []
+        if nic_det is not None:
+            nic_cx = self._bbox_center_x(nic_det)
+            bbox = nic_det.get("bbox_xyxy", [0, 0, 0, 0])
+            nic_cy = (float(bbox[1]) + float(bbox[3])) / 2.0
+
+            def dist_to_nic(p: Dict) -> float:
+                px = self._bbox_center_x(p)
+                pb = p.get("bbox_xyxy", [0, 0, 0, 0])
+                py = (float(pb[1]) + float(pb[3])) / 2.0
+                return ((px - nic_cx) ** 2 + (py - nic_cy) ** 2) ** 0.5
+
+            ports.sort(key=dist_to_nic)
+        else:
+            ports.sort(key=lambda d: -float(d.get("confidence", 0.0)))
+        top_two = ports[:2]
+        top_two.sort(key=self._bbox_center_x)   # image-left first
+        return top_two
+
+    def _camera_sfp_left_right_assignment(
+        self, camera_name: str, detections: List[Dict]
+    ):
+        """Return (img_left_port, img_right_port, l_label, r_label) for one
+        camera, where *img_left_port* is the image-leftmost SFP port.
+        Returns (None, None, None, None) when fewer than 2 ports are visible."""
+        nic = self._find_best_nic(detections)
+        ports = self._find_two_sfp_ports_for_nic(detections, nic)
+        if len(ports) < 2:
+            return None, None, None, None
+        img_left_port = ports[0]
+        img_right_port = ports[1]
+        l_label = str(img_left_port.get("instance_name", img_left_port.get("class_name", "")))
+        r_label = str(img_right_port.get("instance_name", img_right_port.get("class_name", "")))
+        l_cx = self._bbox_center_x(img_left_port)
+        r_cx = self._bbox_center_x(img_right_port)
+        self.get_logger().info(
+            f"YOLO_SFP_VOTE camera={camera_name} left={l_label} right={r_label} "
+            f"left_cx={l_cx:.1f} right_cx={r_cx:.1f}"
+        )
+        return img_left_port, img_right_port, l_label, r_label
+
+    def _normalize_sfp_port_labels_across_cameras(self, processed_dict: Dict) -> None:
+        """Cross-camera majority-vote consensus for SFP port 0/1 labels.
+
+        For each camera that sees exactly 2 SFP ports we record a *vote*:
+          - vote for sfp_port_0 if the image-left port is already labelled
+            ``sfp_port_0``
+          - vote for sfp_port_1 otherwise.
+
+        If at least 2 cameras agree, we relabel every camera so that:
+          - image-left  port → *consensus_left*
+          - image-right port → *consensus_right*
+
+        This corrects the rare case where one camera assigns conflicting
+        indices, ensuring the fused JSON always uses a consistent numbering.
+        """
+        votes_sfp0 = 0
+        votes_sfp1 = 0
+        valid_cams = 0
+        camera_port_pairs: Dict = {}
+
+        for cam, p in processed_dict.items():
+            l_port, r_port, l_label, r_label = self._camera_sfp_left_right_assignment(
+                cam, p["detections"]
+            )
+            if l_label and r_label:
+                valid_cams += 1
+                camera_port_pairs[cam] = (l_port, r_port, l_label, r_label)
+                if l_label == "sfp_port_0":
+                    votes_sfp0 += 1
+                elif l_label == "sfp_port_1":
+                    votes_sfp1 += 1
+
+        if votes_sfp0 >= 2:
+            consensus_left = "sfp_port_0"
+            consensus_right = "sfp_port_1"
+        elif votes_sfp1 >= 2:
+            consensus_left = "sfp_port_1"
+            consensus_right = "sfp_port_0"
+        else:
+            self.get_logger().info(
+                f"YOLO_SFP_CONSENSUS skipped reason=no_majority "
+                f"votes_sfp0={votes_sfp0} votes_sfp1={votes_sfp1} valid_cameras={valid_cams}"
+            )
+            self._sfp_consensus_left_label = None
+            return
+
+        self.get_logger().info(
+            f"YOLO_SFP_CONSENSUS left={consensus_left} right={consensus_right} "
+            f"votes_sfp0={votes_sfp0} votes_sfp1={votes_sfp1}"
+        )
+        self._sfp_consensus_left_label = consensus_left
+        self._sfp_consensus_last_time = time.monotonic()
+
+        for cam, (l_port, r_port, old_l_label, old_r_label) in camera_port_pairs.items():
+            if old_l_label != consensus_left or old_r_label != consensus_right:
+                self.get_logger().info(
+                    f"YOLO_SFP_RELABEL camera={cam} "
+                    f"old_left={old_l_label} new_left={consensus_left} "
+                    f"old_right={old_r_label} new_right={consensus_right}"
+                )
+            # Always write the consensus label (idempotent when already correct).
+            l_port["instance_name"] = consensus_left
+            l_port["class_name"] = consensus_left
+            l_port["base_class_name"] = "sfp_port"
+            l_port["sfp_consensus_corrected"] = True
+            l_port["sfp_consensus_left_label"] = consensus_left
+            l_port["sfp_order_role"] = "image_left"
+
+            r_port["instance_name"] = consensus_right
+            r_port["class_name"] = consensus_right
+            r_port["base_class_name"] = "sfp_port"
+            r_port["sfp_consensus_corrected"] = True
+            r_port["sfp_consensus_left_label"] = consensus_left
+            r_port["sfp_order_role"] = "image_right"
 
 
 def main(args=None) -> None:
