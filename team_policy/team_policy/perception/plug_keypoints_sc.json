@@ -1,0 +1,13 @@
+{
+  "plug": "sc",
+  "source": "aic_assets/models/SC Plug/model.sdf sc_tip_link",
+  "plug_tip_model": [0.01165, 0.0, 0.0],
+  "rear_point_model": [-0.0457523, 0.0, 0.0],
+  "plug_axis_model": [1.0, 0.0, 0.0],
+  "front_face_corners_model": [
+    [0.01165, -0.0125, -0.00505],
+    [0.01165, -0.0125, 0.00505],
+    [0.01165, 0.0125, -0.00505],
+    [0.01165, 0.0125, 0.00505]
+  ]
+}

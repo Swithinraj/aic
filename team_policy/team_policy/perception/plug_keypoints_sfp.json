@@ -1,0 +1,14 @@
+{
+  "plug": "sfp",
+  "source": "aic_assets/models/SFP Module/model.sdf plus visual mesh bounds",
+  "note": "SFP visual mesh long axis is treated as model Z for projection; the physical insertion nose is the forward visual bound.",
+  "plug_tip_model": [0.0, 0.0, -0.02365],
+  "rear_point_model": [0.0, 0.0, 0.0327711],
+  "plug_axis_model": [0.0, 0.0, -1.0],
+  "front_face_corners_model": [
+    [-0.007375, -0.00625, -0.02365],
+    [-0.007375, 0.00597563, -0.02365],
+    [0.007375, -0.00625, -0.02365],
+    [0.007375, 0.00597563, -0.02365]
+  ]
+}

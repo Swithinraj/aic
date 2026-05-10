@@ -253,7 +253,7 @@ distrobox enter -r aic_eval -- /entrypoint.sh \
     start_aic_engine:=true \
     gazebo_gui:=false \
     launch_rviz:=false \
-    aic_engine_config_file:=/home/YOUR_USER/ros2_ws/src/aic/team_policy/team_policy/training_robot/configs/sessions/session_01.yaml
+    aic_engine_config_file:=/home/swithin/official_aic/aic/team_policy/team_policy/training_robot/configs/sessions/session_010.yaml
 ```
 
 Wait for this line before starting Terminal 2:

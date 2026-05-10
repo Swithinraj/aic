@@ -61,8 +61,8 @@ trap 'echo "[ERROR] Script failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 # CONFIG — edit these paths if your workspace layout changes
 # =============================================================================
 
-AIC_ROOT_DEFAULT="/home/${USER}/ros2_ws/src/aic"
-EPISODES_DIR_DEFAULT="/media/${USER}/seagate/aic_episodes"
+AIC_ROOT_DEFAULT="/home/${USER}/official_aic/aic"
+EPISODES_DIR_DEFAULT="/mnt/seagate/intrinsic_swithin"
 CONFIGS_ROOT_DEFAULT="${AIC_ROOT_DEFAULT}/team_policy/team_policy/training_robot/configs"
 DEFAULT_SESSIONS_SUBDIR="sessions"
 
@@ -177,7 +177,7 @@ elif [[ $# -ge 1 && "$1" =~ ^[0-9]+$ ]]; then
         echo "[ERROR] Range $START–$END invalid (total: $TOTAL)"; exit 1
     fi
     for i in $(seq "$START" "$END"); do
-        YAML_FILES+=("$(printf 'session_%02d.yaml' "$i")")
+        YAML_FILES+=("$(printf 'session_%03d.yaml' "$i")")
     done
 else
     # All yaml files

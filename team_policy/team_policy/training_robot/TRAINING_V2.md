@@ -38,9 +38,9 @@ things they must verify first.
 By default this guide assumes:
 
 ```bash
-export AIC_ROOT=/home/$USER/ros2_ws/src/aic
+export AIC_ROOT=/home/$USER//official_aic/aic
 export TRAIN_ROOT=$AIC_ROOT/team_policy/team_policy/training_robot
-export SEAGATE=/media/$USER/seagate/aic_episodes
+export SEAGATE=/mnt/seagate/intrinsic_swithin
 export DATASET_DIR=$TRAIN_ROOT/lerobot_datasets/aic_v3_77d
 ```
 

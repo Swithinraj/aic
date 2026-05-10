@@ -1,0 +1,295 @@
+142:class GRUPolicy(nn.Module):
+145:    def __init__(
+175:    def forward(self, x: torch.Tensor) -> torch.Tensor:
+182:class GRURuntime:
+198:    def load(cls, checkpoint_path: Path, device: torch.device) -> "GRURuntime":
+206:        def _required_int(name: str) -> int:
+227:        def _stat(name: str, shape: tuple[int, ...]) -> torch.Tensor:
+255:class FeatureVSResidualBlock(nn.Module):
+258:    def __init__(self, dim: int, dropout: float):
+268:    def forward(self, x: torch.Tensor) -> torch.Tensor:
+272:class LearnedFeatureVSNet(nn.Module):
+275:    def __init__(
+310:    def forward(self, x: torch.Tensor) -> torch.Tensor:
+318:class LearnedVSRuntime:
+355:    def load(cls, checkpoint_path: Path, device: torch.device) -> "LearnedVSRuntime":
+376:        def _first_int(names: tuple[str, ...], default: Optional[int] = None) -> int:
+427:        def _as_int_list(value: Any) -> list[int]:
+436:        def _as_str_list(value: Any) -> list[str]:
+445:        def _first_str(names: tuple[str, ...], default: str = "") -> str:
+541:        def _find_stat(names: tuple[str, ...]) -> torch.Tensor:
+579:        def _first_bool(names: tuple[str, ...], default: bool = False) -> bool:
+644:    def normalized_sequence(self, seq: np.ndarray) -> np.ndarray:
+653:    def predict_with_debug(self, seq: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+665:    def predict(self, seq: np.ndarray) -> np.ndarray:
+671:class ACTV3Runtime:
+700:    def load(cls, checkpoint_path: Path, device: torch.device) -> "ACTV3Runtime":
+768:        def _get(stats, key, shape, default):
+831:    def reset(self) -> None:
+837:    def clear_action_queue(self) -> None:
+845:    def _ros_image_to_rgb(self, img_msg) -> np.ndarray:
+855:    def _img_to_tensor(self, img_msg, key: str, normalize: bool = True) -> torch.Tensor:
+872:    def select_action(self, obs_msg, state_builder) -> np.ndarray:
+902:class LockedTarget:
+915:class AlignmentInfo:
+929:class CameraAlignmentMeasurement:
+944:class FeatureAnchorMeasurement:
+974:class FeatureCameraState:
+994:class CadTipVisualState:
+1022:class LearnedVSCameraCandidate:
+1036:class TrackState:
+1041:    def __init__(self, camera: str, det: dict, now: float, alpha: float = 0.35):
+1064:    def _bbox(det: dict) -> np.ndarray:
+1069:    def _center(bbox: np.ndarray) -> np.ndarray:
+1073:    def _pose_xyz(det: dict) -> Optional[np.ndarray]:
+1088:    def update(self, det: dict, now: float) -> None:
+1111:    def predict(self, now: float) -> np.ndarray:
+1115:    def age(self, now: float) -> float:
+1119:    def iou(bbox_a: np.ndarray, bbox_b: np.ndarray) -> float:
+1136:    def distance_to(self, det_center: np.ndarray) -> float:
+1140:class CameraTargetTrack:
+1143:    def __init__(
+1160:    def reset(self) -> None:
+1164:    def _image_hw_from_det(det: dict) -> tuple[float, float]:
+1169:    def _filter(self, detections: list[dict]) -> list[dict]:
+1189:    def _cost(self, track: TrackState, det: dict, now: float) -> float:
+1199:    def _score_track(self, track: TrackState, now: float, img_h: float, img_w: float) -> float:
+1219:    def update(self, detections: list[dict], now: float) -> Optional[TrackState]:
+1265:class MultiCameraTargetTracker:
+1268:    def __init__(self, owner):
+1289:    def reset(self) -> None:
+1300:    def update_camera(self, camera: str, detections: list[dict], now: float) -> Optional[LockedTarget]:
+1309:    def update_fused(self, detections: list[dict], now: float) -> Optional[LockedTarget]:
+1331:    def _names_overlap(track: TrackState, det: dict) -> bool:
+1343:    def _select_locked(
+1413:    def selected(self) -> Optional[LockedTarget]:
+1423:class RunHybrid(Policy):
+1426:    def __init__(self, parent_node):
+1430:        def param_value(name: str, default):
+1439:        def bool_value(name: str, default: bool) -> bool:
+2199:    def _path_looks_like_act_checkpoint(self, raw_path: str) -> bool:
+2206:    def _resolve_act_checkpoint_path(self, raw_path: str) -> Path:
+2218:    def _resolve_gru_checkpoint_path(self, raw_path: str) -> Path:
+2233:    def _norm_name(value: object) -> str:
+2236:    def _parse_name_set(self, text) -> set[str]:
+2240:    def _strip_numeric_suffix(name: str) -> str:
+2246:    def _target_match_rank(self, det: dict) -> int | None:
+2288:    def _cb_fused_yolo(self, msg: String) -> None:
+2302:    def _cb_per_cam_yolo(self, msg: String, cam: str) -> None:
+2348:    def _reset_per_cam_state(self) -> None:
+2413:    def _obs_image_hw(obs_msg, cam: str) -> tuple[int, int]:
+2419:    def _build_cam_feature(self, cam: str, now: float, img_h: int, img_w: int) -> np.ndarray:
+2437:    def _build_gru_cam_feature(self, camera_name: str, target_instance: str) -> np.ndarray:
+2477:    def _extract_obb_corners(self, det: dict) -> Optional[np.ndarray]:
+2495:    def _det_names(self, det: dict) -> set[str]:
+2504:    def _is_numbered_sfp_name(self, name: str) -> bool:
+2507:    def _is_generic_sfp_port_det(self, det: dict) -> bool:
+2511:    def _camera_has_numbered_sfp(self, dets: list[dict]) -> bool:
+2519:    def _target_requested_name(self) -> str:
+2530:    def _target_det_allowed(self, det: dict, dets_context: Optional[list[dict]] = None) -> bool:
+2557:    def _best_target_detection(self, dets: list[dict], min_conf: float = 0.0) -> Optional[dict]:
+2577:    def _is_sfp_module_detection(self, det: dict) -> bool:
+2588:    def _is_module_or_plug_tip_detection(self, det: dict) -> bool:
+2594:    def _update_module_detection(self, cam: str, dets: list[dict]) -> None:
+2621:    def _image_msg_to_bgr(self, img_msg) -> Optional[np.ndarray]:
+2649:    def _get_camera_bgr(self, obs_msg, camera: str) -> Optional[np.ndarray]:
+2653:    def _expand_bbox(bbox, img_w: int, img_h: int, scale: float) -> np.ndarray:
+2669:    def _refine_port_rect_from_edges(self, image_bgr: np.ndarray, bbox_xyxy) -> Optional[dict]:
+2739:    def _port_center_from_locked_target(self, obs_msg, locked: LockedTarget) -> Optional[dict]:
+2742:        def _yolo_fallback() -> Optional[dict]:
+2814:    def _estimate_module_tip_uv(self, module_det: dict, slot_uv: np.ndarray) -> Optional[np.ndarray]:
+2855:    def _get_module_tip_uv(self, camera: str, module_detection: dict, port_detection_or_uv) -> Optional[np.ndarray]:
+2869:    def _get_module_tip_measurement(self, cam: str, port_uv: np.ndarray) -> Optional[dict]:
+2900:    def _det_center_uv(self, det: dict, prefer_feature: bool = True) -> Optional[np.ndarray]:
+2921:    def _det_image_size(self, det: dict, cam: str) -> tuple[int, int]:
+2933:    def _inside_image(self, uv: np.ndarray, image_size: tuple[int, int], margin: float = 0.0) -> bool:
+2940:    def _build_alignment_measurements(self, obs_msg=None) -> list[CameraAlignmentMeasurement]:
+3009:    def _filter_alignment_measurements(self, measurements: list[CameraAlignmentMeasurement]) -> list[CameraAlignmentMeasurement]:
+3025:    def _measurement_rms(self, measurements: list[CameraAlignmentMeasurement]) -> Optional[float]:
+3037:    def _best_module_detection(self, dets: list[dict]) -> Optional[dict]:
+3061:    def _uv_from_field(det: dict, *keys: str) -> Optional[np.ndarray]:
+3074:    def _angle_wrap(angle: float) -> float:
+3077:    def _rect_anchor_from_detection(self, det: dict, role: str, port_uv: Optional[np.ndarray] = None) -> dict:
+3134:    def _get_port_anchor_detail(self, det: dict, image=None) -> dict:
+3179:    def _get_port_anchor_from_detection(self, det: dict, image=None) -> tuple[Optional[np.ndarray], str]:
+3183:    def _get_module_anchor_detail(self, det: dict, image=None, port_uv: Optional[np.ndarray] = None) -> dict:
+3209:    def _get_module_anchor_from_detection(self, det: dict, image=None, port_uv: Optional[np.ndarray] = None) -> tuple[Optional[np.ndarray], str]:
+3243:    def _collect_feature_anchor_measurements(self, task=None, obs_msg=None) -> list[FeatureAnchorMeasurement]:
+3405:    def _feature_anchor_rms(self, measurements: list[FeatureAnchorMeasurement]) -> Optional[float]:
+3416:    def _border_score(self, uv: np.ndarray, image_size: tuple[int, int]) -> float:
+3424:    def _feature_camera_states(self, obs_msg=None) -> dict[str, FeatureCameraState]:
+3476:    def _select_feature_camera(self, obs_msg=None) -> Optional[FeatureCameraState]:
+3539:    def _measure_feature_camera(self, camera: str, obs_msg=None) -> Optional[FeatureCameraState]:
+3544:    def _reset_learned_vs_state(self, seed_action: Optional[np.ndarray] = None) -> None:
+3564:    def _learned_vs_bbox(det: Optional[dict]) -> Optional[np.ndarray]:
+3580:    def _learned_vs_bbox_or_point(bbox: Optional[np.ndarray], uv: np.ndarray) -> np.ndarray:
+3586:    def _learned_vs_crop_quality(self, image: Optional[np.ndarray], bbox: np.ndarray) -> tuple[Optional[float], Optional[float]]:
+3624:    def _learned_vs_det_quality(det: Optional[dict], fallback: float) -> float:
+3635:    def _learned_vs_measurement_quality(
+3646:    def _learned_vs_quality_components(
+3655:        def _finite_unit(value: object) -> Optional[float]:
+3718:    def _learned_vs_detection_pair(
+3725:        def _match_track(track_id: int, want_module: bool) -> Optional[dict]:
+3750:    def _learned_vs_camera_id_norm(camera: str) -> float:
+3756:    def _learned_vs_invalid_camera_block(self, camera: str) -> np.ndarray:
+3759:    def _measurement_to_core(self, m: dict, image_hw: tuple[int, int]) -> np.ndarray:
+3815:    def _invalid_camera_block(self, camera: str) -> np.ndarray:
+3832:    def _valid_camera_block(self, m: dict, image_hw: tuple[int, int]) -> np.ndarray:
+3840:    def _feature_state_to_multicam_measurement(self, obs_msg, state: FeatureCameraState) -> Optional[dict]:
+3921:    def _build_multicam_feature(self, obs_msg, measurements: dict[str, dict]) -> np.ndarray:
+3932:    def _learned_vs_camera_core_from_state(
+4044:    def _learned_vs_build_multicam_feature(self, obs_msg) -> Optional[tuple[np.ndarray, dict]]:
+4136:    def _build_learned_vs_feature(self, obs_msg, state: FeatureCameraState) -> Optional[tuple[np.ndarray, float]]:
+4288:    def _learned_vs_camera_candidates(self, obs_msg=None, log_candidates: bool = True) -> dict[str, LearnedVSCameraCandidate]:
+4334:    def _learned_vs_candidate_invalid_reason(self, cand: Optional[LearnedVSCameraCandidate], now: Optional[float] = None) -> Optional[str]:
+4358:    def _valid_learned_vs_candidates(
+4378:    def _set_learned_vs_selected_camera(self, new_camera: Optional[str], reason: str) -> None:
+4392:    def _get_best_learned_vs_candidate(
+4409:    def _select_learned_vs_camera(self, obs_msg=None) -> Optional[LearnedVSCameraCandidate]:
+4466:    def _measure_learned_vs_camera(self, camera: str, obs_msg=None) -> Optional[LearnedVSCameraCandidate]:
+4471:    def _learned_vs_sequence(self, camera: str, feature: np.ndarray) -> np.ndarray:
+4488:    def _learned_vs_multicam_sequence(self, feature: np.ndarray) -> np.ndarray:
+4505:    def _learned_vs_output_to_action(self, pred: np.ndarray) -> np.ndarray:
+4519:    def _clamp_learned_vs_action(self, raw_action: np.ndarray) -> tuple[np.ndarray, bool]:
+4538:    def _learned_vs_camera_axes_base(self, obs_msg, camera_name: str) -> Optional[tuple[np.ndarray, np.ndarray]]:
+4558:    def _project_off_axis(vec: np.ndarray, axis: np.ndarray) -> np.ndarray:
+4565:    def _learned_vs_pose_from_robot_delta(self, obs_msg, robot_delta: np.ndarray) -> Pose:
+4568:    def _learned_vs_action_to_robot_delta(
+4621:    def _learned_vs_update_sign_on_worse(self, camera_name: str) -> None:
+4639:    def _learned_vs_best_from_candidates(
+4647:    def _learned_vs_soft_accept_ready(self, candidate: Optional[LearnedVSCameraCandidate]) -> bool:
+4661:    def _learned_vs_make_info(self, candidate: LearnedVSCameraCandidate, mode: str) -> AlignmentInfo:
+4676:    def _learned_vs_make_multicam_info(self, metadata: dict, mode: str) -> AlignmentInfo:
+4700:    def _learned_vs_multicam_soft_accept_ready(self, metadata: Optional[dict]) -> bool:
+4721:    def _task_is_active(self) -> bool:
+4734:    def _finite_error_px(info: Optional[AlignmentInfo]) -> Optional[float]:
+4743:    def _best_current_learned_vs_error(self, obs_msg) -> tuple[Optional[LearnedVSCameraCandidate], Optional[float]]:
+4767:    def _clamp_act_recovery_action(self, obs_msg, action: np.ndarray) -> np.ndarray:
+4801:    def _run_act_recovery_phase(
+4891:    def _run_alignment_supervisor(
+5051:    def _reset_gru_state(self) -> None:
+5055:    def _reset_act_state(self) -> None:
+5061:    def _select_gru_action(self, obs_msg) -> np.ndarray:
+5075:    def _shape_act_action(self, action_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+5096:    def _select_act_action(self, obs_msg) -> np.ndarray:
+5107:    def _log_act_image_shapes_once(self, obs_msg) -> None:
+5122:    def _act_action_to_pose(self, obs_msg, action: np.ndarray) -> tuple[Pose, np.ndarray, np.ndarray, float]:
+5152:    def _delta_to_pose(self, obs_msg, action_6d: np.ndarray) -> Pose:
+5176:    def _build_raw_state(self, obs_msg) -> np.ndarray:
+5184:    def _build_raw_state_63(self, obs_msg) -> np.ndarray:
+5252:    def _build_raw_state_44(self, obs_msg) -> np.ndarray:
+5295:    def _build_state(self, obs_msg) -> torch.Tensor:
+5302:    def _reset_task_target(self, task) -> None:
+5312:    def _parse_tcp_to_plug_tip(self) -> np.ndarray:
+5322:    def _tcp_pose_to_arrays(self, obs_msg) -> tuple[np.ndarray, np.ndarray]:
+5331:    def _plug_tip_base_from_obs(self, obs_msg) -> np.ndarray:
+5336:    def _get_camera_info_from_obs(self, obs_msg, camera: str):
+5356:    def _camera_frame_name(self, obs_msg, camera: str) -> Optional[str]:
+5369:    def _lookup_transform_msg(self, target_frame: str, source_frame: str):
+5380:    def _lookup_base_to_camera(self, camera_frame: str):
+5383:    def _camera_geometry_results(self, obs_msg) -> dict[str, CameraGeometryResult]:
+5386:    def _camera_geometries(self, obs_msg) -> tuple[dict[str, CameraGeometry], dict[str, str]]:
+5397:    def _legacy_estimate_from_projection(self, projection: CADProjection) -> PlugPoseEstimate:
+5412:    def _startup_validate_camera_geometry(self, obs_msg) -> None:
+5472:    def _transform_point(tf_msg, point_base: np.ndarray) -> np.ndarray:
+5482:    def _camera_intrinsics(info) -> Optional[tuple[float, float, float, float]]:
+5497:    def _project_point_base_to_camera_uv(self, obs_msg, camera: str, point_base: np.ndarray) -> Optional[np.ndarray]:
+5512:    def _project_plug_tip_to_camera(self, obs_msg, camera: str) -> Optional[np.ndarray]:
+5522:    def _tf_msg_to_matrix(tf_msg) -> np.ndarray:
+5532:    def _cad_camera_context(self, obs_msg) -> tuple[
+5552:    def _cad_module_detections(self) -> dict[str, Optional[dict]]:
+5559:    def _estimate_cad_plug_pose(self, obs_msg, refine: Optional[bool] = None) -> Optional[PlugPoseEstimate]:
+5595:    def _empty_cad_projection(camera: str, reason: str):
+5600:    def _project_cad_estimate_for_pose(
+5627:    def _apply_delta_to_pose_arrays(
+5642:    def _cad_tip_visual_states(
+5778:    def _save_cad_debug_overlay(
+5822:    def _cad_visual_status_from_states(self, states: dict[str, CadTipVisualState]) -> Optional[dict]:
+5851:    def _cad_current_visual_status(self, obs_msg, estimate: Optional[PlugPoseEstimate] = None) -> Optional[dict]:
+5855:    def _pose_xyz_from_det(self, det: dict) -> Optional[np.ndarray]:
+5874:    def _find_fused_detection(self, names: list[str] | tuple[str, ...], min_conf: float = 0.0) -> Optional[dict]:
+5892:    def _target_fused_names(self) -> list[str]:
+5902:    def _module_fused_names(self) -> list[str]:
+5909:    def _lookup_det_pose_base(self, names: list[str] | tuple[str, ...], min_conf: float = 0.0) -> Optional[tuple[np.ndarray, float, str]]:
+5933:    def _pose_from_pos_quat(pos: np.ndarray, quat: np.ndarray) -> Pose:
+5940:    def _quat_angle_deg(q_before: np.ndarray, q_after: np.ndarray) -> float:
+5954:    def _axis_angle_norm_deg(rotvec: np.ndarray) -> float:
+5957:    def _now(self) -> float:
+5961:    def _pad(values, length: int) -> list[float]:
+5968:    def _make_motion(self, target_pose: Pose, stiffness, damping, wrench_gains=None) -> MotionUpdate:
+5987:    def _get_tcp_state(self, obs_msg):
+5999:    def _pace_to_step(self, t0_sim: float) -> None:
+6006:    def _hold_pose(self, pos: np.ndarray, quat: np.ndarray, move_robot) -> None:
+6009:    def _controller_mode_value(self, obs_msg) -> tuple[Optional[int], str]:
+6032:    def _controller_is_cartesian(self, obs_msg) -> bool:
+6036:    def _ensure_cartesian_mode(self, get_observation, move_robot, pos: np.ndarray, quat: np.ndarray, phase: str) -> bool:
+6062:    def _locked_target_is_valid(self, locked: Optional[LockedTarget]) -> bool:
+6072:    def _move_lateral_xy(self, pos: np.ndarray, quat: np.ndarray, delta_xy: np.ndarray, move_robot) -> np.ndarray:
+6079:    def _locked_target_for_camera(self, cam: str) -> Optional[LockedTarget]:
+6100:    def _get_locked_for_alignment_camera(self, cam: Optional[str]) -> Optional[LockedTarget]:
+6106:    def _alignment_locked(self) -> Optional[LockedTarget]:
+6129:    def _shape_gru_action(self, action_6d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+6147:    def _estimate_visual_ready_error_px(self, obs_msg, locked: Optional[LockedTarget]) -> Optional[float]:
+6158:    def _log_gru_debug_row(
+6209:    def _multicam_ready_for_handoff(self, obs_msg) -> tuple[bool, list[str]]:
+6226:    def _feature_anchor_ready_for_handoff(self, obs_msg) -> tuple[bool, list[str]]:
+6241:    def _fused_tf_ready_for_handoff(self) -> bool:
+6247:    def _current_tf_xy_error_m(self, min_conf: float = 0.0) -> Optional[float]:
+6262:    def _run_act_coarse_phase(self, get_observation, move_robot, send_feedback, start_time):
+6479:    def _run_gru_phase(self, get_observation, move_robot, send_feedback, start_time):
+6611:    def _wait_for_locked_target(self, get_observation, move_robot, pos: np.ndarray, quat: np.ndarray) -> bool:
+6656:    def _measure_ibvs_error(self, obs_msg, locked: LockedTarget) -> Optional[np.ndarray]:
+6662:    def _measure_module_tip_ibvs_error(self, obs_msg, locked: LockedTarget) -> tuple[Optional[np.ndarray], Optional[LockedTarget], Optional[dict]]:
+6686:    def _measure_edge_module_tip_error(self, obs_msg, locked: LockedTarget) -> tuple[Optional[np.ndarray], Optional[LockedTarget], Optional[dict], Optional[dict]]:
+6727:    def _settle_and_get_ibvs_error(self, get_observation) -> tuple[Optional[object], Optional[LockedTarget], Optional[np.ndarray]]:
+6737:    def _settle_and_get_module_tip_error(self, get_observation) -> tuple[Optional[object], Optional[LockedTarget], Optional[np.ndarray], Optional[dict]]:
+6748:    def _settle_and_get_edge_module_tip_error(self, get_observation) -> tuple[Optional[object], Optional[LockedTarget], Optional[np.ndarray], Optional[dict], Optional[dict]]:
+6759:    def _validate_jacobian(self, J: np.ndarray, label: str) -> bool:
+6785:    def _fallback_jacobian(self, label: str) -> np.ndarray:
+6791:    def _cache_or_fallback_jacobian(self, J: Optional[np.ndarray], mode: str, label: str) -> np.ndarray:
+6804:    def _damped_ibvs_delta(self, J: np.ndarray, err: np.ndarray, gain: Optional[float] = None) -> np.ndarray:
+6822:    def _visual_soft_accept(
+6845:    def _fit_local_jacobian(self, get_observation, move_robot, pos: np.ndarray, quat: np.ndarray) -> Optional[np.ndarray]:
+6867:    def _fit_module_tip_jacobian(self, get_observation, move_robot, pos: np.ndarray, quat: np.ndarray) -> Optional[tuple[np.ndarray, LockedTarget, dict]]:
+6894:    def _fit_edge_module_tip_jacobian(self, get_observation, move_robot, pos: np.ndarray, quat: np.ndarray) -> Optional[tuple[np.ndarray, LockedTarget, dict, dict]]:
+6921:    def _run_multicam_tf_prealign(
+7022:    def _feature_anchor_candidate_moves(self, quat: np.ndarray, step_m: float) -> list[tuple[str, np.ndarray, float]]:
+7043:    def _apply_feature_anchor_move(self, pos: np.ndarray, quat: np.ndarray, delta_xyz: np.ndarray, yaw: float, move_robot) -> tuple[np.ndarray, np.ndarray]:
+7055:    def _log_feature_anchor_csv(
+7092:    def _feature_error_vector(self, meas: FeatureAnchorMeasurement) -> tuple[np.ndarray, float, Optional[float]]:
+7109:    def _feature_control_dofs(self, quat: np.ndarray, angle_valid: bool) -> list[tuple[str, np.ndarray, float]]:
+7126:    def _apply_feature_dof_command(
+7151:    def _fit_selected_feature_jacobian(
+7198:    def _feature_dls_command(self, J: np.ndarray, error_vec: np.ndarray) -> np.ndarray:
+7209:    def _run_feature_anchor_servo(self, task, get_observation, move_robot, start_time, obs_msg, pos, quat):
+7379:    def _run_selected_camera_tip_servo(self, task, get_observation, move_robot, start_time, obs_msg, pos, quat):
+7382:    def _stack_multicam_error(self, measurements: list[CameraAlignmentMeasurement], cameras: list[str]) -> tuple[np.ndarray, np.ndarray]:
+7395:    def _fit_multicam_jacobian(self, get_observation, move_robot, pos: np.ndarray, quat: np.ndarray, base_measurements: list[CameraAlignmentMeasurement]) -> tuple[Optional[np.ndarray], list[str]]:
+7419:    def _multicam_delta(self, J: np.ndarray, err: np.ndarray, weights: np.ndarray) -> np.ndarray:
+7437:    def _log_multicam_csv(self, phase: str, measurements: list[CameraAlignmentMeasurement], rms: Optional[float], pos: Optional[np.ndarray], delta_xyz: np.ndarray, reason: str) -> None:
+7467:    def _run_multicam_ibvs_alignment(self, get_observation, move_robot, start_time, obs_msg, pos, quat):
+7552:    def _cad_tip_make_info(self, status: dict, mode: str = "cad_tip_servo") -> AlignmentInfo:
+7576:    def _cad_tip_goal_reached(self, status: Optional[dict]) -> bool:
+7593:    def _run_cad_tip_multicam_servo(
+7757:    def _run_cad_tip_alignment_supervisor(
+7820:    def _run_learned_vs_multicam_alignment(
+8187:    def _run_learned_vs_alignment(
+8603:    def _run_visual_servo(self, get_observation, move_robot, start_time) -> tuple[bool, Optional[object], Optional[np.ndarray], Optional[np.ndarray], Optional[AlignmentInfo]]:
+8793:    def _run_ibvs_alignment(self, get_observation, move_robot, start_time, obs_msg, pos, quat):
+8877:    def _run_module_tip_ibvs_alignment(self, get_observation, move_robot, start_time, obs_msg, pos, quat):
+8985:    def _run_edge_module_tip_ibvs_alignment(self, get_observation, move_robot, start_time, obs_msg, pos, quat):
+9083:    def _run_pbvs_alignment(self, get_observation, move_robot, start_time, obs_msg, pos, quat):
+9152:    def _pick_insertion_axis(self, init_quat: np.ndarray, recent_actions, alignment_info: Optional[AlignmentInfo] = None, obs_msg=None) -> tuple[np.ndarray, str]:
+9260:    def _perpendicular_search_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+9271:    def _preinsert_orientation_error_deg(self, quat: np.ndarray, alignment_info: Optional[AlignmentInfo]) -> Optional[float]:
+9284:    def _log_preinsert_orientation(self, quat: np.ndarray, alignment_info: Optional[AlignmentInfo]) -> Optional[float]:
+9297:    def _run_orientation_refinement(self, get_observation, move_robot, obs_msg, pos, quat, alignment_info: Optional[AlignmentInfo]):
+9310:    def _insertion_gate_passes(self, alignment_info: AlignmentInfo, quat: np.ndarray, obs_msg=None) -> bool:
+9422:    def _debug_success_hold_should_continue(self) -> bool:
+9436:    def _debug_hold_after_suppressed_success(self, get_observation, move_robot, pos: np.ndarray, quat: np.ndarray) -> bool:
+9465:    def _err_text(value: Optional[float]) -> str:
+9474:    def _current_multicam_visual_status(self, obs_msg) -> Optional[dict]:
+9485:    def _run_insertion_vs_correction(
+9523:    def _run_insertion_phase(self, get_observation, move_robot, send_feedback, start_time, init_pos, init_quat, recent_actions, alignment_info: AlignmentInfo) -> bool:
+9811:    def insert_cable(self, task, get_observation, move_robot, send_feedback):
+10039:def main():

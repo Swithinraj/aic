@@ -152,6 +152,7 @@ _REQUIRED_FILES = (
 
 _SCHEMA_V2_30D = "v2_30d_with_port_xyz"
 _SCHEMA_CHUNK50_33D = "legacy_33d_with_tcp_error"
+_SCHEMA_EXTENDED_ACT = "extended_act_subclass_schema"
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +207,8 @@ def detect_state_schema(state_dim: int, *_unused, override: str = "auto") -> str
         return _SCHEMA_V2_30D
     if state_dim == 33:
         return _SCHEMA_CHUNK50_33D
+    if state_dim in {63, 68, 75, 77}:
+        return _SCHEMA_EXTENDED_ACT
     raise ValueError(f"Unsupported observation.state dim: {state_dim}. Expected 30 or 33.")
 
 
@@ -242,6 +245,10 @@ class RunACT(Policy):
         )
         self.insert_target_lead_m = float(
             decl("insert_target_lead_m", _INSERT_TARGET_LEAD_M).value
+        )
+        self.insert_rotation_gain = float(decl("insert_rotation_gain", 1.0).value)
+        self.require_yolo_insert_confirm = bool(
+            decl("require_yolo_insert_confirm", False).value
         )
         self.insert_force_thresh_n = float(
             decl("insert_force_thresh_n", _INSERT_FORCE_THRESH).value
@@ -303,7 +310,7 @@ class RunACT(Policy):
         if self.delta_pose_scale < 0.0:
             # V2 was trained on frame-to-frame delta poses. Legacy 33D checkpoints
             # were commonly run as velocity-like commands integrated over 0.1s.
-            self.delta_pose_scale = 1.0 if self.schema == _SCHEMA_V2_30D else _STEP_S
+            self.delta_pose_scale = _STEP_S if self.schema == _SCHEMA_CHUNK50_33D else 1.0
 
         self._prev_action: Optional[np.ndarray] = None
         self._target_port_name = ""
@@ -1075,7 +1082,7 @@ class RunACT(Policy):
         avg_rot_delta = np.zeros(3, dtype=np.float64)
         if recent_actions and len(recent_actions) >= 5:
             actions_arr = np.array(list(recent_actions))
-            avg_rot_delta = actions_arr[:, 3:6].mean(axis=0) * 0.3
+            avg_rot_delta = actions_arr[:, 3:6].mean(axis=0) * 0.3 * self.insert_rotation_gain
 
         while self._now() - start_time < self.time_limit_s:
             t0_sim = self._now()
@@ -1106,7 +1113,15 @@ class RunACT(Policy):
                     lateral_norm = float(
                         np.linalg.norm(self._lateral_error_to_port(pos, port_xyz, insert_dir))
                     )
-                if lateral_norm is None or lateral_norm <= self._insert_lateral_threshold_m():
+                if not port_valid and self.require_yolo_insert_confirm:
+                    if not progress_reached_but_unaligned:
+                        progress_reached_but_unaligned = True
+                        self.get_logger().info(
+                            "Insertion progress reached but YOLO target is not held; "
+                            "continuing instead of returning success "
+                            f"actual={actual_progress*1000:.1f}mm"
+                        )
+                elif lateral_norm is None or lateral_norm <= self._insert_lateral_threshold_m():
                     self.get_logger().info(
                         f"Actual insertion progress reached: {actual_progress*1000:.1f}mm "
                         f"(commanded={commanded_push*1000:.1f}mm)"
