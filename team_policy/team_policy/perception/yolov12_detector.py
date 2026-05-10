@@ -40,7 +40,7 @@ class YoloV12MultiCameraDetector(Node):
         self._conf = float(os.environ.get("YOLOV12_CONF", "0.25"))
         self._iou = float(os.environ.get("YOLOV12_IOU", "0.45"))
         self._imgsz = int(os.environ.get("YOLOV12_IMGSZ", "640"))
-        self._max_hz = max(0.1, float(os.environ.get("YOLOV12_MAX_HZ", "5.0")))
+        self._max_hz = max(0.1, float(os.environ.get("YOLOV12_MAX_HZ", "15.0")))
         self._min_period = 1.0 / self._max_hz
         self._mask_alpha = float(os.environ.get("YOLOV12_MASK_ALPHA", "0.55"))
 
@@ -60,12 +60,15 @@ class YoloV12MultiCameraDetector(Node):
             os.environ.get("YOLOV12_SFP_PORT_CLASSES", "sfp_port,sfp port,sfp_tip,sfp_plug,sfp_connector")
         )
         self._sfp_module_classes = self._parse_name_set(
-            os.environ.get("YOLOV12_SFP_MODULE_CLASSES", "sfp_module,sfp module,transceiver")
+            os.environ.get("YOLOV12_SFP_MODULE_CLASSES", "sfp_module,sfp module,transceiver,sfp_port_module,sfp port module,sfp-module,sfpmodule,sfp_transceiver")
+        )
+        self._sfp_plug_line_classes = self._parse_name_set(
+            os.environ.get("YOLOV12_SFP_PLUG_LINE_CLASSES", "sfp_plug,sfp_connector,sfp_tip,sfp_module,transceiver")
         )
         self._gripper_classes = self._parse_name_set(
             os.environ.get("YOLOV12_GRIPPER_CLASSES", "gripper,gripper_tip,gripper_tcp")
         )
-        self._max_sfp_ports = max(1, int(os.environ.get("YOLOV12_MAX_SFP_PORTS", "10")))
+        self._max_sfp_ports = max(1, int(os.environ.get("YOLOV12_MAX_SFP_PORTS", "2")))
         self._sfp_port_memory = {"left": {}, "center": {}, "right": {}}
         self._sfp_port_memory_ttl_sec = float(os.environ.get("YOLOV12_SFP_PORT_MEMORY_TTL_SEC", "1.0"))
         self._sfp_port_memory_match_px = float(os.environ.get("YOLOV12_SFP_PORT_MEMORY_MATCH_PX", "60.0"))
@@ -363,18 +366,22 @@ class YoloV12MultiCameraDetector(Node):
         classes: List[str] = []
         names = result.names if hasattr(result, "names") else self._model.names
         boxes = result.boxes
+        seg_geoms = self._extract_segmentation_geometries(result, frame.shape[:2])
         if boxes is not None:
             xyxy = boxes.xyxy.detach().cpu().numpy() if boxes.xyxy is not None else np.zeros((0, 4), dtype=np.float32)
             confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.zeros((0,), dtype=np.float32)
             clss = boxes.cls.detach().cpu().numpy().astype(int) if boxes.cls is not None else np.zeros((0,), dtype=int)
-            for box, conf, cls_idx in zip(xyxy, confs, clss):
+            for idx, (box, conf, cls_idx) in enumerate(zip(xyxy, confs, clss)):
                 cls_name = str(names[int(cls_idx)]) if names is not None else str(int(cls_idx))
-                detections.append({
+                det = {
                     "class_id": int(cls_idx),
                     "class_name": cls_name,
                     "confidence": float(conf),
                     "bbox_xyxy": [float(v) for v in box.tolist()],
-                })
+                }
+                if idx < len(seg_geoms) and isinstance(seg_geoms[idx], dict):
+                    det.update(seg_geoms[idx])
+                detections.append(det)
         detections = self._filter_target_detections(detections)
         mask_overlay, mask_binary, mask_status, projected_rails, fused_targets = self._fit_rails(camera_name, frame, detections, msg)
         detections = self._assign_detection_instance_names(detections, projected_rails, fused_targets, camera_name)
@@ -382,7 +389,51 @@ class YoloV12MultiCameraDetector(Node):
         classes = [str(det["class_name"]) for det in detections]
         annotated = self._draw_filtered_detections(frame, detections)
         annotated = self._draw_instance_labels(annotated, detections)
+        annotated = self._draw_alignment_lines(annotated, detections)
         return annotated, detections, classes, mask_overlay, mask_binary, mask_status
+
+    def _extract_segmentation_geometries(self, result, image_shape) -> List[Dict]:
+        h, w = int(image_shape[0]), int(image_shape[1])
+        geoms: List[Dict] = []
+        masks_obj = getattr(result, "masks", None)
+        if masks_obj is None or getattr(masks_obj, "data", None) is None:
+            return geoms
+        try:
+            masks = masks_obj.data.detach().cpu().numpy()
+        except Exception:
+            return geoms
+        for mask in masks:
+            m = np.asarray(mask, dtype=np.float32)
+            if m.ndim != 2:
+                geoms.append({})
+                continue
+            if m.shape[0] != h or m.shape[1] != w:
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+            mb = np.where(m > 0.5, 255, 0).astype(np.uint8)
+            contours, _ = cv2.findContours(mb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                geoms.append({})
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            area = float(cv2.contourArea(contour))
+            if area < 8.0:
+                geoms.append({})
+                continue
+            rect = cv2.minAreaRect(contour)
+            (cx, cy), (rw, rh), angle = rect
+            corners = cv2.boxPoints(rect).astype(np.float32)
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.01 * max(peri, 1.0), True)
+            poly = approx.reshape(-1, 2).astype(np.float32) if approx is not None and len(approx) >= 3 else contour.reshape(-1, 2).astype(np.float32)
+            geoms.append(
+                {
+                    "mask_area_px": area,
+                    "obb_cxcywh_deg": [float(cx), float(cy), float(rw), float(rh), float(angle)],
+                    "obb_corners_uv": [[float(x), float(y)] for x, y in corners.tolist()],
+                    "mask_polygon_uv": [[float(x), float(y)] for x, y in poly.tolist()],
+                }
+            )
+        return geoms
 
     def _keep_highest_conf_per_class(self, detections: List[Dict], key_name: str = "class_name"):
         best = {}
@@ -405,6 +456,11 @@ class YoloV12MultiCameraDetector(Node):
         base = self._strip_numeric_suffix(name)
         if name in allowed_names or base in allowed_names:
             return True
+        if any(name.startswith(f"{allowed}_") for allowed in allowed_names):
+            return True
+        if "sfp_module" in allowed_names:
+            if ("sfp" in name and "module" in name) or ("transceiver" in name):
+                return True
         return False
 
     def _canonical_output_name(self, class_name: str) -> str:
@@ -417,7 +473,9 @@ class YoloV12MultiCameraDetector(Node):
             return "nic_card"
         if self._class_in_family(name, self._sc_classes):
             return "sc_port"
-        if self._class_in_family(name, self._sfp_port_classes):
+        if self._is_sfp_plug_line_name(name):
+            return "sfp_module"
+        if self._is_sfp_port_line_name(name):
             return "sfp_port"
         if self._class_in_family(name, self._sfp_module_classes):
             return "sfp_module"
@@ -435,7 +493,9 @@ class YoloV12MultiCameraDetector(Node):
             return "nic"
         if self._class_in_family(name, self._sc_classes):
             return "sc"
-        if self._class_in_family(name, self._sfp_port_classes):
+        if self._is_sfp_plug_line_name(name):
+            return "sfp_module"
+        if self._is_sfp_port_line_name(name):
             return "sfp_port"
         if self._class_in_family(name, self._sfp_module_classes):
             return "sfp_module"
@@ -468,8 +528,8 @@ class YoloV12MultiCameraDetector(Node):
         add_family(self._top_k_family_detections(detections, self._fix_classes, 1))
         add_family(self._top_k_family_detections(detections, self._nic_classes, max(1, len(self._base_nic_rail_quads))))
         add_family(self._top_k_family_detections(detections, self._sc_classes, 5))
-        add_family(self._top_k_family_detections(detections, self._sfp_port_classes, self._max_sfp_ports))
-        add_family(self._top_k_family_detections(detections, self._sfp_module_classes, 1))
+        add_family(self._top_k_sfp_port_detections(detections, self._max_sfp_ports))
+        add_family(self._top_k_sfp_plug_detections(detections, 1))
         add_family(self._top_k_family_detections(detections, self._gripper_classes, 1))
         return filtered
 
@@ -507,16 +567,171 @@ class YoloV12MultiCameraDetector(Node):
             x1, y1, x2, y2 = [int(round(float(v))) for v in det.get("bbox_xyxy", [0, 0, 0, 0])]
             family = self._detection_family_name(det)
             color = colors.get(family, (0, 255, 0))
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            
+            obb_corners = det.get("obb_corners_uv")
+            if obb_corners is not None and len(obb_corners) == 4:
+                pts = np.array(obb_corners, np.int32).reshape((-1, 1, 2))
+                cv2.polylines(out, [pts], True, color, 2, cv2.LINE_AA)
+            else:
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+
+            anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
+            anchor = self._detection_anchor_point(det, anchor_key)
+            cx, cy = int(round(float(anchor[0]))), int(round(float(anchor[1])))
+            cv2.circle(out, (cx, cy), 4, (0, 0, 255), -1, cv2.LINE_AA)
+            
             display_name = str(det.get("instance_name", det.get("class_name", det.get("raw_class_name", ""))))
             conf = float(det.get("confidence", 0.0))
-            text = f"{display_name} {conf:.2f}"
+            text = f"{display_name} {conf:.2f} uv({cx},{cy})"
             (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             tx = max(0, x1)
             ty = max(th + 6, y1 + th + 4)
             cv2.rectangle(out, (tx, ty - th - 6), (tx + tw + 8, ty + baseline - 2), color, -1, cv2.LINE_AA)
             cv2.putText(out, text, (tx + 4, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
         return out
+
+    def _draw_alignment_lines(self, image: np.ndarray, detections: List[Dict]) -> np.ndarray:
+        """Draw SFP alignment lines on the annotated image.
+
+        plug_tip  (shortest OBB edge farthest  from camera) → solid bright green, label "PT"
+        port_mouth (longest  OBB edge closest to camera)   → solid bright green, label "PM"
+        Both are drawn with a black shadow for contrast.
+        """
+        out = image.copy()
+        for det in detections:
+            line = det.get("alignment_line_uv")
+            if not isinstance(line, list) or len(line) != 2:
+                continue
+            role = str(det.get("alignment_line_role", "")).strip()
+            try:
+                p0 = tuple(np.round(np.asarray(line[0], dtype=np.float32)).astype(int).tolist())
+                p1 = tuple(np.round(np.asarray(line[1], dtype=np.float32)).astype(int).tolist())
+            except Exception:
+                continue
+
+            # Shadow + bright green line
+            cv2.line(out, p0, p1, (0, 0, 0), 7, cv2.LINE_AA)
+            cv2.line(out, p0, p1, (0, 255, 0), 3, cv2.LINE_AA)
+
+            # Endpoint dots
+            for pt in (p0, p1):
+                cv2.circle(out, pt, 5, (0, 0, 0), -1, cv2.LINE_AA)
+                cv2.circle(out, pt, 3, (0, 255, 0), -1, cv2.LINE_AA)
+
+            # Midpoint dot
+            mid_uv = det.get("alignment_line_mid_uv")
+            if isinstance(mid_uv, list) and len(mid_uv) == 2:
+                try:
+                    mp = tuple(np.round(np.asarray(mid_uv, dtype=np.float32)).astype(int).tolist())
+                except Exception:
+                    mp = None
+            else:
+                try:
+                    mp = (int(round((p0[0] + p1[0]) / 2.0)), int(round((p0[1] + p1[1]) / 2.0)))
+                except Exception:
+                    mp = None
+            if mp is not None:
+                cv2.circle(out, mp, 6, (0, 0, 0), -1, cv2.LINE_AA)
+                cv2.circle(out, mp, 4, (0, 255, 0), -1, cv2.LINE_AA)
+
+            # Role label: "PT" (plug tip) or "PM" (port mouth)
+            if role and mp is not None:
+                label = "PT" if role == "plug_tip" else "PM" if role == "port_mouth" else role[:4]
+                depth_m = det.get("alignment_line_depth_m")
+                if depth_m is not None:
+                    label += f" {float(depth_m):.2f}m"
+                lx, ly = mp[0] + 7, mp[1] - 7
+                cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (0, 255, 0), 1, cv2.LINE_AA)
+        return out
+
+    def _is_sfp_plug_line_name(self, class_name: str) -> bool:
+        name = self._norm_name(class_name)
+        if self._class_in_family(name, self._sfp_module_classes):
+            return True
+        if name in self._sfp_plug_line_classes or self._strip_numeric_suffix(name) in self._sfp_plug_line_classes:
+            return True
+        return (
+            name.startswith("sfp_")
+            and any(token in name for token in ("plug", "connector", "tip", "module", "transceiver"))
+        )
+
+    def _is_sfp_port_line_name(self, class_name: str) -> bool:
+        name = self._norm_name(class_name)
+        return self._class_in_family(name, self._sfp_port_classes) and not self._is_sfp_plug_line_name(name)
+
+    def _is_sfp_plug_line_detection(self, det: Dict) -> bool:
+        names = [
+            det.get("raw_class_name", ""),
+            det.get("base_class_name", ""),
+            det.get("class_name", ""),
+            det.get("instance_name", ""),
+        ]
+        return any(self._is_sfp_plug_line_name(str(name)) for name in names if str(name))
+
+    def _is_sfp_port_line_detection(self, det: Dict) -> bool:
+        names = [
+            det.get("raw_class_name", ""),
+            det.get("base_class_name", ""),
+            det.get("class_name", ""),
+            det.get("instance_name", ""),
+        ]
+        return any(self._is_sfp_port_line_name(str(name)) for name in names if str(name))
+
+    def _sfp_alignment_role(self, det: Dict) -> Optional[str]:
+        if self._is_sfp_plug_line_detection(det):
+            return "plug_tip"
+        if self._is_sfp_port_line_detection(det):
+            return "port_mouth"
+        return None
+
+    def _top_k_sfp_port_detections(self, detections: List[Dict], k: int) -> List[Dict]:
+        family = [det for det in detections if self._is_sfp_port_line_detection(det)]
+        family.sort(key=lambda det: float(det.get("confidence", 0.0)), reverse=True)
+        return family[: max(0, int(k))]
+
+    def _top_k_sfp_plug_detections(self, detections: List[Dict], k: int) -> List[Dict]:
+        family = [det for det in detections if self._is_sfp_plug_line_detection(det)]
+        family.sort(key=lambda det: float(det.get("confidence", 0.0)), reverse=True)
+        return family[: max(0, int(k))]
+
+    def _alignment_box_corners_uv(self, det: Dict) -> tuple[np.ndarray, str] | tuple[None, str]:
+        corners = det.get("obb_corners_uv")
+        if isinstance(corners, list) and len(corners) == 4:
+            try:
+                return np.asarray(corners, dtype=np.float32).reshape(4, 2), "obb_depth"
+            except Exception:
+                pass
+        box = det.get("bbox_xyxy")
+        if isinstance(box, list) and len(box) == 4:
+            x1, y1, x2, y2 = [float(v) for v in box]
+            return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32), "bbox_depth"
+        return None, ""
+
+    def _alignment_candidate_edges(self, det: Dict, want_long: bool) -> tuple[list[np.ndarray], str]:
+        corners, source = self._alignment_box_corners_uv(det)
+        if corners is None:
+            return [], ""
+        edges = [np.vstack([corners[i], corners[(i + 1) % 4]]).astype(np.float32) for i in range(4)]
+        lengths = np.array([self._segment_length(edge) for edge in edges], dtype=np.float32)
+        if lengths.size != 4 or float(lengths.max()) < 1e-6:
+            return [], ""
+        target = float(lengths.max() if want_long else lengths.min())
+        selected = [edge for edge, length in zip(edges, lengths) if abs(float(length) - target) <= 1e-3]
+        return selected, source
+
+    def _set_alignment_line(self, det: Dict, role: str, line_uv: np.ndarray, source: str) -> None:
+        line = np.asarray(line_uv, dtype=np.float32).reshape(2, 2)
+        mid = self._edge_midpoint(line)
+        vec = line[1] - line[0]
+        angle = float(np.arctan2(float(vec[1]), float(vec[0])))
+        det["alignment_line_role"] = str(role)
+        det["alignment_line_uv"] = [[float(line[0, 0]), float(line[0, 1])], [float(line[1, 0]), float(line[1, 1])]]
+        det["alignment_line_mid_uv"] = [float(mid[0]), float(mid[1])]
+        det["alignment_line_angle_rad"] = angle
+        det["alignment_line_source"] = str(source)
 
     def _stamp_to_sec(self, stamp) -> float:
         return float(getattr(stamp, "sec", 0)) + 1e-9 * float(getattr(stamp, "nanosec", 0))
@@ -743,6 +958,7 @@ class YoloV12MultiCameraDetector(Node):
                     "projected_sc": [],
                     "projected_nic": [],
                     "projected_board_quad": None,
+                    "observed_board_quad": None,
                     "fused_targets": fused_targets,
                     "fix_locked": False,
                 }
@@ -757,6 +973,7 @@ class YoloV12MultiCameraDetector(Node):
                     "projected_sc": [],
                     "projected_nic": [],
                     "projected_board_quad": fallback_board_quad.astype(np.float32),
+                    "observed_board_quad": fallback_board_quad.astype(np.float32),
                     "fused_targets": fused_targets,
                     "fix_locked": False,
                 }
@@ -771,6 +988,7 @@ class YoloV12MultiCameraDetector(Node):
                     "projected_sc": [],
                     "projected_nic": [],
                     "projected_board_quad": fallback_board_quad.astype(np.float32),
+                    "observed_board_quad": fallback_board_quad.astype(np.float32),
                     "fused_targets": fused_targets,
                     "fix_locked": False,
                 }
@@ -812,6 +1030,7 @@ class YoloV12MultiCameraDetector(Node):
                 "projected_sc": projected_sc,
                 "projected_nic": projected_nic,
                 "projected_board_quad": projected_board_quad,
+                "observed_board_quad": fallback_board_quad.astype(np.float32),
                 "fused_targets": fused_targets,
                 "fix_locked": True,
             }
@@ -975,7 +1194,7 @@ class YoloV12MultiCameraDetector(Node):
             det["sc_sequence_id"] = int(global_idx)
 
     def _assign_sfp_ports_by_board_edges(self, detections: List[Dict], camera_name: str, ctx: Optional[Dict]):
-        family = [det for det in detections if self._class_in_family(det.get("base_class_name", det["class_name"]), self._sfp_port_classes)]
+        family = [det for det in detections if self._is_sfp_port_line_detection(det)]
         if len(family) == 0:
             return
         board_bbox = self._taskboard_bbox_for_ordering(detections, ctx or {})
@@ -996,7 +1215,9 @@ class YoloV12MultiCameraDetector(Node):
         scored.sort(key=lambda item: item[0])
 
         if len(scored) >= 2:
-            for idx, (_, det) in enumerate(scored[: self._max_sfp_ports]):
+            top_scored = scored[: self._max_sfp_ports]
+            top_scored.reverse()
+            for idx, (_, det) in enumerate(top_scored):
                 name = f"sfp_port_{idx}"
                 det["class_name"] = name
                 det["instance_name"] = name
@@ -1122,11 +1343,24 @@ class YoloV12MultiCameraDetector(Node):
         return current
 
     def _detection_anchor_point(self, det: Dict, family_key: str) -> np.ndarray:
+        obb = det.get("obb_cxcywh_deg")
+        if isinstance(obb, list) and len(obb) >= 2:
+            cx = float(obb[0])
+            cy = float(obb[1])
+            if family_key == "SC_PORT":
+                corners = det.get("obb_corners_uv")
+                if isinstance(corners, list) and len(corners) == 4:
+                    q = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+                    return np.mean(q[np.argsort(q[:, 1])[-2:]], axis=0).astype(np.float32)
+            return np.array([cx, cy], dtype=np.float32)
+
         x1, y1, x2, y2 = [float(v) for v in det["bbox_xyxy"]]
         if family_key == "SC_PORT":
             return np.array([(x1 + x2) * 0.5, y2], dtype=np.float32)
         if family_key == "NIC_CARD":
-            return np.array([(x1 + x2) * 0.5, y1 + 0.72 * (y2 - y1)], dtype=np.float32)
+            frac = float(os.environ.get("YOLOV12_NIC_ANCHOR_Y_FRAC", "0.72"))
+            x_frac = float(os.environ.get("YOLOV12_NIC_ANCHOR_X_FRAC", "0.5"))
+            return np.array([x1 + x_frac * (x2 - x1), y1 + frac * (y2 - y1)], dtype=np.float32)
         return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
 
     def _invert_affine(self, M: np.ndarray) -> np.ndarray:

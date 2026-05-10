@@ -1,0 +1,5 @@
+layout=mixed
+sessions=150
+trials_per_session=3
+randomize=True
+seed=42
