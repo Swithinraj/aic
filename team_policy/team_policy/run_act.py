@@ -130,8 +130,10 @@ _TARGET_MODULE_NAMES = (
 
 # Impedance (same gains for approach and insertion — the controller wins
 # alignment via low stiffness rather than aggressive position commands).
-_STIFFNESS = np.diag([90.0, 90.0, 90.0, 50.0, 50.0, 50.0]).flatten().tolist()
+_STIFFNESS = np.diag([200.0, 200.0, 200.0, 50.0, 50.0, 50.0]).flatten().tolist()
 _DAMPING = np.diag([50.0, 50.0, 50.0, 20.0, 20.0, 20.0]).flatten().tolist()
+_INSERT_STIFFNESS = np.diag([200.0, 200.0, 300.0, 80.0, 80.0, 80.0]).flatten().tolist()
+_INSERT_DAMPING = np.diag([80.0, 80.0, 100.0, 30.0, 30.0, 30.0]).flatten().tolist()
 _WRENCH_GAINS = [0.5, 0.5, 0.5, 0.0, 0.0, 0.0]
 
 # Insertion geometry.
@@ -170,7 +172,7 @@ _YOLO_FINE_GAIN = 0.6
 _YOLO_FINE_TOTAL_CAP_M = 0.080
 _YOLO_FINE_NO_IMPROVE_STEPS = 6
 _YOLO_FINE_IMPROVE_EPS_M = 0.0015
-_YOLO_INSERT_LATERAL_MAX_SFP_M = 0.018
+_YOLO_INSERT_LATERAL_MAX_SFP_M = 0.025
 _YOLO_INSERT_LATERAL_MAX_SC_M = 0.025
 
 # Pixel-space pre-insert alignment.  This is a lightweight version of the
@@ -726,9 +728,36 @@ class RunACT(Policy):
     def _line_angle_error(cls, plug_angle: float, port_angle: float) -> float:
         return cls._line_angle_mod_pi(float(plug_angle) - float(port_angle))
 
+    @staticmethod
+    def _infer_alignment_role(det: dict) -> str:
+        role = str(det.get("alignment_line_role", "")).strip().lower()
+        if role:
+            return role
+        base = str(det.get("base_class_name", det.get("class_name", ""))).strip().lower()
+        name = str(det.get("instance_name", det.get("class_name", ""))).strip().lower()
+        if base == "sfp_port" or name == "sfp_port" or name.startswith("sfp_port_"):
+            return "port_mouth"
+        if (
+            base == "sfp_module"
+            or name in {"sfp_module", "sfp_plug", "sfp_connector", "transceiver"}
+            or name.startswith(("sfp_module_", "sfp_plug_", "sfp_connector_", "transceiver_"))
+        ):
+            return "plug_tip"
+        return ""
+
     @classmethod
     def _parse_alignment_line(cls, det: dict, role: str, now: float) -> Optional[dict]:
         line = det.get("alignment_line_uv")
+        if (not isinstance(line, list) or len(line) != 2) and role == "port_mouth":
+            left = det.get("mouth_left_uv")
+            right = det.get("mouth_right_uv")
+            if isinstance(left, list) and isinstance(right, list) and len(left) >= 2 and len(right) >= 2:
+                line = [left[:2], right[:2]]
+        if (not isinstance(line, list) or len(line) != 2) and role == "plug_tip":
+            left = det.get("front_left_uv")
+            right = det.get("front_right_uv")
+            if isinstance(left, list) and isinstance(right, list) and len(left) >= 2 and len(right) >= 2:
+                line = [left[:2], right[:2]]
         if not isinstance(line, list) or len(line) != 2:
             return None
         try:
@@ -756,7 +785,7 @@ class RunACT(Policy):
             "angle": cls._line_angle_mod_pi(angle),
             "confidence": conf,
             "stamp": now,
-            "source": str(det.get("alignment_line_source", "")),
+            "source": str(det.get("alignment_line_source", det.get("servo_anchor_source", ""))),
             "name": str(det.get("instance_name", det.get("class_name", ""))),
         }
 
@@ -774,8 +803,8 @@ class RunACT(Policy):
             return None
         # Only enforce freshness on the port line when it is NOT locked.
         # A locked port line is the established reference; it can be older.
+        port_age = now - float(port_line.get("stamp", 0.0))
         if locked_port is None:
-            port_age = now - float(port_line.get("stamp", 0.0))
             if port_age > _PIXEL_ALIGN_FRESH_S:
                 return None
 
@@ -874,17 +903,22 @@ class RunACT(Policy):
             if rank is None:
                 continue
             pos = det.get("pose_base_link", {}).get("position", {})
-            if not isinstance(pos, dict):
+            orient = det.get("pose_base_link", {}).get("orientation", {})
+            if not isinstance(pos, dict) or not isinstance(orient, dict):
                 continue
             try:
                 xyz = np.array(
                     [float(pos.get("x", 0.0)), float(pos.get("y", 0.0)), float(pos.get("z", 0.0))],
                     dtype=np.float32,
                 )
+                quat = np.array(
+                    [float(orient.get("x", 0.0)), float(orient.get("y", 0.0)), float(orient.get("z", 0.0)), float(orient.get("w", 1.0))],
+                    dtype=np.float64,
+                )
                 conf = float(det.get("confidence", 0.0))
             except (TypeError, ValueError):
                 continue
-            scored.append((rank, instance, class_name, conf, xyz))
+            scored.append((rank, instance, class_name, conf, xyz, quat))
 
         if not scored:
             return
@@ -893,28 +927,28 @@ class RunACT(Policy):
             locked_instance = getattr(self, "_yolo_locked_instance", "")
             locked_class = getattr(self, "_yolo_locked_class", "")
 
-        chosen: tuple[str, str, float, np.ndarray, int] | None = None  # (inst, cls, conf, xyz, rank)
+        chosen: tuple[str, str, float, np.ndarray, np.ndarray, int] | None = None  # (inst, cls, conf, xyz, quat, rank)
         if locked_instance:
             # We already locked. Only update from the SAME instance we locked
             # onto — never let a higher-conf rival steal the goal channel.
-            for rank, inst, cls, conf, xyz in scored:
+            for rank, inst, cls, conf, xyz, quat in scored:
                 if inst and inst == locked_instance:
-                    chosen = (inst, cls, conf, xyz, rank)
+                    chosen = (inst, cls, conf, xyz, quat, rank)
                     break
                 if not inst and cls and cls == locked_class:
-                    chosen = (inst, cls, conf, xyz, rank)
+                    chosen = (inst, cls, conf, xyz, quat, rank)
                     break
             # If the locked instance is missing in this frame, hold-last (no-op).
         else:
             # FIRST-SIGHT: lock onto the best-rank match in this frame.
             scored.sort(key=lambda s: (s[0], -s[3]))  # rank asc, conf desc
-            rank, inst, cls, conf, xyz = scored[0]
-            chosen = (inst, cls, conf, xyz, rank)
+            rank, inst, cls, conf, xyz, quat = scored[0]
+            chosen = (inst, cls, conf, xyz, quat, rank)
 
         if chosen is None:
             return
 
-        inst, cls, conf, xyz, rank = chosen
+        inst, cls, conf, xyz, quat, rank = chosen
         announce = False
         with self._yolo_lock:
             if not getattr(self, "_yolo_locked_instance", "") and not getattr(self, "_yolo_locked_class", ""):
@@ -923,6 +957,7 @@ class RunACT(Policy):
                 announce = not getattr(self, "_yolo_lock_announced", False)
                 self._yolo_lock_announced = True
             self._yolo_port_xyz = xyz
+            self._yolo_port_quat = quat
             self._yolo_port_valid = True
             self._yolo_port_stamp_s = time.time()
 
@@ -959,7 +994,7 @@ class RunACT(Policy):
             except (TypeError, ValueError):
                 continue
 
-            role = str(det.get("alignment_line_role", "")).strip().lower()
+            role = self._infer_alignment_role(det)
             if role == "plug_tip":
                 line = self._parse_alignment_line(det, "plug_tip", now)
                 if line is not None and conf > best_plug_line_conf:
@@ -1096,7 +1131,7 @@ class RunACT(Policy):
         action_np = self._smooth_action(action_np)
         return self._apply_action_shaping(action_np)
 
-    def _make_motion(self, target_pose: Pose) -> MotionUpdate:
+    def _make_motion(self, target_pose: Pose, stiffness: Optional[list[float]] = None, damping: Optional[list[float]] = None) -> MotionUpdate:
         mu = MotionUpdate()
         mu.header = Header(
             frame_id="base_link",
@@ -1106,8 +1141,8 @@ class RunACT(Policy):
         mu.trajectory_generation_mode = TrajectoryGenerationMode(
             mode=TrajectoryGenerationMode.MODE_POSITION
         )
-        mu.target_stiffness = _STIFFNESS
-        mu.target_damping = _DAMPING
+        mu.target_stiffness = stiffness if stiffness is not None else _STIFFNESS
+        mu.target_damping = damping if damping is not None else _DAMPING
         mu.feedforward_wrench_at_tip = Wrench(
             force=Vector3(x=0.0, y=0.0, z=0.0),
             torque=Vector3(x=0.0, y=0.0, z=0.0),
@@ -1115,8 +1150,8 @@ class RunACT(Policy):
         mu.wrench_feedback_gains_at_tip = list(_WRENCH_GAINS)
         return mu
 
-    def _send_pose(self, move_robot, target_pose: Pose) -> None:
-        move_robot(motion_update=self._make_motion(target_pose))
+    def _send_pose(self, move_robot, target_pose: Pose, stiffness: Optional[list[float]] = None, damping: Optional[list[float]] = None) -> None:
+        move_robot(motion_update=self._make_motion(target_pose, stiffness=stiffness, damping=damping))
 
     def _delta_to_pose(self, obs_msg, action_6d: np.ndarray) -> Pose:
         tcp = obs_msg.controller_state.tcp_pose
@@ -1185,6 +1220,16 @@ class RunACT(Policy):
         return port_dist is not None and port_dist <= threshold, port_dist, threshold
 
     def _pick_insertion_axis(self, init_quat: np.ndarray, recent_actions) -> tuple[np.ndarray, str]:
+        with self._yolo_lock:
+            port_valid = getattr(self, "_yolo_port_valid", False)
+            port_quat = getattr(self, "_yolo_port_quat", None)
+
+        if port_valid and port_quat is not None:
+            port_normal = _quat_to_rotation_matrix(port_quat)[:, 2]
+            dir_norm = float(np.linalg.norm(port_normal))
+            if dir_norm > 1e-9:
+                return port_normal / dir_norm, "yolo_port_normal"
+
         if recent_actions and len(recent_actions) >= 5:
             actions_arr = np.array(list(recent_actions)[-_INSERT_AXIS_ACTIONS:])
             avg_delta_pos = actions_arr[:, :3].mean(axis=0)
@@ -1963,7 +2008,7 @@ class RunACT(Policy):
 
             target_pose = _pose_from_arrays(target_pos, new_quat)
             last_target_pose = target_pose
-            self._send_pose(move_robot, target_pose)
+            self._send_pose(move_robot, target_pose, stiffness=_INSERT_STIFFNESS, damping=_INSERT_DAMPING)
 
             insert_steps += 1
             if insert_steps % 10 == 0 or insert_steps < 3:
@@ -1994,10 +2039,10 @@ class RunACT(Policy):
         ):
             obs_msg = get_observation()
             if last_target_pose is not None:
-                self._send_pose(move_robot, last_target_pose)
+                self._send_pose(move_robot, last_target_pose, stiffness=_INSERT_STIFFNESS, damping=_INSERT_DAMPING)
             elif obs_msg is not None:
                 pos, quat, _, _ = self._get_tcp_state(obs_msg)
-                self._send_pose(move_robot, _pose_from_arrays(pos, quat))
+                self._send_pose(move_robot, _pose_from_arrays(pos, quat), stiffness=_INSERT_STIFFNESS, damping=_INSERT_DAMPING)
             time.sleep(_STEP_S)
 
         return insert_steps
@@ -2056,6 +2101,15 @@ class RunACT(Policy):
                     pos, quat = fine_pos, fine_quat
 
             if fine_lateral is None or fine_lateral <= self._insert_lateral_threshold_m():
+                aligned_for_insert = True
+                break
+
+            time_left = self.time_limit_s - (self._now() - start)
+            if approach_pass == 2 or time_left < 35.0:
+                self.get_logger().info(
+                    f"Forcing insertion despite high lateral error ({fine_lateral*1000:.1f}mm) "
+                    f"due to budget constraints (pass={approach_pass + 1}, time_left={time_left:.1f}s)"
+                )
                 aligned_for_insert = True
                 break
 

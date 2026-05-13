@@ -48,10 +48,12 @@ class TestSfpAlignmentLines(unittest.TestCase):
         np.testing.assert_allclose(det["alignment_line_mid_uv"], [20.0, 20.0])
         self.assertAlmostEqual(det["alignment_line_angle_rad"], 0.0)
 
-    def test_sfp_port_uses_nearest_long_edge(self):
+    def test_sfp_port_uses_centered_long_axis(self):
         planner = _planner_shell()
         det = {
             "class_name": "sfp_port_0",
+            "base_class_name": "sfp_port",
+            "instance_name": "sfp_port_0",
             "obb_corners_uv": [[10.0, 10.0], [50.0, 10.0], [50.0, 30.0], [10.0, 30.0]],
         }
         depth = np.full((60, 80), 0.5, dtype=np.float32)
@@ -60,11 +62,11 @@ class TestSfpAlignmentLines(unittest.TestCase):
 
         line, source, line_depth, status = planner._select_sfp_alignment_edge(det, depth)
 
-        self.assertEqual(source, "obb_depth")
-        self.assertEqual(status, "ok")
-        self.assertAlmostEqual(line_depth, 0.2, places=5)
+        self.assertEqual(source, "obb_center")
+        self.assertEqual(status, "ok_center_axis")
+        self.assertAlmostEqual(line_depth, 0.5, places=5)
         self.assertIsNotNone(line)
-        np.testing.assert_allclose(line, [[10.0, 10.0], [50.0, 10.0]], atol=1e-6)
+        np.testing.assert_allclose(line, [[10.0, 20.0], [50.0, 20.0]], atol=1e-6)
 
     def test_sfp_plug_uses_farthest_short_edge(self):
         planner = _planner_shell()
@@ -88,6 +90,8 @@ class TestSfpAlignmentLines(unittest.TestCase):
         planner = _planner_shell()
         det = {
             "class_name": "sfp_port_0",
+            "base_class_name": "sfp_port",
+            "instance_name": "sfp_port_0",
             "obb_corners_uv": [[10.0, 10.0], [50.0, 10.0], [50.0, 30.0], [10.0, 30.0]],
         }
         depth = np.zeros((60, 80), dtype=np.float32)
@@ -96,11 +100,11 @@ class TestSfpAlignmentLines(unittest.TestCase):
 
         line, source, line_depth, status = planner._select_sfp_alignment_edge(det, depth)
 
-        self.assertEqual(source, "obb_depth")
-        self.assertEqual(status, "ok")
+        self.assertEqual(source, "obb_center")
+        self.assertEqual(status, "ok_center_axis")
         self.assertAlmostEqual(line_depth, 0.2, places=5)
         self.assertIsNotNone(line)
-        np.testing.assert_allclose(line, [[10.0, 10.0], [50.0, 10.0]], atol=1e-6)
+        np.testing.assert_allclose(line, [[10.0, 20.0], [50.0, 20.0]], atol=1e-6)
 
 
 if __name__ == "__main__":

@@ -1,104 +1,76 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Dict, List, Optional
 
-import cv2
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Point, Pose, PoseArray, Quaternion, TransformStamped
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import ColorRGBA, String
-from tf2_msgs.msg import TFMessage
-from tf2_ros import TransformBroadcaster
+from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
-from sensor_msgs.msg import Image, CameraInfo
 
-from team_policy.perception.yolov12_detector import YoloV12MultiCameraDetector
-# from team_policy.perception.cad_depth_registration import CadDepthPoseEstimator
+from team_policy.perception.yolov12_detector import (
+    _ALLOWED_TF_NAMES,
+    YoloV12MultiCameraDetector,
+)
 
 
 class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
-    """
-    YOLO + metric depth + CAD-registration pose pipeline.
+    """YOLO canonical detections + metric depth anchor TFs.
 
-    - Uses the existing YOLO detections and naming/rail logic from YoloV12MultiCameraDetector.
-    - Uses metric depth crops from /<camera>_camera/stereo_depth/image.
-    - Estimates an initial pose from the depth crop point cloud.
-    - Refines with ICP against the AIC CAD assets when a mesh is available.
-    - Publishes full 6D TFs and pose_base_link JSON for mypolicy.
+    This planner deliberately avoids ICP, task-board masks,
+    and duplicate TF aliases. Each canonical instance gets at
+    most one fused record, selected from the best camera observation.
     """
 
     def __init__(self):
         super().__init__()
 
+        self.draw_alignment_debug = False
         self._base_frame = "base_link"
         self._tf_camera = self._env_text("YOLO_POSE_TF_CAMERA", "center")
+        self._preferred_camera_for_fusion = self._tf_camera
         self._axis_length_m = self._env_float("YOLO_DEPTH_POSE_AXIS_LENGTH_M", 0.05)
         self._axis_width_m = self._env_float("YOLO_DEPTH_POSE_AXIS_WIDTH_M", 0.004)
-        self._sfp_line_width_m = self._env_float("YOLO_DEPTH_POSE_SFP_LINE_WIDTH_M", 0.006)
         self._text_scale = self._env_float("YOLO_DEPTH_POSE_TEXT_SCALE", 0.03)
-        self._board_width_m = self._env_float("YOLO_DEPTH_POSE_BOARD_WIDTH_M", 0.300)
-        self._board_height_m = self._env_float("YOLO_DEPTH_POSE_BOARD_HEIGHT_M", 0.425)
         self._depth_fallback_m = self._env_float("YOLO_DEPTH_POSE_FALLBACK_M", 0.30)
-        self._assets_models_dir = self._env_path("YOLO_DEPTH_POSE_AIC_ASSETS_MODELS_DIR", "")
-        self._preferred_camera_for_fusion = self._tf_camera
-        self._force_table_flat = self._env_bool("YOLO_POSE_FORCE_TABLE_FLAT", True)
-        self._table_normal_base = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        self._table_constrained_families = {"taskboard", "nic", "sc", "sfp_port"}
+        self._fusion_max_age_s = self._env_float("YOLO_DEPTH_POSE_FUSION_MAX_AGE", 0.50)
 
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=True)
         self._tf_broadcaster = TransformBroadcaster(self)
         self._fused_pose_pub = self.create_publisher(PoseArray, "/fused_yolo/poses_base_link", 10)
         self._fused_json_pub = self.create_publisher(String, "/fused_yolo/detections_json", 10)
         self._fused_marker_pub = self.create_publisher(MarkerArray, "/fused_yolo/pose_markers", 10)
 
-        self._latest_instance_obs = {}
+        self._latest_instance_obs: Dict[str, List[Dict]] = {}
         self._latest_depth_images: Dict[str, Optional[np.ndarray]] = {"left": None, "center": None, "right": None}
         self._latest_depth_stamps: Dict[str, float] = {"left": 0.0, "center": 0.0, "right": 0.0}
-
-        # Cross-camera SFP port label consensus
-        self._latest_processed_outputs: Dict[str, Dict] = {}
-        self._sfp_consensus_left_label: Optional[str] = None
-        self._sfp_consensus_last_time: float = 0.0
 
         self._depth_subs = {
             "left": self.create_subscription(Image, "/left_camera/stereo_depth/image", lambda msg: self._depth_cb("left", msg), 10),
             "center": self.create_subscription(Image, "/center_camera/stereo_depth/image", lambda msg: self._depth_cb("center", msg), 10),
             "right": self.create_subscription(Image, "/right_camera/stereo_depth/image", lambda msg: self._depth_cb("right", msg), 10),
         }
-        self._tf_sub = self.create_subscription(TFMessage, "/tf", self._tf_callback, 100)
 
-#         self._cad_estimator = CadDepthPoseEstimator(
-#             assets_models_dir=self._assets_models_dir or None,
-#             logger=lambda msg: self.get_logger().info(msg),
-#             voxel_size_m=self._env_float("YOLO_DEPTH_POSE_VOXEL_M", 0.004),
-#             min_points=max(40, int(self._env_float("YOLO_DEPTH_POSE_MIN_POINTS", 60))),
-#         )
-# # 
         self.get_logger().info(
-            f"Combined planner node started: YOLO + metric depth + CAD registration, TF camera={self._tf_camera}, base_frame={self._base_frame}"
+            f"Combined planner node started: YOLO + metric depth anchor TF, TF camera={self._tf_camera}, base_frame={self._base_frame}"
         )
 
     def _env_float(self, key: str, default: float) -> float:
-        import os
         try:
             return float(os.environ.get(key, str(default)))
         except Exception:
             return float(default)
 
     def _env_text(self, key: str, default: str) -> str:
-        import os
         value = str(os.environ.get(key, default)).strip().lower()
         return value if value in {"left", "center", "right"} else str(default)
-
-    def _env_bool(self, key: str, default: bool) -> bool:
-        import os
-        value = str(os.environ.get(key, "1" if default else "0")).strip().lower()
-        return value in {"1", "true", "yes", "on"}
-
-    def _env_path(self, key: str, default: str) -> str:
-        import os
-        return str(os.environ.get(key, default)).strip()
 
     def _depth_cb(self, camera_name: str, msg: Image) -> None:
         try:
@@ -128,7 +100,7 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
             if now - self._last_infer_time[camera_name] < self._min_period:
                 continue
             try:
-                result = self._run_inference_combined(camera_name, msg)
+                result = self._process_camera_frame(camera_name, msg)
             except Exception as exc:
                 self.get_logger().error(f"{camera_name} inference failed: {exc}")
                 continue
@@ -138,64 +110,41 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         if not camera_results:
             return
 
-        # Build the processed-outputs dict for cross-camera consensus, then
-        # apply consensus SFP port label normalization BEFORE publishing.
-        for camera_name, res in camera_results.items():
-            _, detections, _, _, _, _, _, _, _ = res["result"]
-            self._latest_processed_outputs[camera_name] = {"detections": detections}
-        self._normalize_sfp_port_labels_across_cameras(self._latest_processed_outputs)
-
-        instance_obs = {}
+        instance_obs: Dict[str, List[Dict]] = {}
         for camera_name, res in camera_results.items():
             msg = res["msg"]
-            annotated, detections, classes, mask_overlay, mask_binary, mask_status, _, _, _ = res["result"]
-            # Recompute classes after consensus may have relabelled SFP ports.
+            annotated, detections, classes, mask_overlay, mask_binary, mask_status = res["result"][:6]
+            detections = self._attach_depth_anchor_poses(camera_name, detections)
+            detections = self._attach_sfp_alignment_lines(camera_name, detections)
+            annotated = self._draw_alignment_lines(annotated, detections)
             classes = [str(det.get("instance_name", det.get("class_name", ""))) for det in detections]
+            self._publish_camera_outputs(
+                camera_name,
+                msg,
+                annotated,
+                detections,
+                classes,
+                mask_overlay,
+                mask_binary,
+                mask_status,
+            )
 
-            annotated_msg = self._bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
-            annotated_msg.header = msg.header
-            self._annotated_pubs[camera_name].publish(annotated_msg)
-
-            json_msg = String()
-            json_msg.data = json.dumps(detections, separators=(",", ":"))
-            self._json_pubs[camera_name].publish(json_msg)
-
-            classes_msg = String()
-            classes_msg.data = ",".join(classes)
-            self._classes_pubs[camera_name].publish(classes_msg)
-
-            overlay_msg = self._bridge.cv2_to_imgmsg(mask_overlay, encoding="bgr8")
-            overlay_msg.header = msg.header
-            self._mask_overlay_pubs[camera_name].publish(overlay_msg)
-
-            mask_msg = self._bridge.cv2_to_imgmsg(mask_binary, encoding="mono8")
-            mask_msg.header = msg.header
-            self._mask_binary_pubs[camera_name].publish(mask_msg)
-
-            status_msg = String()
-            status_msg.data = mask_status
-            self._mask_status_pubs[camera_name].publish(status_msg)
-
-            info = self._latest_infos.get(camera_name)
+            with self._lock:
+                info = self._latest_infos.get(camera_name)
             if info is None:
                 continue
             camera_frame_id = str(info.header.frame_id)
             for det in detections:
-                name = det.get("instance_name", det.get("class_name", ""))
-                if not name:
+                name = str(det.get("instance_name", det.get("class_name", "")))
+                if name not in _ALLOWED_TF_NAMES:
                     continue
                 pose_cam = det.get("pose_camera")
                 if not (isinstance(pose_cam, dict) and "t" in pose_cam and "q" in pose_cam):
                     continue
-                family = self._detection_family_name(det)
-                anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
-                anchor = self._detection_anchor_point(det, anchor_key)
-                anchor_uv = [float(anchor[0]), float(anchor[1])]
                 instance_obs.setdefault(name, []).append(
                     {
                         "det": det,
                         "camera_frame_id": camera_frame_id,
-                        "anchor_uv": anchor_uv,
                         "camera_name": camera_name,
                     }
                 )
@@ -203,451 +152,90 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         with self._lock:
             self._latest_instance_obs = instance_obs
 
-    def _tf_callback(self, msg: TFMessage) -> None:
-        with self._lock:
-            frames = dict(self._latest_frames)
-            cached_obs = dict(getattr(self, "_latest_instance_obs", {}))
+        self._publish_fused_from_instance_obs(instance_obs)
 
-        instance_obs = cached_obs if cached_obs else self._run_fresh_detections(frames)
-        if not instance_obs:
-            return
+    @staticmethod
+    def _segment_length(line_uv: np.ndarray) -> float:
+        line = np.asarray(line_uv, dtype=np.float32).reshape(2, 2)
+        return float(np.linalg.norm(line[1] - line[0]))
 
-        stamp = self.get_clock().now().to_msg()
-        fused_records = []
-        used_tf_names = set()
-
-        for name, obs_list in instance_obs.items():
-            best_obj = self._select_best_observation(obs_list)
-            if best_obj is None:
-                continue
-            best_det = best_obj["det"]
-            camera_frame_id = best_obj["camera_frame_id"]
-            pose_cam = best_det.get("pose_camera")
-            if not pose_cam:
-                continue
-
-            pose_base = self._transform_pose_dict(pose_cam, camera_frame_id, self._base_frame)
-            if pose_base is None:
-                continue
-            pose_base = self._maybe_constrain_pose_to_table_plane(best_det, pose_base)
-            alignment_line_base_xyz = self._alignment_line_base_points(
-                best_obj.get("camera_name", "center"),
-                camera_frame_id,
-                best_det.get("alignment_line_uv"),
-            )
-
-            display_name = str(name)
-            tf_base = "det_" + self._tf_safe_name(display_name)
-            tf_name = tf_base
-            index = 1
-            while tf_name in used_tf_names:
-                tf_name = f"{tf_base}_{index}"
-                index += 1
-            used_tf_names.add(tf_name)
-
-            fused_records.append(
-                {
-                    "name": display_name,
-                    "tf_name": tf_name,
-                    "bbox_xyxy": [float(v) for v in best_det.get("bbox_xyxy", [])],
-                    "base_pose": self._pose_dict_to_msg(pose_base),
-                    "class_name": str(best_det.get("class_name", "")),
-                    "confidence": float(best_det.get("confidence", 0.0)),
-                    "camera": best_obj.get("camera_name", "center"),
-                    "anchor_uv": best_obj.get("anchor_uv", []),
-                    "camera_frame_id": camera_frame_id,
-                    "camera_name": best_obj.get("camera_name", "center"),
-                    "pose_source": str(best_det.get("pose_source", "depth_registration")),
-                    "alignment_line_role": best_det.get("alignment_line_role", ""),
-                    "alignment_line_uv": best_det.get("alignment_line_uv", []),
-                    "alignment_line_mid_uv": best_det.get("alignment_line_mid_uv", []),
-                    "alignment_line_angle_rad": best_det.get("alignment_line_angle_rad", None),
-                    "alignment_line_source": best_det.get("alignment_line_source", ""),
-                    "alignment_line_status": best_det.get("alignment_line_status", ""),
-                    "alignment_line_depth_m": best_det.get("alignment_line_depth_m", None),
-                    "alignment_line_base_xyz": alignment_line_base_xyz,
-                }
-            )
-
-        self._publish_fused_records(stamp, fused_records)
-
-    def _select_best_observation(self, obs_list: List[Dict]) -> Optional[Dict]:
-        if not obs_list:
-            return None
-        preferred = [o for o in obs_list if o.get("camera_name") == self._preferred_camera_for_fusion]
-        candidates = preferred if preferred else obs_list
-        return max(candidates, key=lambda o: float(o["det"].get("confidence", 0.0)))
-
-    def _run_fresh_detections(self, frames: Dict) -> Dict:
-        instance_obs = {}
-        for camera_name, msg in frames.items():
-            if msg is None:
-                continue
-            try:
-                result = self._run_inference_combined(camera_name, msg)
-            except Exception:
-                continue
-            _, detections, _, _, _, _, _, _, _ = result
-            with self._lock:
-                info = self._latest_infos.get(camera_name)
-            if info is None:
-                continue
-            camera_frame_id = str(info.header.frame_id)
-            for det in detections:
-                name = det.get("instance_name", det.get("class_name", ""))
-                if not name:
-                    continue
-                pose_cam = det.get("pose_camera")
-                if not (isinstance(pose_cam, dict) and "t" in pose_cam and "q" in pose_cam):
-                    continue
-                family = self._detection_family_name(det)
-                anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
-                anchor = self._detection_anchor_point(det, anchor_key)
-                instance_obs.setdefault(name, []).append(
-                    {
-                        "det": det,
-                        "camera_frame_id": camera_frame_id,
-                        "anchor_uv": [float(anchor[0]), float(anchor[1])],
-                        "camera_name": camera_name,
-                    }
-                )
-        return instance_obs
-
-    def _publish_fused_records(self, stamp, fused_records: List[Dict]):
-        fused_pose_array = PoseArray()
-        fused_pose_array.header.stamp = stamp
-        fused_pose_array.header.frame_id = self._base_frame
-
-        fused_markers = MarkerArray()
-        del_m = Marker()
-        del_m.action = Marker.DELETEALL
-        fused_markers.markers.append(del_m)
-
-        fused_tf_list = []
-        fused_detections_json = []
-        marker_id = 0
-
-        for rec in fused_records:
-            base_pose = rec["base_pose"]
-            fused_pose_array.poses.append(base_pose)
-            fused_tf_list.append(self._pose_to_transform(stamp, self._base_frame, rec["tf_name"], base_pose))
-
-            axes = self._make_axes_marker(marker_id, stamp, rec["name"], base_pose)
-            fused_markers.markers.append(axes)
-            marker_id += 1
-
-            text = Marker()
-            text.header.frame_id = self._base_frame
-            text.header.stamp = stamp
-            text.ns = "combined_detection_pose_text"
-            text.id = marker_id
-            text.type = Marker.TEXT_VIEW_FACING
-            text.action = Marker.ADD
-            text.pose = base_pose
-            text.pose.position.z += 0.04
-            text.scale.z = self._text_scale
-            text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.95)
-            bp = base_pose.position
-            text.text = f"{rec['name']} x={bp.x:.3f} y={bp.y:.3f} z={bp.z:.3f}"
-            fused_markers.markers.append(text)
-            marker_id += 1
-
-            line_marker = self._make_alignment_line_marker(marker_id, stamp, rec)
-            if line_marker is not None:
-                fused_markers.markers.append(line_marker)
-                marker_id += 1
-
-            det_json = {
-                    "class_name": rec["class_name"],
-                    "instance_name": rec["name"],
-                    "confidence": rec["confidence"],
-                    "bbox_xyxy": rec["bbox_xyxy"],
-                    "tf_frame": rec["tf_name"],
-                    "source": rec["camera"],
-                    "anchor_uv": rec.get("anchor_uv", []),
-                    "camera_frame_id": rec.get("camera_frame_id", ""),
-                    "camera_name": rec.get("camera_name", ""),
-                    "pose_source": rec.get("pose_source", "depth_registration"),
-                    "pose_base_link": {
-                        "position": {
-                            "x": float(bp.x),
-                            "y": float(bp.y),
-                            "z": float(bp.z),
-                        },
-                        "orientation": {
-                            "x": float(base_pose.orientation.x),
-                            "y": float(base_pose.orientation.y),
-                            "z": float(base_pose.orientation.z),
-                            "w": float(base_pose.orientation.w),
-                        },
-                    },
-            }
-            for key in (
-                "alignment_line_role",
-                "alignment_line_uv",
-                "alignment_line_mid_uv",
-                "alignment_line_angle_rad",
-                "alignment_line_source",
-                "alignment_line_status",
-                "alignment_line_depth_m",
-                "alignment_line_base_xyz",
-            ):
-                value = rec.get(key)
-                if value not in (None, "", []):
-                    det_json[key] = value
-            fused_detections_json.append(det_json)
-
-        self._fused_pose_pub.publish(fused_pose_array)
-        self._fused_marker_pub.publish(fused_markers)
-        if fused_tf_list:
-            self._tf_broadcaster.sendTransform(fused_tf_list)
-
-        jd = String()
-        jd.data = json.dumps(fused_detections_json, separators=(",", ":"))
-        self._fused_json_pub.publish(jd)
-
-    def _run_inference_combined(self, camera_name: str, msg):
-        frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        results = self._model.predict(
-            source=frame,
-            device=self._device,
-            conf=self._conf,
-            iou=self._iou,
-            imgsz=self._imgsz,
-            verbose=False,
-        )
-        result = results[0]
-        names = result.names if hasattr(result, "names") else self._model.names
-
-        detections: List[Dict] = []
-        boxes = result.boxes
-        seg_geoms = self._extract_segmentation_geometries(result, frame.shape[:2])
-        if boxes is not None:
-            xyxy = boxes.xyxy.detach().cpu().numpy() if boxes.xyxy is not None else np.zeros((0, 4), dtype=np.float32)
-            confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.zeros((0,), dtype=np.float32)
-            clss = boxes.cls.detach().cpu().numpy().astype(int) if boxes.cls is not None else np.zeros((0,), dtype=int)
-            for idx, (box, conf, cls_idx) in enumerate(zip(xyxy, confs, clss)):
-                cls_name = str(names[int(cls_idx)]) if names is not None else str(int(cls_idx))
-                det = {
-                    "class_id": int(cls_idx),
-                    "class_name": cls_name,
-                    "confidence": float(conf),
-                    "bbox_xyxy": [float(v) for v in box.tolist()],
-                }
-                if idx < len(seg_geoms) and isinstance(seg_geoms[idx], dict):
-                    det.update(seg_geoms[idx])
-                detections.append(det)
-
-        detections = self._filter_target_detections(detections)
-        mask_overlay, mask_binary, mask_status, projected_rails, fused_targets = self._fit_rails(camera_name, frame, detections, msg)
-        detections = self._assign_detection_instance_names(detections, projected_rails, fused_targets, camera_name)
-        detections = self._sort_output_detections(detections)
-
-        pose_records = self._estimate_detection_poses(camera_name, detections)
-        detections = self._attach_pose_data_to_detections(detections, pose_records)
-        detections = self._attach_sfp_alignment_lines(camera_name, detections)
-
-        annotated = self._draw_filtered_detections(frame, detections)
-        annotated = self._draw_instance_labels(annotated, detections)
-        annotated = self._draw_alignment_lines(annotated, detections)
-
-        classes = [str(det.get("instance_name", det.get("class_name", ""))) for det in detections]
-        return annotated, detections, classes, mask_overlay, mask_binary, mask_status, None, None, None
-
-    def _extract_segmentation_geometries(self, result, image_shape) -> List[Dict]:
-        h, w = int(image_shape[0]), int(image_shape[1])
-        geoms: List[Dict] = []
-        masks_obj = getattr(result, "masks", None)
-        if masks_obj is None or getattr(masks_obj, "data", None) is None:
-            return geoms
-        try:
-            masks = masks_obj.data.detach().cpu().numpy()
-        except Exception:
-            return geoms
-        for mask in masks:
-            m = np.asarray(mask, dtype=np.float32)
-            if m.ndim != 2:
-                geoms.append({})
-                continue
-            if m.shape[0] != h or m.shape[1] != w:
-                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
-            mb = np.where(m > 0.5, 255, 0).astype(np.uint8)
-            contours, _ = cv2.findContours(mb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                geoms.append({})
-                continue
-            contour = max(contours, key=cv2.contourArea)
-            area = float(cv2.contourArea(contour))
-            if area < 8.0:
-                geoms.append({})
-                continue
-            rect = cv2.minAreaRect(contour)
-            (cx, cy), (rw, rh), angle = rect
-            corners = cv2.boxPoints(rect).astype(np.float32)
-            peri = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.01 * max(peri, 1.0), True)
-            poly = approx.reshape(-1, 2).astype(np.float32) if approx is not None and len(approx) >= 3 else contour.reshape(-1, 2).astype(np.float32)
-            geoms.append(
-                {
-                    "mask_area_px": area,
-                    "obb_cxcywh_deg": [float(cx), float(cy), float(rw), float(rh), float(angle)],
-                    "obb_corners_uv": [[float(x), float(y)] for x, y in corners.tolist()],
-                    "mask_polygon_uv": [[float(x), float(y)] for x, y in poly.tolist()],
-                }
-            )
-        return geoms
-
-    def _obb_long_axis_uv(self, det: Dict) -> Optional[tuple[np.ndarray, np.ndarray]]:
-        corners = det.get("obb_corners_uv")
-        if not isinstance(corners, list) or len(corners) != 4:
-            return None
-        q = np.asarray(corners, dtype=np.float32).reshape(4, 2)
-        edges = [q[(i + 1) % 4] - q[i] for i in range(4)]
-        lengths = [float(np.linalg.norm(e)) for e in edges]
-        if max(lengths) < 1e-6:
-            return None
-        idx = int(np.argmax(lengths))
-        axis = edges[idx] / max(1e-6, lengths[idx])
-        center = np.mean(q, axis=0).astype(np.float32)
-        return center, axis.astype(np.float32)
-
-    def _obb_long_axis_on_plane(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, det: Dict) -> Optional[np.ndarray]:
-        axis_data = self._obb_long_axis_uv(det)
-        if axis_data is None:
-            return None
-        center_uv, uv_dir = axis_data
-        return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
-
-    def _detection_anchor_point(self, det: Dict, family_key: str) -> np.ndarray:
-        obb = det.get("obb_cxcywh_deg")
-        if isinstance(obb, list) and len(obb) >= 2:
-            cx = float(obb[0])
-            cy = float(obb[1])
-            if family_key == "SC_PORT":
-                corners = det.get("obb_corners_uv")
-                if isinstance(corners, list) and len(corners) == 4:
-                    q = np.asarray(corners, dtype=np.float32).reshape(4, 2)
-                    return np.mean(q[np.argsort(q[:, 1])[-2:]], axis=0).astype(np.float32)
-            return np.array([cx, cy], dtype=np.float32)
-        return super()._detection_anchor_point(det, family_key)
+    @staticmethod
+    def _edge_midpoint(line_uv: np.ndarray) -> np.ndarray:
+        line = np.asarray(line_uv, dtype=np.float32).reshape(2, 2)
+        return (0.5 * (line[0] + line[1])).astype(np.float32)
 
     def _det_center_uv(self, det: Dict) -> Optional[np.ndarray]:
-        """Return the 2-D image-space centre (u, v) of a detection."""
+        center = det.get("center_uv")
+        if isinstance(center, list) and len(center) >= 2:
+            return np.asarray(center[:2], dtype=np.float32)
         obb = det.get("obb_cxcywh_deg")
         if isinstance(obb, list) and len(obb) >= 2:
-            return np.array([float(obb[0]), float(obb[1])], dtype=np.float32)
-        box = det.get("bbox_xyxy")
-        if isinstance(box, list) and len(box) == 4:
-            x1, y1, x2, y2 = [float(v) for v in box]
-            return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+            return np.asarray([float(obb[0]), float(obb[1])], dtype=np.float32)
+        bbox = det.get("bbox_xyxy")
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+            return np.asarray([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
         return None
 
-    def _estimate_detection_poses(self, camera_name: str, detections: List[Dict]) -> List[Dict]:
-        with self._lock:
-            info = self._latest_infos.get(camera_name)
-            ctx = self._assignment_context.get(camera_name)
-        depth = self._get_latest_depth_copy(camera_name)
-        if info is None:
-            return []
+    def _alignment_box_corners_uv(self, det: Dict) -> tuple[Optional[np.ndarray], str]:
+        corners = det.get("obb_corners_uv")
+        if isinstance(corners, list) and len(corners) == 4:
+            try:
+                return np.asarray(corners, dtype=np.float32).reshape(4, 2), "obb"
+            except Exception:
+                pass
+        bbox = det.get("bbox_xyxy")
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+            return np.asarray([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32), "bbox"
+        return None, ""
 
-        observed_board_quad = None
-        board_pose_camera = None
-        if ctx is not None:
-            observed_board_quad = ctx.get("observed_board_quad")
-            if observed_board_quad is not None:
-                observed_board_quad = np.asarray(observed_board_quad, dtype=np.float32).reshape(4, 2)
+    def _alignment_candidate_edges(self, det: Dict, want_long: bool) -> tuple[list[np.ndarray], str]:
+        corners, source = self._alignment_box_corners_uv(det)
+        if corners is None:
+            return [], ""
+        edges = [np.vstack([corners[i], corners[(i + 1) % 4]]).astype(np.float32) for i in range(4)]
+        lengths = np.asarray([self._segment_length(edge) for edge in edges], dtype=np.float32)
+        if lengths.size != 4 or float(lengths.max()) < 1e-6:
+            return [], ""
+        target = float(lengths.max() if want_long else lengths.min())
+        selected = [edge for edge, length in zip(edges, lengths) if abs(float(length) - target) <= 1e-3]
+        return selected, source
 
-        records: List[Dict] = []
-        used_tf_names = set()
+    def _centered_axis_line(self, det: Dict, want_long: bool) -> tuple[Optional[np.ndarray], str]:
+        candidates, source = self._alignment_candidate_edges(det, want_long=want_long)
+        corners, _ = self._alignment_box_corners_uv(det)
+        if not candidates or corners is None:
+            return None, ""
+        edge = max(candidates, key=self._segment_length)
+        vec = np.asarray(edge[1] - edge[0], dtype=np.float32)
+        length = float(np.linalg.norm(vec))
+        if length <= 1e-6:
+            return None, ""
+        axis = vec / length
+        center = np.mean(corners, axis=0).astype(np.float32)
+        line = np.vstack([center - 0.5 * length * axis, center + 0.5 * length * axis]).astype(np.float32)
+        if float(line[0, 0]) > float(line[1, 0]):
+            line = line[[1, 0]]
+        return line, f"{source}_center"
 
-        taskboard_det = self._find_best_detection(detections, self._taskboard_classes)
-        if taskboard_det is not None:
-            board_pose_camera = self._estimate_board_pose_geometry(info, depth, taskboard_det, observed_board_quad)
-            if board_pose_camera is None and observed_board_quad is not None:
-                board_pose_camera = self._estimate_board_pose_from_quad(info, observed_board_quad)
-
-            if board_pose_camera is not None:
-                pose = dict(board_pose_camera)
-                pose["R"] = self._orthonormalize_rotation(np.asarray(pose["R"], dtype=np.float32))
-                pose["q"] = self._matrix_to_quaternion(pose["R"])
-                pose["source"] = str(pose.get("source", "board_depth_plane"))
-                records.append(self._make_pose_record(taskboard_det, pose, used_tf_names))
-
-        for det in detections:
-            if taskboard_det is det:
-                continue
-            family = self._detection_family_name(det)
-            raw_pose = None
-            # CAD estimator disabled (cad_depth_registration module not present on this branch)
-            # if depth is not None:
-            #     mesh_family = family if family in {"nic", "sc", "sfp_module"} else None
-            #     raw_pose = self._cad_estimator.estimate_pose(info, depth, det, mesh_family, init_pose_camera=board_pose_camera)
-
-            pose = None
-            if family == "sfp_module" and raw_pose is not None:
-                pose = raw_pose
-            elif board_pose_camera is not None:
-                translation_hint = None if raw_pose is None else np.asarray(raw_pose.get("t", None), dtype=np.float32).reshape(3)
-                pose = self._estimate_component_pose_on_board_plane(
-                    info=info,
-                    depth=depth,
-                    det=det,
-                    board_pose_camera=board_pose_camera,
-                    raw_pose_camera=raw_pose,
-                    translation_hint=translation_hint,
-                )
-            elif raw_pose is not None:
-                pose = raw_pose
-            if pose is None:
-                pose = self._fallback_pose_from_depth_or_anchor(info, depth, det, board_pose_camera)
-            if pose is None:
-                continue
-            records.append(self._make_pose_record(det, pose, used_tf_names))
-
-        return records
-
-    def _fallback_pose_from_depth_or_anchor(self, info: CameraInfo, depth: Optional[np.ndarray], det: Dict, init_pose_camera: Optional[Dict]) -> Optional[Dict]:
-        family = self._detection_family_name(det)
-        anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
-        anchor = self._detection_anchor_point(det, anchor_key)
-        t = self._backproject_anchor(info, depth, anchor)
-        if t is None:
-            return None
-        R = np.eye(3, dtype=np.float32)
-        if init_pose_camera is not None:
-            R = np.asarray(init_pose_camera["R"], dtype=np.float32).reshape(3, 3)
-        R = self._orthonormalize_rotation(R)
-        return {"R": R.astype(np.float32), "t": t.astype(np.float32), "q": self._matrix_to_quaternion(R), "source": "depth_anchor_board_oriented" if init_pose_camera is not None else "depth_anchor"}
-
-    def _backproject_anchor(self, info: CameraInfo, depth: Optional[np.ndarray], anchor_uv: np.ndarray) -> Optional[np.ndarray]:
-        u = float(anchor_uv[0])
-        v = float(anchor_uv[1])
-        Z = self._sample_depth(depth, u, v)
-        if Z is None:
-            Z = float(self._depth_fallback_m)
-        fx = float(info.k[0])
-        fy = float(info.k[4])
-        cx = float(info.k[2])
-        cy = float(info.k[5])
-        if fx <= 1e-6 or fy <= 1e-6:
-            return None
-        X = (u - cx) * Z / fx
-        Y = (v - cy) * Z / fy
-        return np.array([X, Y, Z], dtype=np.float32)
-
-    def _sample_depth(self, depth: Optional[np.ndarray], u: float, v: float) -> Optional[float]:
-        if depth is None:
-            return None
-        h, w = depth.shape[:2]
-        r = int(np.clip(round(v), 0, h - 1))
-        c = int(np.clip(round(u), 0, w - 1))
-        r0, r1 = max(0, r - 2), min(h, r + 3)
-        c0, c1 = max(0, c - 2), min(w, c + 3)
-        patch = np.asarray(depth[r0:r1, c0:c1], dtype=np.float32)
-        valid = patch[np.isfinite(patch) & (patch > 0.05) & (patch < 3.0)]
-        if valid.size == 0:
-            return None
-        return float(np.median(valid))
+    def _sfp_alignment_role(self, det: Dict) -> Optional[str]:
+        names = [
+            str(det.get("raw_class_name", "")),
+            str(det.get("base_class_name", "")),
+            str(det.get("class_name", "")),
+            str(det.get("instance_name", "")),
+        ]
+        normed = [self._norm_name(name) for name in names if name]
+        if any(name == "sfp_port" or name.startswith("sfp_port_") for name in normed):
+            return "port_mouth"
+        if any(
+            name in {"sfp_module", "sfpmodule", "transceiver", "sfp_plug", "sfp_connector", "sfp_tip"}
+            or name.startswith(("sfp_module_", "sfp_plug_", "sfp_connector_", "sfp_tip_"))
+            for name in normed
+        ):
+            return "plug_tip"
+        return None
 
     def _sample_alignment_edge_depth(
         self,
@@ -660,22 +248,17 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         edge = np.asarray(edge_uv, dtype=np.float32).reshape(2, 2)
         inward = np.zeros(2, dtype=np.float32)
         if box_center_uv is not None:
-            try:
-                center = np.asarray(box_center_uv, dtype=np.float32).reshape(2)
-                inward = center - self._edge_midpoint(edge)
-                n = float(np.linalg.norm(inward))
-                if n > 1e-6:
-                    inward = inward / n
-                else:
-                    inward[:] = 0.0
-            except Exception:
+            center = np.asarray(box_center_uv, dtype=np.float32).reshape(2)
+            inward = center - self._edge_midpoint(edge)
+            n = float(np.linalg.norm(inward))
+            if n > 1e-6:
+                inward = inward / n
+            else:
                 inward[:] = 0.0
-
         samples = []
-        offsets_px = (2.0, 4.0, 0.0, 7.0, 10.0, 14.0)
         for alpha in np.linspace(0.12, 0.88, 7):
             uv_edge = (1.0 - float(alpha)) * edge[0] + float(alpha) * edge[1]
-            for offset_px in offsets_px:
+            for offset_px in (2.0, 4.0, 0.0, 7.0, 10.0, 14.0):
                 uv = uv_edge + inward * float(offset_px)
                 z = self._sample_depth(depth, float(uv[0]), float(uv[1]))
                 if z is not None and np.isfinite(z):
@@ -692,32 +275,14 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         ref_uv: np.ndarray,
         depth: Optional[np.ndarray],
     ) -> tuple[Optional[np.ndarray], str, Optional[float], str]:
-        """Pick the shortest (want_long=False) or longest (want_long=True) OBB edge
-        whose midpoint is CLOSEST to ref_uv in image space.
-
-        This is the primary selector for SFP lines: the plug's tip edge is
-        whichever short edge faces the port, and the port's mouth edge is
-        whichever long edge faces the plug.  No depth heuristic needed.
-        """
         candidates, source = self._alignment_candidate_edges(det, want_long=want_long)
         if not candidates:
             return None, "", None, "no_candidate_edges"
         ref = np.asarray(ref_uv, dtype=np.float32).reshape(2)
-        best_edge = min(
-            candidates,
-            key=lambda e: float(np.linalg.norm(
-                np.asarray(e, dtype=np.float32).reshape(2, 2).mean(axis=0) - ref
-            )),
-        )
-        # Sample depth at the selected edge for the annotation label only.
-        line_depth = None
-        if depth is not None:
-            corners, _ = self._alignment_box_corners_uv(det)
-            box_center = (
-                None if corners is None
-                else np.asarray(corners, dtype=np.float32).reshape(4, 2).mean(axis=0)
-            )
-            line_depth = self._sample_alignment_edge_depth(depth, best_edge, box_center)
+        best_edge = min(candidates, key=lambda edge: float(np.linalg.norm(self._edge_midpoint(edge) - ref)))
+        corners, _ = self._alignment_box_corners_uv(det)
+        box_center = None if corners is None else np.mean(corners, axis=0).astype(np.float32)
+        line_depth = self._sample_alignment_edge_depth(depth, best_edge, box_center)
         return np.asarray(best_edge, dtype=np.float32).reshape(2, 2), source, line_depth, "ok_toward_ref"
 
     def _select_sfp_alignment_edge(
@@ -725,27 +290,22 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         det: Dict,
         depth: Optional[np.ndarray],
     ) -> tuple[Optional[np.ndarray], str, Optional[float], str]:
-        """Fallback edge selector used when no complementary detection is visible.
-
-        Tries depth first; if depth is unavailable or yields no valid samples,
-        returns the first candidate (deterministic, never returns None for a
-        valid detection so a line is always drawn).
-        """
         role = self._sfp_alignment_role(det)
-        if role not in {"plug_tip", "port_mouth"}:
+        if role == "port_mouth":
+            line, source = self._centered_axis_line(det, want_long=True)
+            if line is None:
+                return None, "", None, "no_candidate_edges"
+            corners, _ = self._alignment_box_corners_uv(det)
+            box_center = None if corners is None else np.mean(corners, axis=0).astype(np.float32)
+            return line, source, self._sample_alignment_edge_depth(depth, line, box_center), "ok_center_axis"
+        if role != "plug_tip":
             return None, "", None, "not_sfp"
 
-        want_long = role == "port_mouth"
-        candidates, source = self._alignment_candidate_edges(det, want_long=want_long)
+        candidates, source = self._alignment_candidate_edges(det, want_long=False)
         if not candidates:
             return None, "", None, "no_candidate_edges"
-
         corners, _ = self._alignment_box_corners_uv(det)
-        box_center = (
-            None if corners is None
-            else np.asarray(corners, dtype=np.float32).reshape(4, 2).mean(axis=0)
-        )
-
+        box_center = None if corners is None else np.mean(corners, axis=0).astype(np.float32)
         if depth is not None:
             scored = []
             for edge in candidates:
@@ -753,612 +313,345 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
                 if z is not None:
                     scored.append((float(z), edge))
             if scored:
-                # plug_tip  → largest Z (farthest from camera)
-                # port_mouth → smallest Z (closest to camera)
-                scored.sort(key=lambda item: item[0], reverse=(role == "plug_tip"))
-                return (
-                    np.asarray(scored[0][1], dtype=np.float32).reshape(2, 2),
-                    source,
-                    float(scored[0][0]),
-                    "ok_depth_fallback",
-                )
-
-        # Last resort: pick first candidate — always produces a visible line.
-        fallback_status = "ok_no_depth" if depth is None else "ok_no_depth_samples"
-        return np.asarray(candidates[0], dtype=np.float32).reshape(2, 2), source, None, fallback_status
+                scored.sort(key=lambda item: item[0], reverse=True)
+                return np.asarray(scored[0][1], dtype=np.float32).reshape(2, 2), source, float(scored[0][0]), "ok_depth_fallback"
+        return np.asarray(candidates[0], dtype=np.float32).reshape(2, 2), source, None, "ok_no_depth"
 
     def _attach_sfp_alignment_lines(self, camera_name: str, detections: List[Dict]) -> List[Dict]:
-        """Attach SFP alignment lines to each plug/port detection.
-
-        Primary path: cross-detection geometry.
-          - plug_tip  edge = shortest OBB edge whose midpoint is CLOSEST to the
-            nearest sfp_port detection centre.
-          - port_mouth edge = longest  OBB edge whose midpoint is CLOSEST to the
-            nearest sfp_plug/module detection centre.
-
-        This is camera-orientation independent and never inverts.  Falls back
-        to depth / first-candidate when the complementary detection is missing.
-        """
         depth = self._get_latest_depth_copy(camera_name)
-
-        # First pass: collect plug and port centres for cross-referencing.
         plug_centers: List[np.ndarray] = []
         port_centers: List[np.ndarray] = []
         for det in detections:
             role = self._sfp_alignment_role(det)
             center = self._det_center_uv(det)
-            if role is None or center is None:
-                continue
-            if role == "plug_tip":
+            if role == "plug_tip" and center is not None:
                 plug_centers.append(center)
-            elif role == "port_mouth":
+            elif role == "port_mouth" and center is not None:
                 port_centers.append(center)
 
-        # Second pass: select and attach.
         for det in detections:
             role = self._sfp_alignment_role(det)
             if role is None:
                 continue
-
-            center = self._det_center_uv(det)
-            line = source = line_depth = None
+            line = None
+            source = ""
+            line_depth = None
             status = ""
-
-            if role == "plug_tip" and port_centers and center is not None:
-                nearest_port = min(
-                    port_centers,
-                    key=lambda p: float(np.linalg.norm(p - center)),
-                )
+            center = self._det_center_uv(det)
+            if role == "port_mouth":
+                line, source, line_depth, status = self._select_sfp_alignment_edge(det, depth)
+            elif role == "plug_tip" and port_centers and center is not None:
+                nearest_port = min(port_centers, key=lambda p: float(np.linalg.norm(p - center)))
                 line, source, line_depth, status = self._select_sfp_edge_toward_point(
-                    det, want_long=False, ref_uv=nearest_port, depth=depth
+                    det,
+                    want_long=False,
+                    ref_uv=nearest_port,
+                    depth=depth,
                 )
-            elif role == "port_mouth" and plug_centers and center is not None:
-                nearest_plug = min(
-                    plug_centers,
-                    key=lambda p: float(np.linalg.norm(p - center)),
-                )
-                line, source, line_depth, status = self._select_sfp_edge_toward_point(
-                    det, want_long=True, ref_uv=nearest_plug, depth=depth
-                )
-
-            # Fallback when the complementary detection is not yet visible.
             if line is None:
                 line, source, line_depth, status = self._select_sfp_alignment_edge(det, depth)
-
             det["alignment_line_status"] = status or "no_line"
             if line is None:
                 continue
             self._set_alignment_line(det, role, line, source)
             if line_depth is not None:
                 det["alignment_line_depth_m"] = float(line_depth)
-
         return detections
 
-    def _backproject_uv_required_depth(self, info: CameraInfo, depth: Optional[np.ndarray], uv: np.ndarray) -> Optional[np.ndarray]:
-        if depth is None:
-            return None
-        u = float(uv[0])
-        v = float(uv[1])
-        z = self._sample_depth(depth, u, v)
-        if z is None:
-            return None
-        fx = float(info.k[0])
-        fy = float(info.k[4])
-        cx = float(info.k[2])
-        cy = float(info.k[5])
-        if fx <= 1e-6 or fy <= 1e-6:
-            return None
-        return np.array([(u - cx) * z / fx, (v - cy) * z / fy, z], dtype=np.float32)
-
-    def _alignment_line_base_points(
-        self,
-        camera_name: str,
-        camera_frame_id: str,
-        line_uv,
-    ) -> list[list[float]]:
-        if not isinstance(line_uv, list) or len(line_uv) != 2:
-            return []
+    def _attach_depth_anchor_poses(self, camera_name: str, detections: List[Dict]) -> List[Dict]:
         with self._lock:
             info = self._latest_infos.get(camera_name)
         if info is None:
-            return []
+            return detections
         depth = self._get_latest_depth_copy(camera_name)
-        pts_cam = []
-        try:
-            line = np.asarray(line_uv, dtype=np.float32).reshape(2, 2)
-        except Exception:
-            return []
-        for uv in line:
-            p_cam = self._backproject_uv_required_depth(info, depth, uv)
-            if p_cam is None:
-                return []
-            pts_cam.append(p_cam)
-        try:
-            R, t = self._lookup_transform(self._base_frame, camera_frame_id)
-        except Exception:
-            return []
-        pts_base = [np.asarray(R, dtype=np.float32).reshape(3, 3) @ p + np.asarray(t, dtype=np.float32).reshape(3) for p in pts_cam]
-        return [[float(v) for v in p.tolist()] for p in pts_base]
-
-    def _make_pose_record(self, det: Dict, pose_camera: Dict, used_tf_names: set) -> Dict:
-        display_name = str(det.get("instance_name", det.get("class_name", "")))
-        tf_base = "det_" + self._tf_safe_name(display_name)
-        tf_name = tf_base
-        index = 1
-        while tf_name in used_tf_names:
-            tf_name = f"{tf_base}_{index}"
-            index += 1
-        used_tf_names.add(tf_name)
-        return {
-            "name": display_name,
-            "tf_name": tf_name,
-            "bbox_xyxy": [float(v) for v in det.get("bbox_xyxy", [])],
-            "pose_camera": pose_camera,
-            "pose_source": str(pose_camera.get("source", "depth_registration")),
-        }
-
-    def _attach_pose_data_to_detections(self, detections: List[Dict], pose_records: List[Dict]) -> List[Dict]:
-        out = [dict(d) for d in detections]
-        for det in out:
-            for rec in pose_records:
-                rb = rec.get("bbox_xyxy")
-                db = det.get("bbox_xyxy")
-                if rb is None or db is None or len(rb) != len(db):
-                    continue
-                if sum(abs(float(a) - float(b)) for a, b in zip(rb, db)) < 1e-3:
-                    pose_cam = rec.get("pose_camera")
-                    if pose_cam:
-                        det["pose_camera"] = {
-                            "R": [[float(x) for x in row] for row in np.asarray(pose_cam.get("R", self._quaternion_to_matrix(np.asarray(pose_cam["q"], dtype=np.float32))), dtype=np.float32).reshape(3, 3)],
-                            "t": [float(v) for v in pose_cam["t"]],
-                            "q": [float(v) for v in pose_cam["q"]],
-                        }
-                    det["tf_frame"] = rec.get("tf_name")
-                    det["pose_source"] = rec.get("pose_source", "depth_registration")
-                    break
+        out: List[Dict] = []
+        for det in detections:
+            name = str(det.get("instance_name", det.get("class_name", "")))
+            if name not in _ALLOWED_TF_NAMES:
+                continue
+            det2 = dict(det)
+            anchor = self._anchor_uv_for_detection(det2)
+            t_cam = self._backproject_anchor(info, depth, anchor)
+            if t_cam is None:
+                out.append(det2)
+                continue
+            q = [0.0, 0.0, 0.0, 1.0]
+            det2["anchor_uv"] = [float(anchor[0]), float(anchor[1])]
+            det2["pose_camera"] = {
+                "t": [float(v) for v in t_cam],
+                "q": q,
+            }
+            det2["pose_source"] = "depth_anchor"
+            out.append(det2)
         return out
 
-    def _camera_matrix_from_info(self, info) -> np.ndarray:
-        return np.array(
-            [[float(info.k[0]), 0.0, float(info.k[2])], [0.0, float(info.k[4]), float(info.k[5])], [0.0, 0.0, 1.0]],
-            dtype=np.float32,
-        )
+    def _anchor_uv_for_detection(self, det: Dict) -> np.ndarray:
+        if isinstance(det.get("center_uv"), list) and len(det["center_uv"]) >= 2:
+            return np.asarray(det["center_uv"][:2], dtype=np.float32)
+        return self._detection_anchor_point(det)
 
-    def _dist_coeffs_from_info(self, info) -> np.ndarray:
-        if getattr(info, "d", None) is None or len(info.d) == 0:
-            return np.zeros((5, 1), dtype=np.float32)
-        return np.asarray(info.d, dtype=np.float32).reshape(-1, 1)
-
-    def _board_corner_points_xy(self) -> np.ndarray:
-        half_w = 0.5 * float(self._board_width_m)
-        half_h = 0.5 * float(self._board_height_m)
-        return np.array([[-half_w, half_h], [half_w, half_h], [half_w, -half_h], [-half_w, -half_h]], dtype=np.float32)
-
-    def _board_corner_points_xyz(self) -> np.ndarray:
-        xy = self._board_corner_points_xy()
-        return np.column_stack([xy, np.zeros((4, 1), dtype=np.float32)]).astype(np.float32)
-
-    def _estimate_board_pose_from_quad(self, info, board_quad_image: np.ndarray) -> Optional[Dict]:
-        image_points = np.asarray(board_quad_image, dtype=np.float32).reshape(4, 2)
-        object_points = self._board_corner_points_xyz()
-        K = self._camera_matrix_from_info(info)
-        dist = self._dist_coeffs_from_info(info)
-        solve_flags = getattr(cv2, "SOLVEPNP_IPPE", cv2.SOLVEPNP_ITERATIVE)
-        ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, dist, flags=solve_flags)
-        if not ok:
-            ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-        if not ok:
+    def _backproject_anchor(self, info: CameraInfo, depth: Optional[np.ndarray], anchor_uv: np.ndarray) -> Optional[np.ndarray]:
+        u = float(anchor_uv[0])
+        v = float(anchor_uv[1])
+        Z = self._sample_depth(depth, u, v)
+        if Z is None:
+            Z = float(self._depth_fallback_m)
+        fx = float(info.k[0])
+        fy = float(info.k[4])
+        cx = float(info.k[2])
+        cy = float(info.k[5])
+        if fx <= 1e-6 or fy <= 1e-6 or Z <= 0.0:
             return None
-        R, _ = cv2.Rodrigues(rvec)
-        t = np.asarray(tvec, dtype=np.float32).reshape(3)
-        R = self._orthonormalize_rotation(np.asarray(R, dtype=np.float32).reshape(3, 3))
-        return {"R": R, "t": t, "q": self._matrix_to_quaternion(R), "source": "board_pnp"}
+        X = (u - cx) * Z / fx
+        Y = (v - cy) * Z / fy
+        return np.array([X, Y, Z], dtype=np.float32)
 
-    def _estimate_board_pose_geometry(self, info: CameraInfo, depth: Optional[np.ndarray], taskboard_det: Dict, observed_board_quad: Optional[np.ndarray]) -> Optional[Dict]:
+    def _sample_depth(self, depth: Optional[np.ndarray], u: float, v: float) -> Optional[float]:
         if depth is None:
-            return self._estimate_board_pose_from_quad(info, observed_board_quad) if observed_board_quad is not None else None
-        pts = self._depth_points_from_region(info, depth, taskboard_det, observed_board_quad)
-        if pts is None or len(pts) < 80:
-            return self._estimate_board_pose_from_quad(info, observed_board_quad) if observed_board_quad is not None else None
-        plane = self._fit_dominant_plane_ransac(pts)
-        if plane is None:
-            return self._estimate_board_pose_from_quad(info, observed_board_quad) if observed_board_quad is not None else None
-        normal, plane_point, plane_pts = plane
-        quad3d = None
-        if observed_board_quad is not None:
-            quad3d = self._lift_quad_to_plane(info, observed_board_quad, normal, plane_point)
-        if quad3d is not None:
-            centroid = quad3d.mean(axis=0).astype(np.float32)
-            x_hint = (quad3d[1] - quad3d[0]) + (quad3d[2] - quad3d[3])
-            y_hint = (quad3d[3] - quad3d[0]) + (quad3d[2] - quad3d[1])
-            x_axis = self._normalize_vec(self._project_vec_to_plane(x_hint, normal))
-            y_axis = self._normalize_vec(self._project_vec_to_plane(y_hint, normal))
-            if x_axis is not None and y_axis is not None and float(np.dot(np.cross(x_axis, y_axis), normal)) < 0.0:
-                x_axis = -x_axis
-        else:
-            centroid = np.median(plane_pts, axis=0).astype(np.float32)
-            x_axis = self._board_x_axis_from_image(info, centroid, normal, observed_board_quad, taskboard_det)
-            y_axis = None
-        if x_axis is None:
-            x_axis = self._board_x_axis_from_image(info, centroid, normal, observed_board_quad, taskboard_det)
-        if x_axis is None:
-            x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-            x_axis = self._normalize_vec(self._project_vec_to_plane(x_axis, normal))
-        if x_axis is None:
             return None
-        y_axis = self._normalize_vec(np.cross(normal, x_axis))
-        if y_axis is None:
-            return None
-        x_axis = self._normalize_vec(np.cross(y_axis, normal))
-        if x_axis is None:
-            return None
-        R = self._orthonormalize_rotation(np.column_stack([x_axis, y_axis, normal]).astype(np.float32))
-        return {"R": R, "t": centroid.astype(np.float32), "q": self._matrix_to_quaternion(R), "source": "board_depth_plane_ransac"}
-
-    def _depth_points_from_region(self, info: CameraInfo, depth: np.ndarray, det: Dict, quad: Optional[np.ndarray]) -> Optional[np.ndarray]:
         h, w = depth.shape[:2]
-        if quad is not None:
-            quad_i = np.round(np.asarray(quad, dtype=np.float32)).astype(np.int32).reshape(-1, 2)
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillConvexPoly(mask, quad_i, 255)
-        else:
-            box = det.get("bbox_xyxy", [0, 0, 0, 0])
-            x1, y1, x2, y2 = [float(v) for v in box]
-            bw = max(2.0, x2 - x1)
-            bh = max(2.0, y2 - y1)
-            ix1 = int(np.clip(np.floor(x1 + 0.05 * bw), 0, w - 1))
-            iy1 = int(np.clip(np.floor(y1 + 0.05 * bh), 0, h - 1))
-            ix2 = int(np.clip(np.ceil(x2 - 0.05 * bw), ix1 + 1, w))
-            iy2 = int(np.clip(np.ceil(y2 - 0.05 * bh), iy1 + 1, h))
-            mask = np.zeros((h, w), dtype=np.uint8)
-            mask[iy1:iy2, ix1:ix2] = 255
-        z = np.asarray(depth, dtype=np.float32)
-        valid = (mask > 0) & np.isfinite(z) & (z > 0.05) & (z < 3.0)
-        if not np.any(valid):
+        if h <= 0 or w <= 0:
             return None
-        valid_z = z[valid]
-        z_med = float(np.median(valid_z))
-        z_mad = float(np.median(np.abs(valid_z - z_med)))
-        z_band = max(0.015, 3.0 * z_mad)
-        valid &= (z >= z_med - z_band) & (z <= z_med + z_band)
-        ys, xs = np.where(valid)
-        if xs.size < 30:
+        r = int(np.clip(round(v), 0, h - 1))
+        c = int(np.clip(round(u), 0, w - 1))
+        r0, r1 = max(0, r - 3), min(h, r + 4)
+        c0, c1 = max(0, c - 3), min(w, c + 4)
+        patch = np.asarray(depth[r0:r1, c0:c1], dtype=np.float32)
+        valid = patch[np.isfinite(patch) & (patch > 0.05) & (patch < 3.0)]
+        if valid.size == 0:
             return None
-        fx = float(info.k[0])
-        fy = float(info.k[4])
-        cx = float(info.k[2])
-        cy = float(info.k[5])
-        if fx <= 1e-6 or fy <= 1e-6:
-            return None
-        zs = z[ys, xs].astype(np.float32)
-        X = (xs.astype(np.float32) - cx) * zs / fx
-        Y = (ys.astype(np.float32) - cy) * zs / fy
-        pts = np.column_stack([X, Y, zs]).astype(np.float32)
-        centroid = np.median(pts, axis=0)
-        dist = np.linalg.norm(pts - centroid.reshape(1, 3), axis=1)
-        pts = pts[dist <= np.percentile(dist, 94.0)]
-        return pts.astype(np.float32) if len(pts) >= 30 else None
+        return float(np.median(valid))
 
-    def _fit_dominant_plane_ransac(self, pts: np.ndarray, iterations: int = 120, threshold_m: float = 0.008) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        pts = np.asarray(pts, dtype=np.float32)
-        if pts.shape[0] < 40:
-            return None
-        rng = np.random.default_rng(12345)
-        best_inliers = None
-        best_normal = None
-        best_point = None
-        n_pts = pts.shape[0]
-        for _ in range(iterations):
-            idx = rng.choice(n_pts, size=3, replace=False)
-            p0, p1, p2 = pts[idx]
-            normal = np.cross(p1 - p0, p2 - p0)
-            normal = self._normalize_vec(normal)
-            if normal is None:
+    def _publish_fused_from_instance_obs(self, instance_obs: Dict[str, List[Dict]]) -> None:
+        stamp = self.get_clock().now().to_msg()
+        fused_records = []
+        for name in sorted(instance_obs.keys(), key=self._tf_sort_key):
+            if name not in _ALLOWED_TF_NAMES:
                 continue
-            d = np.abs((pts - p0.reshape(1, 3)) @ normal.reshape(3, 1)).reshape(-1)
-            inliers = d < threshold_m
-            if best_inliers is None or int(np.count_nonzero(inliers)) > int(np.count_nonzero(best_inliers)):
-                best_inliers = inliers
-                best_normal = normal
-                best_point = p0
-        if best_inliers is None or int(np.count_nonzero(best_inliers)) < 40:
-            return None
-        inlier_pts = pts[best_inliers]
-        center = np.median(inlier_pts, axis=0)
-        X = inlier_pts - center.reshape(1, 3)
-        cov = np.cov(X.T)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        normal = eigvecs[:, np.argmin(eigvals)].astype(np.float32)
-        if float(np.dot(normal, center)) > 0.0:
-            normal = -normal
-        normal = self._normalize_vec(normal)
-        if normal is None:
-            return None
-        dist = np.abs((pts - center.reshape(1, 3)) @ normal.reshape(3, 1)).reshape(-1)
-        inlier_pts = pts[dist < threshold_m]
-        if len(inlier_pts) < 40:
-            return None
-        plane_point = np.median(inlier_pts, axis=0).astype(np.float32)
-        return normal.astype(np.float32), plane_point, inlier_pts.astype(np.float32)
+            best_obj = self._select_best_observation(instance_obs[name])
+            if best_obj is None:
+                continue
+            det = best_obj["det"]
+            camera_frame_id = best_obj["camera_frame_id"]
+            pose_base = self._transform_pose_dict(det.get("pose_camera"), camera_frame_id, self._base_frame)
+            if pose_base is None:
+                continue
+            tf_name = "det_" + self._tf_safe_name(name)
+            anchor_keys = (
+                "servo_anchor_valid",
+                "servo_anchor_source",
+                "servo_anchor_quality",
+                "mouth_center_uv",
+                "mouth_left_uv",
+                "mouth_right_uv",
+                "mouth_angle_rad",
+                "sc_port_center_uv",
+                "sc_port_axis_left_uv",
+                "sc_port_axis_right_uv",
+                "sc_port_axis_angle_rad",
+                "tip_uv",
+                "front_center_uv",
+                "front_left_uv",
+                "front_right_uv",
+                "front_angle_rad",
+                "sc_plug_tip_uv",
+                "sc_plug_axis_left_uv",
+                "sc_plug_axis_right_uv",
+                "sc_plug_axis_angle_rad",
+                "alignment_line_role",
+                "alignment_line_uv",
+                "alignment_line_mid_uv",
+                "alignment_line_angle_rad",
+                "alignment_line_source",
+                "alignment_line_status",
+                "alignment_line_depth_m",
+            )
+            anchors = {key: det[key] for key in anchor_keys if key in det}
+            fused_records.append(
+                {
+                    "name": name,
+                    "tf_name": tf_name,
+                    "bbox_xyxy": [float(v) for v in det.get("bbox_xyxy", [])],
+                    "center_uv": det.get("center_uv", []),
+                    "base_pose": self._pose_dict_to_msg(pose_base),
+                    "pose_base": pose_base,
+                    "class_name": str(det.get("class_name", "")),
+                    "confidence": float(det.get("confidence", 0.0)),
+                    "raw_confidence": float(det.get("raw_confidence", 0.0)),
+                    "track_id": int(det.get("track_id", -1)),
+                    "feature_track_id": int(det.get("feature_track_id", -1)),
+                    "feature_quality_score": float(det.get("feature_quality_score", 0.0)),
+                    "feature_tracked_count": int(det.get("feature_tracked_count", 0)),
+                    "feature_inlier_count": int(det.get("feature_inlier_count", 0)),
+                    "feature_mode": str(det.get("feature_mode", "")),
+                    "camera": best_obj.get("camera_name", ""),
+                    "camera_name": best_obj.get("camera_name", ""),
+                    "camera_frame_id": camera_frame_id,
+                    "pose_source": "depth_anchor",
+                    **anchors,
+                }
+            )
+        self._publish_fused_records(stamp, fused_records)
 
-    def _lift_quad_to_plane(self, info: CameraInfo, quad_uv: np.ndarray, normal: np.ndarray, plane_point: np.ndarray) -> Optional[np.ndarray]:
-        quad_uv = np.asarray(quad_uv, dtype=np.float32).reshape(4, 2)
-        pts = []
-        for uv in quad_uv:
-            ray = self._ray_from_pixel(info, float(uv[0]), float(uv[1]))
-            if ray is None:
-                return None
-            denom = float(np.dot(normal, ray))
-            if abs(denom) < 1e-6:
-                return None
-            t = float(np.dot(normal, plane_point) / denom)
-            if t <= 0.01:
-                return None
-            pts.append((ray * t).astype(np.float32))
-        pts = np.asarray(pts, dtype=np.float32)
-        return pts if pts.shape == (4, 3) else None
-
-    def _board_x_axis_from_image(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, quad: Optional[np.ndarray], taskboard_det: Dict) -> Optional[np.ndarray]:
-        if quad is not None:
-            quad = np.asarray(quad, dtype=np.float32).reshape(4, 2)
-            top_edge = quad[1] - quad[0]
-            bottom_edge = quad[2] - quad[3]
-            uv_dir = top_edge + bottom_edge
-            if float(np.linalg.norm(uv_dir)) < 1e-6:
-                uv_dir = quad[1] - quad[0]
-            center_uv = quad.mean(axis=0)
-            return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
-        box = np.asarray(taskboard_det.get("bbox_xyxy", [0, 0, 0, 0]), dtype=np.float32)
-        center_uv = np.array([(box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5], dtype=np.float32)
-        uv_dir = np.array([1.0, 0.0], dtype=np.float32)
-        return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
-
-    def _image_dir_to_plane_axis(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, center_uv: np.ndarray, uv_dir: np.ndarray) -> Optional[np.ndarray]:
-        uv_dir = np.asarray(uv_dir, dtype=np.float32).reshape(2)
-        nrm = float(np.linalg.norm(uv_dir))
-        if nrm < 1e-6:
+    def _select_best_observation(self, obs_list: List[Dict]) -> Optional[Dict]:
+        if not obs_list:
             return None
-        uv_dir = uv_dir / nrm
-        p0 = self._ray_from_pixel(info, float(center_uv[0]), float(center_uv[1]))
-        p1 = self._ray_from_pixel(info, float(center_uv[0] + 8.0 * uv_dir[0]), float(center_uv[1] + 8.0 * uv_dir[1]))
-        if p0 is None or p1 is None:
-            return None
-        axis = p1 - p0
-        axis = self._project_vec_to_plane(axis, normal)
-        return self._normalize_vec(axis)
+        ranked = sorted(obs_list, key=lambda obs: float(obs["det"].get("confidence", 0.0)), reverse=True)
+        best = ranked[0]
+        best_conf = float(best["det"].get("confidence", 0.0))
+        preferred = [
+            obs for obs in ranked
+            if obs.get("camera_name") == self._preferred_camera_for_fusion
+            and best_conf - float(obs["det"].get("confidence", 0.0)) <= 0.05
+        ]
+        return preferred[0] if preferred else best
 
-    def _ray_from_pixel(self, info: CameraInfo, u: float, v: float) -> Optional[np.ndarray]:
-        fx = float(info.k[0])
-        fy = float(info.k[4])
-        cx = float(info.k[2])
-        cy = float(info.k[5])
-        if fx <= 1e-6 or fy <= 1e-6:
-            return None
-        ray = np.array([(u - cx) / fx, (v - cy) / fy, 1.0], dtype=np.float32)
-        return self._normalize_vec(ray)
+    def _publish_fused_records(self, stamp, fused_records: List[Dict]) -> None:
+        fused_pose_array = PoseArray()
+        fused_pose_array.header.stamp = stamp
+        fused_pose_array.header.frame_id = self._base_frame
 
-    def _project_vec_to_plane(self, v: np.ndarray, normal: np.ndarray) -> np.ndarray:
-        v = np.asarray(v, dtype=np.float32).reshape(3)
-        n = np.asarray(normal, dtype=np.float32).reshape(3)
-        return v - n * float(np.dot(v, n))
+        fused_markers = MarkerArray()
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        fused_markers.markers.append(delete_marker)
 
-    def _normalize_vec(self, v: np.ndarray) -> Optional[np.ndarray]:
-        v = np.asarray(v, dtype=np.float32).reshape(3)
-        n = float(np.linalg.norm(v))
-        if n < 1e-6:
-            return None
-        return (v / n).astype(np.float32)
+        transforms = []
+        fused_json = []
+        marker_id = 0
+        published_items = []
 
-    def _orthonormalize_rotation(self, R: np.ndarray) -> np.ndarray:
-        U, _, Vt = np.linalg.svd(np.asarray(R, dtype=np.float32).reshape(3, 3))
-        Rn = U @ Vt
-        if np.linalg.det(Rn) < 0.0:
-            U[:, -1] *= -1.0
-            Rn = U @ Vt
-        return np.asarray(Rn, dtype=np.float32)
+        for rec in fused_records:
+            pose = rec["base_pose"]
+            fused_pose_array.poses.append(pose)
+            transforms.append(self._pose_to_transform(stamp, self._base_frame, rec["tf_name"], pose))
+            published_items.append(f"{rec['name']}:{float(rec['confidence']):.2f}")
 
-    def _bbox_long_axis_on_plane(self, info: CameraInfo, center_xyz: np.ndarray, normal: np.ndarray, det: Dict) -> Optional[np.ndarray]:
-        box = np.asarray(det.get("bbox_xyxy", [0, 0, 0, 0]), dtype=np.float32)
-        if box.size != 4:
-            return None
-        x1, y1, x2, y2 = [float(v) for v in box]
-        if (x2 - x1) >= (y2 - y1):
-            center_uv = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
-            uv_dir = np.array([1.0, 0.0], dtype=np.float32)
-        else:
-            center_uv = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
-            uv_dir = np.array([0.0, 1.0], dtype=np.float32)
-        return self._image_dir_to_plane_axis(info, center_xyz, normal, center_uv, uv_dir)
+            axes = self._make_axes_marker(marker_id, stamp, rec["name"], pose)
+            fused_markers.markers.append(axes)
+            marker_id += 1
 
-    def _principal_axis_from_points_on_plane(self, pts: np.ndarray, normal: np.ndarray, fallback_axis: np.ndarray) -> Optional[np.ndarray]:
-        pts = np.asarray(pts, dtype=np.float32)
-        if pts.shape[0] < 12:
-            return None
-        center = np.median(pts, axis=0)
-        X = pts - center.reshape(1, 3)
-        X = X - (X @ normal.reshape(3, 1)) * normal.reshape(1, 3)
-        cov = np.cov(X.T)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        axis = eigvecs[:, np.argmax(eigvals)].astype(np.float32)
-        axis = self._normalize_vec(self._project_vec_to_plane(axis, normal))
-        if axis is None:
-            return None
-        fallback_axis = self._normalize_vec(self._project_vec_to_plane(fallback_axis, normal))
-        if fallback_axis is not None and float(np.dot(axis, fallback_axis)) < 0.0:
-            axis = -axis
-        return axis.astype(np.float32)
+            text = Marker()
+            text.header.frame_id = self._base_frame
+            text.header.stamp = stamp
+            text.ns = "simple_yolo_depth_anchor_text"
+            text.id = marker_id
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose = pose
+            text.pose.position.z += 0.04
+            text.scale.z = self._text_scale
+            text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.95)
+            text.text = rec["name"]
+            fused_markers.markers.append(text)
+            marker_id += 1
 
-    def _estimate_component_pose_on_board_plane(self, info: CameraInfo, depth: Optional[np.ndarray], det: Dict, board_pose_camera: Dict, raw_pose_camera: Optional[Dict] = None, translation_hint: Optional[np.ndarray] = None) -> Optional[Dict]:
-        if board_pose_camera is None:
-            return None
-        Rb = np.asarray(board_pose_camera["R"], dtype=np.float32).reshape(3, 3)
-        board_x = Rb[:, 0]
-        board_y = Rb[:, 1]
-        normal = Rb[:, 2]
-        pts = None if depth is None else self._depth_points_from_region(info, depth, det, None)
-        if translation_hint is not None:
-            t = np.asarray(translation_hint, dtype=np.float32).reshape(3)
-        elif pts is not None and len(pts) >= 12:
-            t = np.median(pts, axis=0).astype(np.float32)
-        else:
-            family = self._detection_family_name(det)
-            anchor_key = "NIC_CARD" if family == "nic" else "SC_PORT" if family == "sc" else "GENERIC"
-            anchor = self._detection_anchor_point(det, anchor_key)
-            t = self._backproject_anchor(info, depth, anchor)
-        if t is None:
-            return None
+            bp = pose.position
+            fused_det = {
+                    "class_name": rec["class_name"],
+                    "instance_name": rec["name"],
+                    "confidence": rec["confidence"],
+                    "raw_confidence": rec.get("raw_confidence", 0.0),
+                    "bbox_xyxy": rec["bbox_xyxy"],
+                    "tf_frame": rec["tf_name"],
+                    "source": rec["camera"],
+                    "camera_name": rec["camera_name"],
+                    "center_uv": rec.get("center_uv", []),
+                    "camera_frame_id": rec.get("camera_frame_id", ""),
+                    "pose_source": "depth_anchor",
+                    "track_id": rec.get("track_id", -1),
+                    "feature_track_id": rec.get("feature_track_id", -1),
+                    "feature_quality_score": rec.get("feature_quality_score", 0.0),
+                    "feature_tracked_count": rec.get("feature_tracked_count", 0),
+                    "feature_inlier_count": rec.get("feature_inlier_count", 0),
+                    "feature_mode": rec.get("feature_mode", ""),
+                    "pose_base_link": {
+                        "position": {
+                            "x": float(bp.x),
+                            "y": float(bp.y),
+                            "z": float(bp.z),
+                        },
+                        "orientation": {
+                            "x": float(pose.orientation.x),
+                            "y": float(pose.orientation.y),
+                            "z": float(pose.orientation.z),
+                            "w": float(pose.orientation.w),
+                        },
+                    },
+                }
+            for key in (
+                "servo_anchor_valid",
+                "servo_anchor_source",
+                "servo_anchor_quality",
+                "mouth_center_uv",
+                "mouth_left_uv",
+                "mouth_right_uv",
+                "mouth_angle_rad",
+                "sc_port_center_uv",
+                "sc_port_axis_left_uv",
+                "sc_port_axis_right_uv",
+                "sc_port_axis_angle_rad",
+                "tip_uv",
+                "front_center_uv",
+                "front_left_uv",
+                "front_right_uv",
+                "front_angle_rad",
+                "sc_plug_tip_uv",
+                "sc_plug_axis_left_uv",
+                "sc_plug_axis_right_uv",
+                "sc_plug_axis_angle_rad",
+                "alignment_line_role",
+                "alignment_line_uv",
+                "alignment_line_mid_uv",
+                "alignment_line_angle_rad",
+                "alignment_line_source",
+                "alignment_line_status",
+                "alignment_line_depth_m",
+            ):
+                if key in rec:
+                    fused_det[key] = rec[key]
+            fused_json.append(fused_det)
 
-        raw_axis = None
-        if raw_pose_camera is not None and raw_pose_camera.get("R", None) is not None:
-            raw_axis = np.asarray(raw_pose_camera["R"], dtype=np.float32).reshape(3, 3)[:, 0]
-        if raw_axis is None:
-            raw_axis = board_x
+        self._fused_pose_pub.publish(fused_pose_array)
+        self._fused_marker_pub.publish(fused_markers)
+        if transforms:
+            self._tf_broadcaster.sendTransform(transforms)
 
-        x_axis = None
-        if pts is not None and len(pts) >= 12:
-            x_axis = self._principal_axis_from_points_on_plane(pts, normal, raw_axis)
-        if x_axis is None:
-            x_axis = self._obb_long_axis_on_plane(info, t, normal, det)
-        if x_axis is None:
-            x_axis = self._bbox_long_axis_on_plane(info, t, normal, det)
-        if x_axis is None and raw_axis is not None:
-            x_axis = self._normalize_vec(self._project_vec_to_plane(raw_axis, normal))
-        if x_axis is None:
-            x_axis = board_x
-        if float(np.dot(x_axis, board_x)) < 0.0:
-            x_axis = -x_axis
-        y_axis = self._normalize_vec(np.cross(normal, x_axis))
-        if y_axis is None:
-            y_axis = board_y
-        if float(np.dot(y_axis, board_y)) < 0.0:
-            y_axis = -y_axis
-        x_axis = self._normalize_vec(np.cross(y_axis, normal))
-        if x_axis is None:
-            x_axis = board_x
-        R = self._orthonormalize_rotation(np.column_stack([x_axis, y_axis, normal]).astype(np.float32))
-        return {"R": R, "t": t.astype(np.float32), "q": self._matrix_to_quaternion(R), "source": "board_plane_component"}
+        msg = String()
+        msg.data = json.dumps(fused_json, separators=(",", ":"))
+        self._fused_json_pub.publish(msg)
+        self.get_logger().info(f"TRACK_YOLO_TF published={','.join(published_items)}")
 
     def _transform_pose_dict(self, pose: Optional[Dict], source_frame: str, target_frame: str) -> Optional[Dict]:
         if pose is None:
             return None
-        t_val = pose.get("t")
-        q_val = pose.get("q")
-        R_val = pose.get("R")
-        if t_val is None:
-            return None
-        t_src = np.asarray(t_val, dtype=np.float32).reshape(3)
-        if R_val is not None:
-            R_src = np.asarray(R_val, dtype=np.float32).reshape(3, 3)
-        elif q_val is not None:
-            R_src = self._quaternion_to_matrix(np.asarray(q_val, dtype=np.float32).reshape(4))
-        else:
-            return None
-        q_src = self._matrix_to_quaternion(R_src)
+        t = np.asarray(pose.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+        q = np.asarray(pose.get("q", [0.0, 0.0, 0.0, 1.0]), dtype=np.float64).reshape(4)
         if source_frame == target_frame:
-            return {"R": R_src.astype(np.float32), "t": t_src.astype(np.float32), "q": q_src.astype(np.float32)}
+            return {"t": t, "q": self._normalize_quat(q)}
         try:
-            R_tf, t_tf = self._lookup_transform(target_frame, source_frame)
-        except Exception:
-            return None
-        R_tf = np.asarray(R_tf, dtype=np.float32).reshape(3, 3)
-        t_tf = np.asarray(t_tf, dtype=np.float32).reshape(3)
-        R_tgt = R_tf @ R_src
-        t_tgt = R_tf @ t_src + t_tf
-        return {"R": R_tgt.astype(np.float32), "t": t_tgt.astype(np.float32), "q": self._matrix_to_quaternion(R_tgt)}
-
-    def _maybe_constrain_pose_to_table_plane(self, det: Dict, pose_base: Dict) -> Dict:
-        if not self._force_table_flat:
-            return pose_base
-        family = self._detection_family_name(det)
-        if family not in self._table_constrained_families:
-            return pose_base
-
-        R = np.asarray(pose_base.get("R"), dtype=np.float32).reshape(3, 3)
-        t = np.asarray(pose_base.get("t"), dtype=np.float32).reshape(3)
-
-        world_up = self._table_normal_base.astype(np.float32)
-        z_axis = R[:, 2].astype(np.float32)
-        if float(np.dot(z_axis, world_up)) < 0.0:
-            world_up = -world_up
-
-        x_hint = self._project_vec_to_plane(R[:, 0], world_up)
-        x_axis = self._normalize_vec(x_hint)
-        if x_axis is None:
-            y_hint = self._project_vec_to_plane(R[:, 1], world_up)
-            y_axis = self._normalize_vec(y_hint)
-            if y_axis is None:
-                return pose_base
-            x_axis = self._normalize_vec(np.cross(y_axis, world_up))
-            if x_axis is None:
-                return pose_base
-        y_axis = self._normalize_vec(np.cross(world_up, x_axis))
-        if y_axis is None:
-            return pose_base
-        x_axis = self._normalize_vec(np.cross(y_axis, world_up))
-        if x_axis is None:
-            return pose_base
-
-        R_flat = self._orthonormalize_rotation(np.column_stack([x_axis, y_axis, world_up]).astype(np.float32))
-        return {
-            "R": R_flat.astype(np.float32),
-            "t": t.astype(np.float32),
-            "q": self._matrix_to_quaternion(R_flat),
-            "source": str(pose_base.get("source", "")) + "+table_flat",
-        }
+            tf = self._tf_buffer.lookup_transform(target_frame, source_frame, Time())
+        except TransformException:
+            try:
+                tf = self._tf_buffer.lookup_transform(target_frame, source_frame, self.get_clock().now())
+            except Exception:
+                return None
+        tr = tf.transform.translation
+        rot = tf.transform.rotation
+        tf_t = np.array([tr.x, tr.y, tr.z], dtype=np.float64)
+        tf_q = np.array([rot.x, rot.y, rot.z, rot.w], dtype=np.float64)
+        R = self._quat_to_matrix(tf_q)
+        out_t = R @ t + tf_t
+        out_q = self._quat_multiply(tf_q, q)
+        return {"t": out_t, "q": self._normalize_quat(out_q)}
 
     def _pose_dict_to_msg(self, pose: Dict) -> Pose:
-        msg = Pose()
-        msg.position.x = float(pose["t"][0])
-        msg.position.y = float(pose["t"][1])
-        msg.position.z = float(pose["t"][2])
-        msg.orientation = self._quaternion_msg_from_array(pose["q"])
-        return msg
-
-    def _quaternion_msg_from_array(self, q: np.ndarray) -> Quaternion:
-        q = np.asarray(q, dtype=np.float32).reshape(4)
-        msg = Quaternion()
-        msg.x = float(q[0])
-        msg.y = float(q[1])
-        msg.z = float(q[2])
-        msg.w = float(q[3])
-        return msg
-
-    def _matrix_to_quaternion(self, R: np.ndarray) -> np.ndarray:
-        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
-        trace = float(np.trace(R))
-        if trace > 0.0:
-            s = 0.5 / np.sqrt(trace + 1.0)
-            w = 0.25 / s
-            x = (R[2, 1] - R[1, 2]) * s
-            y = (R[0, 2] - R[2, 0]) * s
-            z = (R[1, 0] - R[0, 1]) * s
-        else:
-            if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-                s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[0, 0] - R[1, 1] - R[2, 2]))
-                w = (R[2, 1] - R[1, 2]) / s
-                x = 0.25 * s
-                y = (R[0, 1] + R[1, 0]) / s
-                z = (R[0, 2] + R[2, 0]) / s
-            elif R[1, 1] > R[2, 2]:
-                s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[1, 1] - R[0, 0] - R[2, 2]))
-                w = (R[0, 2] - R[2, 0]) / s
-                x = (R[0, 1] + R[1, 0]) / s
-                y = 0.25 * s
-                z = (R[1, 2] + R[2, 1]) / s
-            else:
-                s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[2, 2] - R[0, 0] - R[1, 1]))
-                w = (R[1, 0] - R[0, 1]) / s
-                x = (R[0, 2] + R[2, 0]) / s
-                y = (R[1, 2] + R[2, 1]) / s
-                z = 0.25 * s
-        q = np.array([x, y, z, w], dtype=np.float64)
-        qn = np.linalg.norm(q)
-        if qn < 1e-12:
-            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-        q = q / qn
-        if q[3] < 0.0:
-            q = -q
-        return q.astype(np.float32)
+        t = np.asarray(pose["t"], dtype=np.float64).reshape(3)
+        q = self._normalize_quat(np.asarray(pose["q"], dtype=np.float64).reshape(4))
+        return Pose(
+            position=Point(x=float(t[0]), y=float(t[1]), z=float(t[2])),
+            orientation=Quaternion(x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3])),
+        )
 
     def _pose_to_transform(self, stamp, parent: str, child: str, pose: Pose) -> TransformStamped:
         tf = TransformStamped()
@@ -1371,248 +664,72 @@ class CombinedYoloDepthPosePlanner(YoloV12MultiCameraDetector):
         tf.transform.rotation = pose.orientation
         return tf
 
-    def _tf_safe_name(self, text: str) -> str:
-        out = str(text).strip().lower().replace(" ", "_").replace("-", "_")
-        out = "".join(ch for ch in out if ch.isalnum() or ch == "_")
-        while "__" in out:
-            out = out.replace("__", "_")
-        return out if out else "detection"
-
     def _make_axes_marker(self, marker_id: int, stamp, name: str, pose: Pose) -> Marker:
-        R = self._quaternion_to_matrix(
-            np.array([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w], dtype=np.float32)
-        )
-        origin = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=np.float32)
-        x_end = origin + R[:, 0] * float(self._axis_length_m)
-        y_end = origin + R[:, 1] * float(self._axis_length_m)
-        z_end = origin + R[:, 2] * float(self._axis_length_m)
-
         marker = Marker()
         marker.header.frame_id = self._base_frame
         marker.header.stamp = stamp
-        marker.ns = "combined_detection_axes"
+        marker.ns = "simple_yolo_depth_anchor_axes"
         marker.id = marker_id
-        marker.type = Marker.LINE_LIST
+        marker.type = Marker.ARROW
         marker.action = Marker.ADD
-        marker.scale.x = self._axis_width_m
-        marker.pose.orientation.w = 1.0
-        marker.points = [
-            self._point_msg(origin),
-            self._point_msg(x_end),
-            self._point_msg(origin),
-            self._point_msg(y_end),
-            self._point_msg(origin),
-            self._point_msg(z_end),
-        ]
-        marker.colors = [
-            ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0),
-            ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0),
-            ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0),
-            ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0),
-            ColorRGBA(r=0.0, g=0.4, b=1.0, a=1.0),
-            ColorRGBA(r=0.0, g=0.4, b=1.0, a=1.0),
-        ]
+        marker.pose = pose
+        marker.scale.x = self._axis_length_m
+        marker.scale.y = self._axis_width_m
+        marker.scale.z = self._axis_width_m
+        marker.color = ColorRGBA(r=0.1, g=0.9, b=0.1, a=0.9)
+        marker.text = name
         return marker
 
-    def _make_alignment_line_marker(self, marker_id: int, stamp, rec: Dict) -> Optional[Marker]:
-        pts = rec.get("alignment_line_base_xyz", [])
-        if not isinstance(pts, list) or len(pts) != 2:
-            return None
-        try:
-            p0 = np.asarray(pts[0], dtype=np.float32).reshape(3)
-            p1 = np.asarray(pts[1], dtype=np.float32).reshape(3)
-        except Exception:
-            return None
-        if not np.all(np.isfinite(p0)) or not np.all(np.isfinite(p1)):
-            return None
-        marker = Marker()
-        marker.header.frame_id = self._base_frame
-        marker.header.stamp = stamp
-        marker.ns = "combined_sfp_alignment_lines"
-        marker.id = marker_id
-        marker.type = Marker.LINE_LIST
-        marker.action = Marker.ADD
-        marker.scale.x = self._sfp_line_width_m
-        marker.pose.orientation.w = 1.0
-        marker.points = [self._point_msg(p0), self._point_msg(p1)]
-        marker.colors = [
-            ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0),
-            ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0),
-        ]
-        return marker
+    def _tf_safe_name(self, text: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(text).strip().lower())
+        return safe or "unknown"
 
-    def _point_msg(self, xyz: np.ndarray) -> Point:
-        p = Point()
-        p.x = float(xyz[0])
-        p.y = float(xyz[1])
-        p.z = float(xyz[2])
-        return p
+    def _tf_sort_key(self, text: str):
+        order = {
+            "task_board": 0,
+            "nic_card": 1,
+            "sc_port": 2,
+            "sfp_port": 3,
+            "sfp_port_0": 3,
+            "sfp_port_1": 4,
+            "sfp_module": 5,
+            "sc_plug": 6,
+        }
+        return (order.get(text, 99), text)
 
-    def _quaternion_to_matrix(self, q: np.ndarray) -> np.ndarray:
-        x, y, z, w = [float(v) for v in np.asarray(q, dtype=np.float32).reshape(4)]
+    @staticmethod
+    def _normalize_quat(q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=np.float64).reshape(4)
+        n = float(np.linalg.norm(q))
+        if n < 1e-9:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        return q / n
+
+    @staticmethod
+    def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
+        x, y, z, w = CombinedYoloDepthPosePlanner._normalize_quat(q)
         return np.array(
             [
-                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
             ],
-            dtype=np.float32,
+            dtype=np.float64,
         )
 
-    # ------------------------------------------------------------------
-    # Cross-camera SFP port label consensus
-    # ------------------------------------------------------------------
-
-    def _bbox_center_x(self, det: Dict) -> float:
-        """Return horizontal centre pixel of a detection's bounding box."""
-        bbox = det.get("bbox_xyxy")
-        if not bbox or len(bbox) < 4:
-            return 0.0
-        return (float(bbox[0]) + float(bbox[2])) / 2.0
-
-    def _is_sfp_port(self, det: Dict) -> bool:
-        """True when the detection belongs to the SFP-port family."""
-        base = str(det.get("base_class_name", ""))
-        cls = str(det.get("class_name", ""))
-        inst = str(det.get("instance_name", ""))
-        return base == "sfp_port" or cls.startswith("sfp_port") or inst.startswith("sfp_port")
-
-    def _is_nic_card(self, det: Dict) -> bool:
-        """True when the detection is a NIC card."""
-        return (
-            str(det.get("base_class_name", "")) == "nic_card"
-            or str(det.get("class_name", "")) == "nic_card"
+    @staticmethod
+    def _quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        ax, ay, az, aw = CombinedYoloDepthPosePlanner._normalize_quat(a)
+        bx, by, bz, bw = CombinedYoloDepthPosePlanner._normalize_quat(b)
+        return np.array(
+            [
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz,
+            ],
+            dtype=np.float64,
         )
-
-    def _find_best_nic(self, detections: List[Dict]) -> Optional[Dict]:
-        """Return the highest-confidence NIC card detection, or None."""
-        nics = [d for d in detections if self._is_nic_card(d)]
-        if not nics:
-            return None
-        return max(nics, key=lambda d: float(d.get("confidence", 0.0)))
-
-    def _find_two_sfp_ports_for_nic(
-        self, detections: List[Dict], nic_det: Optional[Dict]
-    ) -> List[Dict]:
-        """Return up to 2 SFP-port detections closest to *nic_det*, sorted
-        left-to-right by image-X so index 0 is the image-left port."""
-        ports = [d for d in detections if self._is_sfp_port(d)]
-        if not ports:
-            return []
-        if nic_det is not None:
-            nic_cx = self._bbox_center_x(nic_det)
-            bbox = nic_det.get("bbox_xyxy", [0, 0, 0, 0])
-            nic_cy = (float(bbox[1]) + float(bbox[3])) / 2.0
-
-            def dist_to_nic(p: Dict) -> float:
-                px = self._bbox_center_x(p)
-                pb = p.get("bbox_xyxy", [0, 0, 0, 0])
-                py = (float(pb[1]) + float(pb[3])) / 2.0
-                return ((px - nic_cx) ** 2 + (py - nic_cy) ** 2) ** 0.5
-
-            ports.sort(key=dist_to_nic)
-        else:
-            ports.sort(key=lambda d: -float(d.get("confidence", 0.0)))
-        top_two = ports[:2]
-        top_two.sort(key=self._bbox_center_x)   # image-left first
-        return top_two
-
-    def _camera_sfp_left_right_assignment(
-        self, camera_name: str, detections: List[Dict]
-    ):
-        """Return (img_left_port, img_right_port, l_label, r_label) for one
-        camera, where *img_left_port* is the image-leftmost SFP port.
-        Returns (None, None, None, None) when fewer than 2 ports are visible."""
-        nic = self._find_best_nic(detections)
-        ports = self._find_two_sfp_ports_for_nic(detections, nic)
-        if len(ports) < 2:
-            return None, None, None, None
-        img_left_port = ports[0]
-        img_right_port = ports[1]
-        l_label = str(img_left_port.get("instance_name", img_left_port.get("class_name", "")))
-        r_label = str(img_right_port.get("instance_name", img_right_port.get("class_name", "")))
-        l_cx = self._bbox_center_x(img_left_port)
-        r_cx = self._bbox_center_x(img_right_port)
-        self.get_logger().info(
-            f"YOLO_SFP_VOTE camera={camera_name} left={l_label} right={r_label} "
-            f"left_cx={l_cx:.1f} right_cx={r_cx:.1f}"
-        )
-        return img_left_port, img_right_port, l_label, r_label
-
-    def _normalize_sfp_port_labels_across_cameras(self, processed_dict: Dict) -> None:
-        """Cross-camera majority-vote consensus for SFP port 0/1 labels.
-
-        For each camera that sees exactly 2 SFP ports we record a *vote*:
-          - vote for sfp_port_0 if the image-left port is already labelled
-            ``sfp_port_0``
-          - vote for sfp_port_1 otherwise.
-
-        If at least 2 cameras agree, we relabel every camera so that:
-          - image-left  port → *consensus_left*
-          - image-right port → *consensus_right*
-
-        This corrects the rare case where one camera assigns conflicting
-        indices, ensuring the fused JSON always uses a consistent numbering.
-        """
-        votes_sfp0 = 0
-        votes_sfp1 = 0
-        valid_cams = 0
-        camera_port_pairs: Dict = {}
-
-        for cam, p in processed_dict.items():
-            l_port, r_port, l_label, r_label = self._camera_sfp_left_right_assignment(
-                cam, p["detections"]
-            )
-            if l_label and r_label:
-                valid_cams += 1
-                camera_port_pairs[cam] = (l_port, r_port, l_label, r_label)
-                if l_label == "sfp_port_0":
-                    votes_sfp0 += 1
-                elif l_label == "sfp_port_1":
-                    votes_sfp1 += 1
-
-        if votes_sfp0 >= 2:
-            consensus_left = "sfp_port_0"
-            consensus_right = "sfp_port_1"
-        elif votes_sfp1 >= 2:
-            consensus_left = "sfp_port_1"
-            consensus_right = "sfp_port_0"
-        else:
-            self.get_logger().info(
-                f"YOLO_SFP_CONSENSUS skipped reason=no_majority "
-                f"votes_sfp0={votes_sfp0} votes_sfp1={votes_sfp1} valid_cameras={valid_cams}"
-            )
-            self._sfp_consensus_left_label = None
-            return
-
-        self.get_logger().info(
-            f"YOLO_SFP_CONSENSUS left={consensus_left} right={consensus_right} "
-            f"votes_sfp0={votes_sfp0} votes_sfp1={votes_sfp1}"
-        )
-        self._sfp_consensus_left_label = consensus_left
-        self._sfp_consensus_last_time = time.monotonic()
-
-        for cam, (l_port, r_port, old_l_label, old_r_label) in camera_port_pairs.items():
-            if old_l_label != consensus_left or old_r_label != consensus_right:
-                self.get_logger().info(
-                    f"YOLO_SFP_RELABEL camera={cam} "
-                    f"old_left={old_l_label} new_left={consensus_left} "
-                    f"old_right={old_r_label} new_right={consensus_right}"
-                )
-            # Always write the consensus label (idempotent when already correct).
-            l_port["instance_name"] = consensus_left
-            l_port["class_name"] = consensus_left
-            l_port["base_class_name"] = "sfp_port"
-            l_port["sfp_consensus_corrected"] = True
-            l_port["sfp_consensus_left_label"] = consensus_left
-            l_port["sfp_order_role"] = "image_left"
-
-            r_port["instance_name"] = consensus_right
-            r_port["class_name"] = consensus_right
-            r_port["base_class_name"] = "sfp_port"
-            r_port["sfp_consensus_corrected"] = True
-            r_port["sfp_consensus_left_label"] = consensus_left
-            r_port["sfp_order_role"] = "image_right"
 
 
 def main(args=None) -> None:
