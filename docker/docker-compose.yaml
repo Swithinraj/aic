@@ -2,7 +2,6 @@ name: aic
 services:
   eval:
     image: ghcr.io/intrinsic-dev/aic/aic_eval
-    # image: my-eval:v1
     build:
       dockerfile: docker/aic_eval/Dockerfile
       context: ..
@@ -15,9 +14,9 @@ services:
       AIC_MODEL_PASSWD: CHANGE_IN_PROD
       # AIC_ENABLE_ACL: true
   model:
-    image: my-solution:v1
+    image: izus_model:v1
     build:
-      dockerfile: docker/aic_model/Dockerfile
+      dockerfile: docker/izus_model/Dockerfile
       context: ..
     gpus: all
     networks:
@@ -30,4 +29,3 @@ services:
       # AIC_ENABLE_ACL: true
 networks:
   default:
-    internal: true
