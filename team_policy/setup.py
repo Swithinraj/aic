@@ -29,12 +29,7 @@ setup(
     entry_points={
         "console_scripts": [
             "rviz_click_to_move = team_policy.planner.rviz_click_to_move:main",
-            "test_stereo_center_depth = team_policy.Depth.test_depth_publisher:main",
-            "test_depth_axis_estimator = team_policy.planner.depth_angle_estimator:main",
-            "test_yolov12_perception = team_policy.perception.yolov12_detector:main",
-            "test_pose_estimator = team_policy.perception.pose_estimator:main",
-            "combined_yolo_depth_pose_planner = team_policy.planner.combined_yolo_depth_pose_planner:main",
-            "collect_training_data = team_policy.training_robot.cheatcode_collector:main",
+            "yolo_v26_obb_detector = team_policy.perception.yolo_v26_obb_detector:main",
         ],
     },
 )

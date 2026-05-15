@@ -19,7 +19,7 @@ class ThreeCameraDatasetCollector(Node):
     def __init__(self):
         super().__init__("three_camera_dataset_collector")
 
-        self.dataset_dir = Path("/home/swithin/official_aic/aic/team_policy/team_policy/Data_Collection/dataset")
+        self.dataset_dir = Path("/home/ibrahim/ros2_ws/src/aic/team_policy/team_policy/Data_Collection/dataset")
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
 
         self.lock = threading.Lock()

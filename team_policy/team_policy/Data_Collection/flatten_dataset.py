@@ -7,12 +7,19 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("source_dataset_dir", help="Folder containing timestamp subfolders")
-    parser.add_argument("output_dir", help="Folder where flattened images will be saved")
+    parser.add_argument("source_dataset_dir_pos", nargs="?", help="Folder containing timestamp subfolders")
+    parser.add_argument("output_dir_pos", nargs="?", help="Folder where flattened images will be saved")
+    parser.add_argument("--source_dataset_dir", dest="source_dataset_dir_flag", help="Folder containing timestamp subfolders")
+    parser.add_argument("--output_dir", dest="output_dir_flag", help="Folder where flattened images will be saved")
     args = parser.parse_args()
 
-    source_dir = Path(args.source_dataset_dir).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    source_dataset_dir = args.source_dataset_dir_flag or args.source_dataset_dir_pos
+    output_dir_arg = args.output_dir_flag or args.output_dir_pos
+    if source_dataset_dir is None or output_dir_arg is None:
+        parser.error("source_dataset_dir and output_dir are required")
+
+    source_dir = Path(source_dataset_dir).expanduser().resolve()
+    output_dir = Path(output_dir_arg).expanduser().resolve()
 
     if not source_dir.exists():
         print(f"Source folder does not exist: {source_dir}")

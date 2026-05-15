@@ -1,1 +1,1 @@
-from .yolov12_detector import YoloV12MultiCameraDetector
+from .yolo_v26_obb_detector import YoloV12MultiCameraDetector
