@@ -2,11 +2,10 @@ name: aic
 services:
   eval:
     image: ghcr.io/intrinsic-dev/aic/aic_eval
-    # image: my-eval:v1
     build:
       dockerfile: docker/aic_eval/Dockerfile
       context: ..
-    command: gazebo_gui:=false launch_rviz:=false ground_truth:=false start_aic_engine:=true shutdown_on_aic_engine_exit:=true model_discovery_timeout_seconds:=600
+    command: gazebo_gui:=false launch_rviz:=false ground_truth:=false start_aic_engine:=true shutdown_on_aic_engine_exit:=true
     gpus: all
     networks:
       - default
@@ -15,9 +14,9 @@ services:
       AIC_MODEL_PASSWD: CHANGE_IN_PROD
       # AIC_ENABLE_ACL: true
   model:
-    image: my-solution:v1
+    image: izus_model:v3
     build:
-      dockerfile: docker/team_policy/Dockerfile
+      dockerfile: docker/izus_model/Dockerfile
       context: ..
     gpus: all
     networks:
@@ -30,4 +29,3 @@ services:
       # AIC_ENABLE_ACL: true
 networks:
   default:
-    internal: true
