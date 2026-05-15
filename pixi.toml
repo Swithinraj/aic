@@ -7,9 +7,6 @@ version = "0.1.0"
 conda-pypi-map = { "robostack-kilted" = "robostack_mapping.json" }
 preview = ["pixi-build"]
 
-[system-requirements]
-cuda = "12.1"
-
 [target.linux-64.dependencies]
 evdev = ">=1.9.2,<2"
 
@@ -38,8 +35,6 @@ ros-kilted-std-srvs = "*"
 ros-kilted-tf2-ros-py = "*"
 setuptools = ">=71.0.0,<81.0.0"                                                        # required by lerobot==0.4.3
 ros-kilted-izus-policy = { path = "izus_policy" }
-urdf-parser-py = ">=0.0.4,<0.0.5"
-pinocchio = ">=3.9.0,<4"
 
 [pypi-dependencies]
 huggingface-hub = { version = "~=1.7" }
@@ -49,15 +44,9 @@ lerobot_teleoperator_devices = { git = "https://github.com/koonpeng/lerobot-ros"
 mujoco = "==3.5.0"
 pynput = ">=1.7.6,<2"
 pyspacemouse = ">=2.0.0, <3"
-transformers = ">=4.49"
-pillow = ">=10.0"
 safetensors = ">=0.4"
-trimesh = ">=4.0"
 ultralytics = ">=8.2"
-pyrender = ">=0.1.45"
-pyglet = "<2"
 PyOpenGL = ">=3.1"
-transforms3d = ">=0.4"
 scipy = ">=1.10"
 
 [activation]

@@ -314,7 +314,7 @@ def build_frame_from_z_and_x_hint(
 ) -> Optional[np.ndarray]:
     """Build a right-handed ROS quaternion from a primary Z axis and a lateral X hint.
 
-    Shared convention for SFP port and SFP module so CheatCode quaternion matching works:
+    Shared convention for SFP port and SFP module so reference-policy quaternion matching works:
       Z / blue  = insertion / approaching axis  (kept as given, normalized)
       X / red   = lateral axis  (x_hint projected onto the plane ⊥ Z, normalized)
       Y / green = cross(Z, X)   →  det(R) = +1  (valid ROS rotation)
@@ -402,7 +402,7 @@ def compute_sfp_port_orientation_from_pair(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build SFP port frame from the two triangulated port positions.
 
-    Convention (right-handed, shared with SFP module for CheatCode quaternion matching):
+    Convention (right-handed, shared with SFP module for reference-policy quaternion matching):
       Z / blue  = downward base_link direction, orthogonalized against X (insertion axis)
       X / red   = direction from sfp_port_0 to sfp_port_1 (lateral, used as x_hint)
       Y / green = cross(Z, X)  →  det(R) = +1  (valid ROS rotation)
@@ -511,7 +511,7 @@ def compute_sc_port_orientation_from_axis(
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """Build SC port frame from the detected OBB mouth axis projected into base_link.
 
-    Convention (right-handed, matching SFP port for CheatCode quaternion compatibility):
+    Convention (right-handed, matching SFP port for reference-policy quaternion compatibility):
       Z / blue  = base_link downward [0, 0, -1], orthogonalized against X
       X / red   = SC port mouth direction (left -> right) projected into base_link
       Y / green = cross(Z, X)  ->  det(R) = +1
@@ -570,7 +570,7 @@ def compute_sc_plug_orientation_matching_sc_port(
       X / red   = SC port X axis projected perpendicular to Z  (gripper local X fallback)
       Y / green = cross(Z, X),  then X = cross(Y, Z)  right-handed
 
-    Compatible with SC port convention so CheatCode quaternion matching works.
+    Compatible with SC port convention so reference-policy quaternion matching works.
     """
     g = np.asarray(gripper_pos, dtype=np.float64).reshape(3)
     p = np.asarray(plug_pos, dtype=np.float64).reshape(3)
@@ -1483,7 +1483,11 @@ class YoloV12MultiCameraDetector(Node):
             YOLO = None
         self.bridge = CvBridge()
         self.lock = threading.Lock()
-        self.model_path = str(Path(__file__).resolve().parents[1] / "models" / "yolo_v26_obb.pt")
+        model_dir = Path(__file__).resolve().parents[1] / "models"
+        preferred_model_path = model_dir / "yolov12_obb.pt"
+        legacy_model_path = model_dir / "yolo_v26_obb.pt"
+        selected_model_path = preferred_model_path if preferred_model_path.is_file() else legacy_model_path
+        self.model_path = str(selected_model_path)
         self.device = self.resolve_device("auto")
         for name, value in PARAMS.items():
             setattr(self, name, value)
@@ -1558,7 +1562,9 @@ class YoloV12MultiCameraDetector(Node):
         self._sc_orient_consensus_last_update: float = 0.0
 
         if not os.path.isfile(self.model_path):
-            raise FileNotFoundError(f"YOLO model not found: {self.model_path}")
+            raise FileNotFoundError(
+                f"YOLO model not found: tried '{preferred_model_path}' and '{legacy_model_path}'"
+            )
         if YOLO is None:
             raise ImportError("ultralytics.YOLO could not be imported at runtime")
         self.model = YOLO(self.model_path)
@@ -2290,8 +2296,8 @@ class YoloV12MultiCameraDetector(Node):
         elif family in {"sfp_port", "sc_port"}:
             keys = ("mouth_center_uv", "center_uv")
         elif family == "sc_plug":
-            # SC plug TF position should come from the front/tip mating anchor so that
-            # CheatCode receives the plug's functional geometry, not the plastic body center.
+            # SC plug TF position should come from the front/tip mating anchor so the
+            # reference policy receives the plug's functional geometry, not body center.
             keys = ("tip_uv", "front_center_uv", "center_uv")
         else:
             keys = ("tip_uv", "front_center_uv", "center_uv")
@@ -3022,24 +3028,12 @@ class YoloV12MultiCameraDetector(Node):
                             orientation_note = "z_tcp_to_plug_green_axis_negative_gripper_tcp_y_no_other_axis_setup_change"
                             self._object_orientations[child] = quat.copy()
                             now_mono = self.ros_time()
-                            if now_mono - self._sfp_module_gripper_orient_last_log_time >= 1.0:
+                            if now_mono - self._sfp_module_gripper_orient_last_log_time >= 5.0:
                                 self._sfp_module_gripper_orient_last_log_time = now_mono
                                 self.get_logger().info(
-                                    f"YOLO_SFP_MODULE_AXES "
-                                    f"source={x_hint_source} "
-                                    f"z_tcp_to_plug=({Rm[0,2]:+.4f},{Rm[1,2]:+.4f},{Rm[2,2]:+.4f}) "
-                                    f"x=({Rm[0,0]:+.4f},{Rm[1,0]:+.4f},{Rm[2,0]:+.4f}) "
-                                    f"y=({Rm[0,1]:+.4f},{Rm[1,1]:+.4f},{Rm[2,1]:+.4f}) "
-                                    f"det={det_m:+.6f} "
-                                    f"quat=({quat[0]:+.4f},{quat[1]:+.4f},{quat[2]:+.4f},{quat[3]:+.4f})"
-                                )
-                                self.get_logger().info(
-                                    f"YOLO_SFP_MODULE_ORIENT_MATCHING_GRIPPER_GREEN "
-                                    f"green_axis_negative_gripper_tcp_y=True no_hardcoded_axis_correction=True "
-                                    f"tcp=({gripper_pos[0]:+.4f},{gripper_pos[1]:+.4f},{gripper_pos[2]:+.4f}) "
-                                    f"plug=({point[0]:+.4f},{point[1]:+.4f},{point[2]:+.4f}) "
-                                    f"tcp_to_plug=({tcp_to_plug[0]:+.4f},{tcp_to_plug[1]:+.4f},{tcp_to_plug[2]:+.4f}) "
-                                    f"norm={offset_norm:.4f}"
+                                    f"YOLO_SFP_MODULE_ORIENT source={x_hint_source} "
+                                    f"tcp_to_plug_norm={offset_norm:.4f} det={det_m:+.6f} "
+                                    f"q=({quat[0]:+.3f},{quat[1]:+.3f},{quat[2]:+.3f},{quat[3]:+.3f})"
                                 )
                     else:
                         self.log_module_tri(
@@ -3057,7 +3051,6 @@ class YoloV12MultiCameraDetector(Node):
                 # All observations vote on the 180-deg local-Z flip; the final X/red axis
                 # is built from a sign-aligned, weight-averaged combination across cameras.
                 # Convention: Z/blue=[0,0,-1], X/red=mouth axis, Y/green=Z×X (right-handed).
-                prev_x_axis = self._sc_port_x_axis.copy() if self._sc_port_x_axis is not None else None
                 q_sc_port, sc_port_x, dbg = self.compute_sc_port_orientation_consensus(
                     observations, point, outputs
                 )
@@ -3073,46 +3066,25 @@ class YoloV12MultiCameraDetector(Node):
                     pose_source = "position_weighted_least_squares_orientation_sc_port_multi_cam_consensus"
                     orientation_note = "z_downward_x_sc_port_weighted_avg_multi_cam_hsv_tb_consensus"
                     now_mono = self.ros_time()
-                    if now_mono - self._sc_port_orient_last_log_time >= 1.0:
+                    if now_mono - self._sc_port_orient_last_log_time >= 5.0:
                         self._sc_port_orient_last_log_time = now_mono
                         Rp = quat_to_matrix(quat)
                         det_p = float(np.linalg.det(Rp))
                         per_cam_dbg = dbg.get("per_cam", [])
                         used_cams = [c["cam"] for c in per_cam_dbg]
                         num_cams = dbg.get("num_cams", 0)
-                        x_avg = dbg.get("x_avg", sc_port_x)
-                        prev_x_str = (
-                            f"({prev_x_axis[0]:+.4f},{prev_x_axis[1]:+.4f},{prev_x_axis[2]:+.4f})"
-                            if prev_x_axis is not None else "none"
-                        )
                         self.get_logger().info(
-                            f"YOLO_SC_PORT_AXES "
-                            f"orientation_source=sc_multi_camera_hsv_taskboard_consensus "
+                            f"YOLO_SC_PORT_ORIENT "
                             f"num_orientation_cams={num_cams} "
                             f"locked_flip={stable_flip} "
-                            f"used_cameras={used_cams} "
-                            f"axis_source=weighted_average_all_cameras "
-                            f"x=({Rp[0,0]:+.4f},{Rp[1,0]:+.4f},{Rp[2,0]:+.4f}) "
-                            f"y=({Rp[0,1]:+.4f},{Rp[1,1]:+.4f},{Rp[2,1]:+.4f}) "
-                            f"z=({Rp[0,2]:+.4f},{Rp[1,2]:+.4f},{Rp[2,2]:+.4f}) "
                             f"det={det_p:+.6f} "
-                            f"quat=({quat[0]:+.4f},{quat[1]:+.4f},{quat[2]:+.4f},{quat[3]:+.4f})"
-                        )
-                        self.get_logger().info(
-                            f"YOLO_SC_ORIENT_CONSENSUS "
                             f"cameras={used_cams} "
                             f"hsv_votes_flip={dbg.get('hsv_votes_flip', 0)} "
                             f"hsv_votes_no_flip={dbg.get('hsv_votes_no_flip', 0)} "
                             f"tb_votes_flip={dbg.get('tb_votes_flip', 0)} "
                             f"tb_votes_no_flip={dbg.get('tb_votes_no_flip', 0)} "
-                            f"final_vote_flip_weight={dbg.get('flip_weight', 0.0):.3f} "
-                            f"final_vote_no_flip_weight={dbg.get('no_flip_weight', 0.0):.3f} "
-                            f"candidate_flip={dbg.get('preferred_flip', False)} "
-                            f"locked_flip={stable_flip} "
-                            f"previous_x_axis={prev_x_str} "
-                            f"averaged_x_axis=({x_avg[0]:+.4f},{x_avg[1]:+.4f},{x_avg[2]:+.4f}) "
-                            f"quat=({quat[0]:+.4f},{quat[1]:+.4f},{quat[2]:+.4f},{quat[3]:+.4f}) "
-                            f"source={'multi_camera_consensus' if dbg.get('voting_cams', 0) >= 1 else 'previous_hold'}"
+                            f"flip_w={dbg.get('flip_weight', 0.0):.3f} no_flip_w={dbg.get('no_flip_weight', 0.0):.3f} "
+                            f"q=({quat[0]:+.3f},{quat[1]:+.3f},{quat[2]:+.3f},{quat[3]:+.3f})"
                         )
 
             if key == ("sc_plug", "sc_plug"):
@@ -3181,7 +3153,7 @@ class YoloV12MultiCameraDetector(Node):
                         pose_source = "position_weighted_least_squares_orientation_y_neg_gripper_x_primary"
                         orientation_note = "y_exact_neg_gripper_x_x_cross_y_z_z_cross_x_y_rhs"
                         now_mono = self.ros_time()
-                        if now_mono - self._sc_plug_orient_last_log_time >= 1.0:
+                        if now_mono - self._sc_plug_orient_last_log_time >= 5.0:
                             self._sc_plug_orient_last_log_time = now_mono
                             Rm = quat_to_matrix(quat)
                             det_m = float(np.linalg.det(Rm))
@@ -3190,19 +3162,11 @@ class YoloV12MultiCameraDetector(Node):
                                 if self._sc_port_quat is not None else float("nan")
                             )
                             self.get_logger().info(
-                                f"YOLO_SC_PLUG_AXES "
-                                f"z_src=rpy_prior_secondary y_src=neg_gripper_x_exact "
-                                f"x=({Rm[0,0]:+.4f},{Rm[1,0]:+.4f},{Rm[2,0]:+.4f}) "
-                                f"y=({Rm[0,1]:+.4f},{Rm[1,1]:+.4f},{Rm[2,1]:+.4f}) "
-                                f"z=({Rm[0,2]:+.4f},{Rm[1,2]:+.4f},{Rm[2,2]:+.4f}) "
+                                f"YOLO_SC_PLUG_ORIENT "
                                 f"det={det_m:+.6f} "
-                                f"quat=({quat[0]:+.4f},{quat[1]:+.4f},{quat[2]:+.4f},{quat[3]:+.4f})"
-                            )
-                            self.get_logger().info(
-                                f"YOLO_SC_FRAME_CHECK "
                                 f"q_delta_port_plug_deg={q_delta_deg:.2f} "
                                 f"tcp_to_plug_norm={offset_norm:.4f} "
-                                f"z_prior=({z_from_prior[0]:+.4f},{z_from_prior[1]:+.4f},{z_from_prior[2]:+.4f})"
+                                f"q=({quat[0]:+.3f},{quat[1]:+.3f},{quat[2]:+.3f},{quat[3]:+.3f})"
                             )
                 except TransformException as exc:
                     now_mono = self.ros_time()
@@ -3307,19 +3271,9 @@ class YoloV12MultiCameraDetector(Node):
                 if _now_mono - self._sfp_orient_last_log_time >= 5.0:
                     self._sfp_orient_last_log_time = _now_mono
                     self.get_logger().info(
-                        f"YOLO_SFP_PORT_AXES "
-                        f"x=({_Rp[0,0]:+.4f},{_Rp[1,0]:+.4f},{_Rp[2,0]:+.4f}) "
-                        f"y=({_Rp[0,1]:+.4f},{_Rp[1,1]:+.4f},{_Rp[2,1]:+.4f}) "
-                        f"z=({_Rp[0,2]:+.4f},{_Rp[1,2]:+.4f},{_Rp[2,2]:+.4f}) "
+                        f"YOLO_SFP_PORT_ORIENT "
                         f"det={_det_p:+.6f} "
-                        f"quat=({_q_sfp[0]:+.4f},{_q_sfp[1]:+.4f},{_q_sfp[2]:+.4f},{_q_sfp[3]:+.4f}) "
-                        f"pair_axis=({_pair_axis[0]:+.4f},{_pair_axis[1]:+.4f},{_pair_axis[2]:+.4f}) "
-                        f"sep={_sep:.4f}m"
-                    )
-                    self.get_logger().info(
-                        f"YOLO_SFP_PORT_PAIR_STABLE "
-                        f"sfp0=({_sfp0_pos[0]:+.4f},{_sfp0_pos[1]:+.4f},{_sfp0_pos[2]:+.4f}) "
-                        f"sfp1=({_sfp1_pos[0]:+.4f},{_sfp1_pos[1]:+.4f},{_sfp1_pos[2]:+.4f}) "
+                        f"pair_axis=({_pair_axis[0]:+.3f},{_pair_axis[1]:+.3f},{_pair_axis[2]:+.3f}) "
                         f"sep={_sep:.4f}m"
                     )
 
@@ -3379,13 +3333,6 @@ class YoloV12MultiCameraDetector(Node):
                 tf_msg.transform.rotation.y = float(stored_q[1])
                 tf_msg.transform.rotation.z = float(stored_q[2])
                 tf_msg.transform.rotation.w = float(stored_q[3])
-                if self.ros_time() - self._sfp_orient_last_log_time < 0.1:
-                    # Log once per orientation update (throttled by pair computation above)
-                    self.get_logger().info(
-                        f"YOLO_SFP_PORT_TF child={child_id} "
-                        f"pos=({pose.position.x:+.4f},{pose.position.y:+.4f},{pose.position.z:+.4f}) "
-                        f"quat=({stored_q[0]:+.4f},{stored_q[1]:+.4f},{stored_q[2]:+.4f},{stored_q[3]:+.4f})"
-                    )
             else:
                 tf_msg.transform.rotation = pose.orientation
             transforms.append(tf_msg)
@@ -3433,13 +3380,6 @@ class YoloV12MultiCameraDetector(Node):
             transforms.append(alias)
 
             if now_mono - self._gripper_tf_last_log_time >= GRIPPER_TF_LOG_PERIOD_S:
-                t = alias.transform.translation
-                q = alias.transform.rotation
-                self.get_logger().info(
-                    f"YOLO_GRIPPER_TF_ALIAS source={source_frame} child={alias.child_frame_id} "
-                    f"pos=({t.x:+.4f},{t.y:+.4f},{t.z:+.4f}) "
-                    f"quat=({q.x:+.4f},{q.y:+.4f},{q.z:+.4f},{q.w:+.4f})"
-                )
                 self._gripper_tf_last_log_time = now_mono
         return transforms
 
