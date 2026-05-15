@@ -24,7 +24,10 @@ COPY izus_policy /ws_aic/src/aic/izus_policy
 # 4. Restore the original pixi.toml and install only the local code
 COPY pixi.toml /ws_aic/src/aic/
 RUN --mount=type=cache,target=/root/.cache/rattler/cache \
-  cd /ws_aic/src/aic && pixi install
+    cd /ws_aic/src/aic && pixi install \
+ && rm -rf /ws_aic/src/aic/.pixi/bld /ws_aic/src/aic/.pixi/artifacts-v0 \
+ && find /ws_aic/src/aic/.pixi/envs -type d \( -name __pycache__ -o -name tests -o -name test \) -prune -exec rm -rf {} + \
+ && find /ws_aic/src/aic/.pixi/envs -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
 WORKDIR /ws_aic/src/aic
 COPY --chmod=755 <<"EOF" /entrypoint.sh

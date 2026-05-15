@@ -1,1 +1,15 @@
 .pixi
+.git
+.github
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.egg-info
+**/.ipynb_checkpoints
+**/.DS_Store
+docs
+*.log
+**/files.txt

@@ -14,7 +14,7 @@ services:
       AIC_MODEL_PASSWD: CHANGE_IN_PROD
       # AIC_ENABLE_ACL: true
   model:
-    image: izus_model:v1
+    image: izus_model:v2
     build:
       dockerfile: docker/izus_model/Dockerfile
       context: ..

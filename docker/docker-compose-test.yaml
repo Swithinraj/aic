@@ -20,10 +20,10 @@ services:
       __GLX_VENDOR_LIBRARY_NAME: nvidia
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      - ${XDG_RUNTIME_DIR:-/run/user/1000}/${WAYLAND_DISPLAY:-wayland-1}:${XDG_RUNTIME_DIR:-/run/user/1000}/${WAYLAND_DISPLAY:-wayland-1}:rw
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/${WAYLAND_DISPLAY:-wayland-0}:${XDG_RUNTIME_DIR:-/run/user/1000}/${WAYLAND_DISPLAY:-wayland-0}:rw
     ipc: host
   model:
-    image: izus_model:v1
+    image: izus_model:v2
     build:
       dockerfile: docker/izus_model/Dockerfile
       context: ..
