@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,9 +30,6 @@ CAMERAS = ("left", "center", "right")
 BASE_FRAME = "base_link"
 CAMERA_OPTICAL_FRAMES = {cam: f"{cam}_camera/optical" for cam in CAMERAS}
 
-# Optional TF aliases republished by this detector for policy-side debugging/control.
-# We do NOT rebroadcast the original child frame (for example, gripper/tcp) to avoid
-# TF authority conflicts. Instead, we publish stable aliases under yolo_tri/gripper/*.
 GRIPPER_TF_SOURCE_FRAMES = ("gripper/tcp",)
 GRIPPER_TF_ALIAS_PREFIX = "yolo_tri/gripper"
 GRIPPER_TF_LOG_PERIOD_S = 2.0
@@ -168,10 +164,7 @@ def rpy_to_quat_xyzw(roll: float, pitch: float, yaw: float) -> np.ndarray:
 
 
 def quat_slerp_xyzw(q_old: np.ndarray, q_new: np.ndarray, alpha: float) -> np.ndarray:
-    """Normalized-lerp toward q_new with sign correction for shortest-path interpolation.
-
-    alpha=0 returns q_old unchanged; alpha=1 returns q_new unchanged.
-    """
+    """Interpolate toward q_new with sign correction."""
     q_o = quat_normalize(q_old)
     q_n = quat_normalize(q_new)
     if float(np.dot(q_o, q_n)) < 0.0:
@@ -198,12 +191,7 @@ def quat_to_rpy_xyzw(q: np.ndarray) -> Tuple[float, float, float]:
 
 
 def quat_yaw_align_blue_axis_to_vector_xyzw(q: np.ndarray, target_vector_base: np.ndarray) -> np.ndarray:
-    """Rotate the frame about base-link Z so the blue/Z axis yaw points toward target_vector_base.
-
-    This is intentionally a yaw-only correction for SC plug. It preserves the existing
-    3D tilt as much as possible and does not force the blue axis to exactly equal the
-    full 3D gripper→plug vector.
-    """
+    """Yaw-align the frame's Z axis toward a base-link target vector."""
     q = quat_normalize(q)
     target = np.asarray(target_vector_base, dtype=np.float64).reshape(3)
     target_xy = target[:2].copy()
@@ -226,14 +214,7 @@ def quat_local_blue_twist_make_green_perpendicular_xyzw(
     q_sc_plug: np.ndarray,
     q_gripper_tcp: np.ndarray,
 ) -> Tuple[np.ndarray, float, float, float]:
-    """Rotate only around the SC plug's own local blue/Z axis.
-
-    The SC plug blue/Z direction is preserved.  The twist angle is selected so the
-    resulting SC plug green/Y axis is perpendicular to the gripper TCP green/Y axis,
-    both expressed in base_link coordinates.
-
-    Returns (new_quat_xyzw, twist_rad, green_dot_before, green_dot_after).
-    """
+    """Twist around the SC plug local Z axis and return alignment diagnostics."""
     q_sc = quat_normalize(q_sc_plug)
     q_tcp = quat_normalize(q_gripper_tcp)
     R_sc = quat_to_matrix(q_sc)
@@ -249,13 +230,8 @@ def quat_local_blue_twist_make_green_perpendicular_xyzw(
     if not np.all(np.isfinite([a, b])) or float(np.hypot(a, b)) < 1e-9:
         return q_sc, 0.0, before_dot, before_dot
 
-    # Local Z twist means q_new = q_sc * Rz(theta). Therefore:
-    #   y_new = -sin(theta) * x_old + cos(theta) * y_old
-    # Want dot(y_new, tcp_y) = 0 -> a*cos(theta) - b*sin(theta) = 0.
     theta = float(np.arctan2(a, b))
 
-    # theta + pi is the other valid perpendicular solution. Pick the smaller
-    # absolute local twist to avoid unnecessary frame spin.
     theta = float(np.arctan2(np.sin(theta), np.cos(theta)))
     theta_alt = float(np.arctan2(np.sin(theta + np.pi), np.cos(theta + np.pi)))
     if abs(theta_alt) < abs(theta):
@@ -298,7 +274,7 @@ def ensure_right_handed_axes(
     y_axis: np.ndarray,
     z_axis: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Normalize three axes and flip Y if det([x,y,z]) < 0 to ensure a proper rotation matrix."""
+    """Normalize axes and enforce a proper rotation matrix."""
     x = np.asarray(x_axis, dtype=np.float64).reshape(3)
     y = np.asarray(y_axis, dtype=np.float64).reshape(3)
     z = np.asarray(z_axis, dtype=np.float64).reshape(3)
@@ -315,17 +291,7 @@ def build_frame_from_z_and_x_hint(
     x_hint: np.ndarray,
     fallbacks: Optional[List[np.ndarray]] = None,
 ) -> Optional[np.ndarray]:
-    """Build a right-handed ROS quaternion from a primary Z axis and a lateral X hint.
-
-    Shared convention for SFP port and SFP module so CheatCode quaternion matching works:
-      Z / blue  = insertion / approaching axis  (kept as given, normalized)
-      X / red   = lateral axis  (x_hint projected onto the plane ⊥ Z, normalized)
-      Y / green = cross(Z, X)   →  det(R) = +1  (valid ROS rotation)
-    Re-orthogonalize X = cross(Y, Z) to remove numerical drift.
-
-    If x_hint is degenerate against Z, each fallback is tried in order.
-    Returns normalized xyzw quaternion, or None if all hints are degenerate.
-    """
+    """Build a right-handed xyzw quaternion from a Z axis and X hint."""
     z = np.asarray(z_axis, dtype=np.float64).reshape(3)
     z_n = float(np.linalg.norm(z))
     if not np.isfinite(z_n) or z_n < 1e-9:
@@ -361,14 +327,7 @@ def build_frame_from_z_and_y_hint(
     y_hint: np.ndarray,
     fallbacks: Optional[List[np.ndarray]] = None,
 ) -> Optional[np.ndarray]:
-    """Build a right-handed ROS quaternion from primary Z and desired Y/green hint.
-
-    This is used only for the SFP module orientation.  It preserves the existing
-    module convention that Z / blue is the TCP→plug direction, but it chooses
-    the Y / green axis from the gripper TCP green axis.  The hint is projected
-    onto the plane perpendicular to Z, then X is recomputed as Y × Z so that
-    [X Y Z] is a valid right-handed rotation matrix.
-    """
+    """Build a right-handed xyzw quaternion from a Z axis and Y hint."""
     z = np.asarray(z_axis, dtype=np.float64).reshape(3)
     z_n = float(np.linalg.norm(z))
     if not np.isfinite(z_n) or z_n < 1e-9:
@@ -403,18 +362,7 @@ def compute_sfp_port_orientation_from_pair(
     sfp0_pos: np.ndarray,
     sfp1_pos: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Build SFP port frame from the two triangulated port positions.
-
-    Convention (right-handed, shared with SFP module for CheatCode quaternion matching):
-      Z / blue  = downward base_link direction, orthogonalized against X (insertion axis)
-      X / red   = direction from sfp_port_0 to sfp_port_1 (lateral, used as x_hint)
-      Y / green = cross(Z, X)  →  det(R) = +1  (valid ROS rotation)
-
-    Returns (quat_xyzw, x_axis_normalized).
-    x_axis is the normalized sfp0→sfp1 vector, returned so the module orientation builder
-    can reuse it as its x_hint to guarantee both frames share the same lateral reference.
-    Falls back to identity quat + base-X if the two positions coincide.
-    """
+    """Build the SFP port frame from the two triangulated port positions."""
     sfp0 = np.asarray(sfp0_pos, dtype=np.float64).reshape(3)
     sfp1 = np.asarray(sfp1_pos, dtype=np.float64).reshape(3)
     _id_x = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
@@ -425,18 +373,12 @@ def compute_sfp_port_orientation_from_pair(
         return np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64), _id_x
     x_hint = x_hint / x_norm
 
-    # Z = insertion/downward axis (primary); X = lateral (hint projected ⊥ Z)
     z_primary = np.asarray([0.0, 0.0, -1.0], dtype=np.float64)
     z_fallbacks: List[np.ndarray] = [np.asarray([0.0, -1.0, 0.0], dtype=np.float64)]
-    # build_frame_from_z_and_x_hint treats Z as primary and X as hint, so swap roles:
-    # we want X = sfp0→sfp1 preserved, Z = downward projected ⊥ X.
-    # Achieve this by calling with z=downward as primary and x_hint=sfp0→sfp1.
     quat = build_frame_from_z_and_x_hint(z_primary, x_hint, fallbacks=z_fallbacks)
     if quat is None:
         return np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64), x_hint
 
-    # Extract the actual X column from the built matrix so the caller gets the
-    # re-orthogonalized lateral axis (very close to the original sfp0→sfp1 unit vector).
     R = quat_to_matrix(quat)
     x_axis_out = R[:, 0].copy()
     return quat, x_axis_out
@@ -471,20 +413,7 @@ def compute_sfp_module_orientation_matching_port(
     plug_pos: np.ndarray,
     port_x_axis: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
-    """Build SFP module/plug frame while matching the gripper TCP green axis.
-
-    Only the SFP module orientation is changed.  The position source, TF setup,
-    port orientation, triangulation, tracking, and existing axis convention are
-    left intact.
-
-    Convention:
-      Z / blue  = normalized vector from gripper/TCP to triangulated plug position.
-      Y / green = -gripper TCP local Y axis, projected perpendicular to Z.
-      X / red   = recomputed as Y × Z to keep [X Y Z] right-handed.
-
-    The negative gripper-Y is intentional because the observed module green axis
-    must follow the opposite TCP green direction in this setup.
-    """
+    """Build the SFP module frame from TCP-to-plug geometry."""
     del port_x_axis  # kept in the signature to avoid changing call sites/API
     g = np.asarray(gripper_pos, dtype=np.float64).reshape(3)
     p = np.asarray(plug_pos, dtype=np.float64).reshape(3)
@@ -512,15 +441,7 @@ def compute_sc_port_orientation_from_axis(
     k: np.ndarray,
     base_R_camera: np.ndarray,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Build SC port frame from the detected OBB mouth axis projected into base_link.
-
-    Convention (right-handed, matching SFP port for CheatCode quaternion compatibility):
-      Z / blue  = base_link downward [0, 0, -1], orthogonalized against X
-      X / red   = SC port mouth direction (left -> right) projected into base_link
-      Y / green = cross(Z, X)  ->  det(R) = +1
-
-    Returns (quat_xyzw, x_axis_normalized) or None if the axis is degenerate.
-    """
+    """Build the SC port frame from the detected OBB mouth axis."""
     left = np.asarray(axis_left_uv, dtype=np.float64).reshape(2)
     right = np.asarray(axis_right_uv, dtype=np.float64).reshape(2)
     axis_2d = right - left
@@ -532,16 +453,12 @@ def compute_sc_port_orientation_from_axis(
     if abs(fx) < 1e-9 or abs(fy) < 1e-9:
         return None
     dx, dy = axis_2d[0] / norm_2d, axis_2d[1] / norm_2d
-    # Map image-plane direction to camera-space direction (perpendicular to optical axis).
     axis_cam = np.asarray([dx / fx, dy / fy, 0.0], dtype=np.float64)
     axis_cam_n = float(np.linalg.norm(axis_cam))
     if axis_cam_n < 1e-12:
         return None
     axis_cam = axis_cam / axis_cam_n
 
-    # Negate the OBB axis so Y = cross(Z_down, -OBB) = cross(OBB, Z_down):
-    # this is the left-hand-rule Y with Z facing down, det(R) = +1 (valid ROS TF).
-    # Equivalent to the old post-hoc 180-deg yaw flip, but done directly here.
     x_hint = -(np.asarray(base_R_camera, dtype=np.float64).reshape(3, 3) @ axis_cam)
     z_primary = np.asarray([0.0, 0.0, -1.0], dtype=np.float64)
     quat = build_frame_from_z_and_x_hint(
@@ -562,19 +479,7 @@ def compute_sc_plug_orientation_matching_sc_port(
     sc_port_x_axis: Optional[np.ndarray] = None,
     z_axis_hint: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
-    """Build SC plug frame matching the SC port convention.
-
-    Convention (right-handed, same object-frame as SC port):
-      Z / blue  = z_axis_hint when provided — the plug's forward axis derived from the
-                  calibrated RPY grasp prior (qualification_phase.md: roll=0.4432,
-                  pitch=-0.4838, yaw=1.3303 applied to gripper orientation). This gives
-                  the physically correct insertion tilt (~28 deg pitch). Falls back to
-                  normalize(plug_pos - gripper_pos) if the hint is absent or degenerate.
-      X / red   = SC port X axis projected perpendicular to Z  (gripper local X fallback)
-      Y / green = cross(Z, X),  then X = cross(Y, Z)  right-handed
-
-    Compatible with SC port convention so CheatCode quaternion matching works.
-    """
+    """Build the SC plug frame from gripper, plug, and optional port axes."""
     g = np.asarray(gripper_pos, dtype=np.float64).reshape(3)
     p = np.asarray(plug_pos, dtype=np.float64).reshape(3)
 
@@ -611,11 +516,8 @@ def order_quad_points_tl_tr_br_bl(points_uv: np.ndarray) -> Optional[np.ndarray]
     center = np.mean(pts, axis=0)
     angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
     ordered = pts[np.argsort(angles)]
-    # np.argsort gives cyclic order. Rotate so first point is top-left.
     start = int(np.argmin(ordered[:, 0] + ordered[:, 1]))
     ordered = np.roll(ordered, -start, axis=0)
-    # Ensure clockwise TL,TR,BR,BL in image coordinates.
-    # If the second point is bottom-left rather than top-right, reverse the cycle.
     if ordered[1, 0] < ordered[3, 0]:
         ordered = np.asarray([ordered[0], ordered[3], ordered[2], ordered[1]], dtype=np.float64)
     return ordered.astype(np.float64)
@@ -635,11 +537,7 @@ def image_quad_from_sc_plug_detection(det: Dict) -> Optional[np.ndarray]:
 
 
 def sc_plug_object_points_tl_tr_br_bl(width_m: float, height_m: float) -> np.ndarray:
-    """Planar SC-plug front-face model points matching TL,TR,BR,BL image order.
-
-    The exact scale mainly affects estimated translation. Orientation is the intended
-    output here; final TF position still comes from multi-camera triangulation.
-    """
+    """Return planar SC-plug front-face model points in TL,TR,BR,BL order."""
     w = max(1e-6, float(width_m))
     h = max(1e-6, float(height_m))
     return np.asarray([
@@ -657,11 +555,7 @@ def solve_sc_plug_pnp_quat_base(
     width_m: float,
     height_m: float,
 ) -> Optional[Tuple[np.ndarray, float, str]]:
-    """Estimate SC-plug orientation from one camera using planar PnP.
-
-    Returns (quat_xyzw_in_base_link, reprojection_error_px, method_name), or None.
-    Position from PnP is intentionally ignored; triangulated position remains the TF origin.
-    """
+    """Estimate SC-plug orientation from one camera using planar PnP."""
     image_points = image_quad_from_sc_plug_detection(det)
     if image_points is None:
         return None
@@ -1007,7 +901,6 @@ class Track:
     kalman_x: Optional[np.ndarray] = None
     kalman_p: Optional[np.ndarray] = None
     kalman_q: float = 1.0
-    # Persistent smoothed SC port mouth-axis anchor (only used when family == "sc_port").
     stable_anchor_axis_uv: Optional[np.ndarray] = None
     stable_anchor_center_uv: Optional[np.ndarray] = None
     stable_anchor_length_px: float = 0.0
@@ -1166,8 +1059,6 @@ class Track:
             }
             return data
         if self.family == "sc_port":
-            # --- Stable SC port mouth-axis with two-edge averaging + EMA smoothing ---
-            # Step 1: extract raw axis from the two longest OBB edges.
             if corners is not None:
                 all_edges = []
                 for i in range(4):
@@ -1179,20 +1070,16 @@ class Track:
                 raw_length = 0.5 * (all_edges[0][0] + all_edges[1][0])
                 d0 = all_edges[0][1]
                 d1 = all_edges[1][1]
-                # Align d1 sign so both long edges point the same half-space.
                 if float(np.dot(d0, d1)) < 0.0:
                     d1 = -d1
                 raw_axis = d0 + d1
                 n = float(np.linalg.norm(raw_axis))
                 raw_axis = raw_axis / max(n, 1e-6)
             else:
-                # Fallback: use horizontal bbox axis.
                 raw_axis = np.asarray([1.0, 0.0], dtype=np.float64)
                 raw_length = float(self.size_wh[0])
-            # Step 2: sign consistency against stored stable axis.
             if self.stable_anchor_axis_uv is not None and float(np.dot(raw_axis, self.stable_anchor_axis_uv)) < 0.0:
                 raw_axis = -raw_axis
-            # Step 3: EMA smoothing (alpha = 0.15 toward new measurement).
             ema_alpha = 0.15
             if self.stable_anchor_axis_uv is not None:
                 blended = (1.0 - ema_alpha) * self.stable_anchor_axis_uv + ema_alpha * raw_axis
@@ -1204,11 +1091,9 @@ class Track:
                 smoothed_axis = raw_axis
                 smoothed_center = self.center_uv.copy()
                 smoothed_length = raw_length
-            # Step 4: persist smoothed values back onto the track.
             self.stable_anchor_axis_uv = smoothed_axis.copy()
             self.stable_anchor_center_uv = smoothed_center.copy()
             self.stable_anchor_length_px = float(smoothed_length)
-            # Step 5: derive left/right endpoints; guarantee left is the lower-x end.
             half = 0.5 * smoothed_length
             sc_left = smoothed_center - half * smoothed_axis
             sc_right = smoothed_center + half * smoothed_axis
@@ -1517,17 +1402,12 @@ class YoloV12MultiCameraDetector(Node):
         self._sfp_module_gripper_orient_last_log_time = 0.0
         self._sc_plug_pnp_last_log_time = 0.0
         self._sc_plug_prior_last_log_time = 0.0
-        # Latest SFP port axes stored when both ports are triangulated.
-        # Used as the preferred x_hint for module orientation so both frames
-        # share the same lateral reference (matching port convention).
         self._sfp_port_x_axis: Optional[np.ndarray] = None   # lateral  (red)
         self._sfp_port_z_axis: Optional[np.ndarray] = None   # insertion (blue)
         self._sfp_port_quat: Optional[np.ndarray] = None
-        # SC port axes — persisted across frames so SC plug can always reference them.
         self._sc_port_x_axis: Optional[np.ndarray] = None   # mouth/lateral axis (red)
         self._sc_port_quat: Optional[np.ndarray] = None
         self._sc_port_hsv_flip_applied: bool = False
-        # Locking state machine: prevents frame-to-frame flip stuttering.
         self._sc_port_hsv_flip_locked: Optional[bool] = None
         self._sc_port_hsv_flip_candidate: Optional[bool] = None
         self._sc_port_hsv_flip_candidate_start: Optional[float] = None
@@ -1535,16 +1415,12 @@ class YoloV12MultiCameraDetector(Node):
         self._sc_port_hsv_flip_required_s: float = 2.0
         self._sc_port_hsv_flip_margin_ratio: float = 1.75
         self._sc_port_hsv_flip_min_pixels: int = 20
-        # SC plug yaw candidate lock: prevents 180-deg flip stuttering.
         self._sc_plug_yaw_candidate_locked: Optional[str] = None
         self._sc_plug_yaw_candidate_pending: Optional[str] = None
         self._sc_plug_yaw_candidate_start: Optional[float] = None
         self._sc_plug_yaw_candidate_required_s: float = 1.0
         self._sc_port_orient_last_log_time = 0.0
         self._sc_plug_orient_last_log_time = 0.0
-        # Multi-camera SC port orientation consensus state machine.
-        # Separate from the per-camera HSV-only lock so both evidence sources
-        # (HSV + task-board) from all cameras are jointly considered.
         self._sc_orient_consensus_locked_flip: Optional[bool] = None
         self._sc_orient_consensus_candidate_flip: Optional[bool] = None
         self._sc_orient_consensus_candidate_start: Optional[float] = None
@@ -1693,8 +1569,11 @@ class YoloV12MultiCameraDetector(Node):
     def stamp_sec(self, stamp) -> float:
         return float(getattr(stamp, "sec", 0)) + 1e-9 * float(getattr(stamp, "nanosec", 0))
 
+    def ros_now_sec(self) -> float:
+        return float(self.get_clock().now().nanoseconds) * 1e-9
+
     def tick(self) -> None:
-        now = time.monotonic()
+        now = self.ros_now_sec()
         with self.lock:
             frames = dict(self.latest_frames)
             camera_ks = {cam: (None if self.camera_k[cam] is None else self.camera_k[cam].copy()) for cam in CAMERAS}
@@ -1709,10 +1588,6 @@ class YoloV12MultiCameraDetector(Node):
                 raw = self.infer(frame, msg, cam)
                 dets = [d for d in raw if d.family in FAMILY_ORDER]
                 public = self.trackers[cam].update(dets, frame, now)
-                # SC ports and SC plugs are intentionally published directly from raw YOLO output.
-                # This bypasses tracker confirmation, confidence gates, consensus hold,
-                # and feature-quality filtering only for SC detections. All other families
-                # keep the existing tracked/publishable path unchanged.
                 public = self.replace_sc_detections_with_raw(public, raw)
                 processed[cam] = {"msg": msg, "frame": frame, "detections": public, "raw": raw}
                 self.last_infer_time[cam] = now
@@ -1795,7 +1670,7 @@ class YoloV12MultiCameraDetector(Node):
         return out
 
     def det_center_xy(self, det: Dict) -> Tuple[float, float]:
-        center = det.get("center_uv")
+        center = det.get("cen_SETTLE_MAX_STEPSter_uv")
         if isinstance(center, list) and len(center) >= 2:
             return float(center[0]), float(center[1])
         bbox = det.get("bbox_xyxy", [0, 0, 0, 0])
@@ -1876,13 +1751,7 @@ class YoloV12MultiCameraDetector(Node):
         )
 
     def raw_sc_detection_to_dict(self, det: Detection, instance_name: str, source: str) -> Dict:
-        """Convert a raw YOLO SC-port Detection into the public JSON schema.
-
-        This is deliberately used only for sc_port so SC detections are published
-        exactly from the model output after only the global YOLO raw_conf/NMS stage.
-        No tracker confirmation, confidence threshold, Kalman/feature gate, or
-        publish confidence filtering is applied here.
-        """
+        """Convert a raw YOLO SC-port detection into the public JSON schema."""
         bbox = np.asarray(det.bbox_xyxy, dtype=np.float64).reshape(4)
         center = np.asarray(det.center_uv, dtype=np.float64).reshape(2)
         corners = None
@@ -1956,11 +1825,7 @@ class YoloV12MultiCameraDetector(Node):
         return data
 
     def raw_sc_plug_detection_to_dict(self, det: Detection, instance_name: str, source: str) -> Dict:
-        """Convert a raw YOLO SC-plug Detection into the public JSON schema.
-
-        This mirrors the existing raw SC-port publishing path, but keeps plug-specific
-        fields such as tip/front anchors. It is deliberately used only for sc_plug.
-        """
+        """Convert a raw YOLO SC-plug detection into the public JSON schema."""
         bbox = np.asarray(det.bbox_xyxy, dtype=np.float64).reshape(4)
         center = np.asarray(det.center_uv, dtype=np.float64).reshape(2)
         corners = None
@@ -2038,13 +1903,7 @@ class YoloV12MultiCameraDetector(Node):
         return data
 
     def replace_sc_detections_with_raw(self, public: List[Dict], raw: List[Detection]) -> List[Dict]:
-        """Merge SC detections into the public detection list.
-
-        SC port: keep up to two raw YOLO detections so pair numbering can label
-                 sc_port_0/sc_port_1 before triangulation.
-        SC plug: always use the highest-confidence raw YOLO detection (existing behaviour).
-        All other families pass through unchanged.
-        """
+        """Merge raw SC detections into the public detection list."""
         other = [d for d in public if not self.is_family(d, "sc_port") and not self.is_family(d, "sc_plug")]
         tracked_sc_ports = [d for d in public if self.is_family(d, "sc_port")]
 
@@ -2063,7 +1922,6 @@ class YoloV12MultiCameraDetector(Node):
                 key=lambda d: (-float(d.get("confidence", 0.0)), self.det_center_xy(d)[0], self.det_center_xy(d)[1]),
             )[: int(self.sc_max_ports)]
 
-        # SC plug: always raw (unchanged behaviour).
         raw_sc_plugs = sorted(
             [d for d in raw if d.family == "sc_plug"],
             key=lambda d: (-float(d.confidence), float(d.center_uv[0]), float(d.center_uv[1])),
@@ -2097,7 +1955,7 @@ class YoloV12MultiCameraDetector(Node):
 
     def normalize_sfp_consensus(self, outputs: Dict[str, Dict]) -> None:
         pairs: Dict[str, Tuple[Dict, Dict]] = {}
-        now = time.monotonic()
+        now = self.ros_now_sec()
 
         for cam, data in outputs.items():
             ports = [d for d in data.get("detections", []) if self.is_family(d, "sfp_port")]
@@ -2207,8 +2065,6 @@ class YoloV12MultiCameraDetector(Node):
                 self.sfp_last_log_labels[log_key] = new
 
     def normalize_sc_consensus(self, outputs: Dict[str, Dict]) -> None:
-        # SC naming only. With two ports, magenta proximity identifies SC_PORT_1.
-        # If no magenta evidence is visible, the port nearest the gripper TCP is SC_PORT_0.
         camera_ports = {}
         for cam, data in outputs.items():
             ports = [d for d in data.get("detections", []) if self.is_family(d, "sc_port")]
@@ -2218,7 +2074,7 @@ class YoloV12MultiCameraDetector(Node):
             )[: int(self.sc_max_ports)]
             if ports:
                 camera_ports[cam] = ports
-        now = time.monotonic()
+        now = self.ros_now_sec()
         if not camera_ports:
             if now - self.sc_consensus_last_time >= self.sc_consensus_hold_s:
                 self.sc_consensus_labels = []
@@ -2261,7 +2117,7 @@ class YoloV12MultiCameraDetector(Node):
 
 
     def log_module_tri(self, text: str, min_period_s: float = 1.0) -> None:
-        now = time.monotonic()
+        now = self.ros_now_sec()
         if now - self.module_tri_last_log_time >= min_period_s:
             self.module_tri_last_log_time = now
             self.get_logger().info(text)
@@ -2273,8 +2129,6 @@ class YoloV12MultiCameraDetector(Node):
         elif family in {"sfp_port", "sc_port"}:
             keys = ("mouth_center_uv", "center_uv")
         elif family == "sc_plug":
-            # SC plug TF position should come from the front/tip mating anchor so that
-            # CheatCode receives the plug's functional geometry, not the plastic body center.
             keys = ("tip_uv", "front_center_uv", "center_uv")
         else:
             keys = ("tip_uv", "front_center_uv", "center_uv")
@@ -2475,30 +2329,7 @@ class YoloV12MultiCameraDetector(Node):
         image_bgr: Optional[np.ndarray],
         det: Dict,
     ) -> Tuple[bool, bool, int, int]:
-        """Return (decision_available, should_flip, pink_plus_count, pink_minus_count).
-
-        Uses two complementary evidence sources:
-          1. Local endpoint sampling: count magenta pixels in small patches near each
-             OBB mouth axis endpoint.
-          2. Global magenta centroid: find the overall magenta centre-of-mass in the
-             image and compare its distance to each endpoint.
-
-        Axis mapping (important):
-          compute_sc_port_orientation_from_axis() computes
-            axis_2d = right_uv - left_uv   (left→right in image)
-            x_hint  = -(R @ axis_cam)       (negated → right→left direction)
-          Therefore 3D +x axis points toward left_uv, -x points toward right_uv.
-            pink_plus  probes near left_uv  (+x end)
-            pink_minus probes near right_uv (-x end)
-          should_flip=True means pink is on the right_uv/-x side → x must be negated.
-
-        decision_available=True only when:
-          max(pink_plus, pink_minus) >= _sc_port_hsv_flip_min_pixels
-          AND max/min ratio >= _sc_port_hsv_flip_margin_ratio
-
-        Returns (False, False, 0, 0) when image is absent, UV points are missing,
-        or evidence is too weak or ambiguous.
-        """
+        """Return HSV flip evidence for SC port orientation."""
         if image_bgr is None or not isinstance(image_bgr, np.ndarray) or image_bgr.size == 0:
             return False, False, 0, 0
 
@@ -2540,9 +2371,8 @@ class YoloV12MultiCameraDetector(Node):
                 return 0
             return int(np.count_nonzero(mask[y1:y2, x1:x2]))
 
-        # Method 1: local endpoint samples
-        pink_plus = _count(lx, ly)    # near left_uv → +x in 3D
-        pink_minus = _count(rx, ry)   # near right_uv → -x in 3D
+        pink_plus = _count(lx, ly)
+        pink_minus = _count(rx, ry)
 
         min_px = int(self._sc_port_hsv_flip_min_pixels)
         ratio_needed = float(self._sc_port_hsv_flip_margin_ratio)
@@ -2553,7 +2383,6 @@ class YoloV12MultiCameraDetector(Node):
         if local_strong:
             return True, pink_minus > pink_plus, pink_plus, pink_minus
 
-        # Method 2: global magenta centroid fallback
         nonzero_pts = cv2.findNonZero(mask)
         if nonzero_pts is not None and len(nonzero_pts) >= min_px:
             pts = nonzero_pts.reshape(-1, 2).astype(np.float64)
@@ -2561,11 +2390,9 @@ class YoloV12MultiCameraDetector(Node):
             cy_pink = float(np.mean(pts[:, 1]))
             dist_plus = float(np.hypot(cx_pink - lx, cy_pink - ly))
             dist_minus = float(np.hypot(cx_pink - rx, cy_pink - ry))
-            # Require a meaningful asymmetry relative to the axis length
             if abs(dist_plus - dist_minus) >= axis_len * 0.15:
                 total_px = int(len(pts))
                 centroid_on_minus_side = dist_minus < dist_plus
-                # Encode result as pseudo endpoint counts for logging
                 if centroid_on_minus_side:
                     return True, True, 0, total_px
                 else:
@@ -2579,14 +2406,7 @@ class YoloV12MultiCameraDetector(Node):
         outputs: Dict[str, Dict],
         cam: str,
     ) -> Optional[np.ndarray]:
-        """Return the normalized 2D image direction of the nearest task-board edge.
-
-        Finds the highest-confidence task_board detection in the given camera, extracts
-        its OBB corners (or falls back to bbox corners), and returns the direction of the
-        edge that is closest to the query detection centre.
-
-        Returns None if no task_board detection exists in this camera.
-        """
+        """Return the nearest task-board edge direction in image coordinates."""
         cam_data = outputs.get(cam)
         if cam_data is None:
             return None
@@ -2608,7 +2428,6 @@ class YoloV12MultiCameraDetector(Node):
                 return None
             corners = rect_corners_from_bbox(np.asarray(bbox[:4], dtype=np.float64))
 
-        # Query point: prefer mouth_center_uv / tip_uv / center_uv of the SC detection.
         qx, qy = self.det_center_xy(det)
         for key in ("mouth_center_uv", "tip_uv", "center_uv"):
             val = det.get(key)
@@ -2642,12 +2461,7 @@ class YoloV12MultiCameraDetector(Node):
         point_base: np.ndarray,
         eps_m: float = 0.02,
     ) -> Optional[np.ndarray]:
-        """Return the normalized 2D image direction of axis_base projected from point_base.
-
-        Transforms point_base and point_base + eps_m * axis into the camera optical frame,
-        projects both with the camera intrinsics, and returns the normalized 2D direction.
-        Returns None when the projection is invalid or the two image points coincide.
-        """
+        """Project a base-link axis into image coordinates."""
         axis = np.asarray(axis_base, dtype=np.float64).reshape(3)
         axis_n = float(np.linalg.norm(axis))
         if axis_n < 1e-12:
@@ -2690,13 +2504,7 @@ class YoloV12MultiCameraDetector(Node):
         point_base: np.ndarray,
         outputs: Dict[str, Dict],
     ) -> Optional[float]:
-        """Score a candidate: lower means green/Y is more opposite to the nearest task-board edge.
-
-        Projects the candidate's green/Y base_link axis into the image and computes
-        dot(green_image_dir, nearest_task_board_edge_dir).  A lower (more negative) value
-        means green is more opposite to the edge, which is the desired physical configuration.
-        Returns None when either the task-board or the projection is unavailable.
-        """
+        """Score green-axis consistency against the nearest task-board edge."""
         edge_dir = self._nearest_task_board_edge_direction_uv(obs["det"], outputs, obs["cam"])
         if edge_dir is None:
             return None
@@ -2799,7 +2607,7 @@ class YoloV12MultiCameraDetector(Node):
                 voting_cams += 1
 
         # --- Step 3: consensus decision with hysteresis ---
-        now_mono = time.monotonic()
+        now_mono = self.ros_now_sec()
         consensus_decided = False
         preferred_flip = False
         if voting_cams >= 1 and (flip_weight + no_flip_weight) > 1e-9:
@@ -3004,7 +2812,7 @@ class YoloV12MultiCameraDetector(Node):
                             pose_source = "position_weighted_least_squares_orientation_z_tcp_to_plug_y_negative_gripper_tcp"
                             orientation_note = "z_tcp_to_plug_green_axis_negative_gripper_tcp_y_no_other_axis_setup_change"
                             self._object_orientations[child] = quat.copy()
-                            now_mono = time.monotonic()
+                            now_mono = self.ros_now_sec()
                             if now_mono - self._sfp_module_gripper_orient_last_log_time >= 1.0:
                                 self._sfp_module_gripper_orient_last_log_time = now_mono
                                 self.get_logger().info(
@@ -3055,7 +2863,7 @@ class YoloV12MultiCameraDetector(Node):
                     pose_type = "triangulated_position_with_geometry_based_orientation"
                     pose_source = "position_weighted_least_squares_orientation_sc_port_multi_cam_consensus"
                     orientation_note = "z_downward_x_sc_port_weighted_avg_multi_cam_hsv_tb_consensus"
-                    now_mono = time.monotonic()
+                    now_mono = self.ros_now_sec()
                     if now_mono - self._sc_port_orient_last_log_time >= 1.0:
                         self._sc_port_orient_last_log_time = now_mono
                         Rp = quat_to_matrix(quat)
@@ -3163,7 +2971,7 @@ class YoloV12MultiCameraDetector(Node):
                         pose_type = "triangulated_position_with_geometry_based_orientation"
                         pose_source = "position_weighted_least_squares_orientation_y_neg_gripper_x_primary"
                         orientation_note = "y_exact_neg_gripper_x_x_cross_y_z_z_cross_x_y_rhs"
-                        now_mono = time.monotonic()
+                        now_mono = self.ros_now_sec()
                         if now_mono - self._sc_plug_orient_last_log_time >= 1.0:
                             self._sc_plug_orient_last_log_time = now_mono
                             Rm = quat_to_matrix(quat)
@@ -3188,7 +2996,7 @@ class YoloV12MultiCameraDetector(Node):
                                 f"z_prior=({z_from_prior[0]:+.4f},{z_from_prior[1]:+.4f},{z_from_prior[2]:+.4f})"
                             )
                 except TransformException as exc:
-                    now_mono = time.monotonic()
+                    now_mono = self.ros_now_sec()
                     if now_mono - self._sc_plug_orient_last_log_time >= 1.0:
                         self._sc_plug_orient_last_log_time = now_mono
                         self.get_logger().warn(
@@ -3286,7 +3094,7 @@ class YoloV12MultiCameraDetector(Node):
                 self._sfp_port_orientations[_sfp0_child] = _q_sfp.copy()
                 self._sfp_port_orientations[_sfp1_child] = _q_sfp.copy()
                 _det_p = float(np.linalg.det(_Rp))
-                _now_mono = time.monotonic()
+                _now_mono = self.ros_now_sec()
                 if _now_mono - self._sfp_orient_last_log_time >= 5.0:
                     self._sfp_orient_last_log_time = _now_mono
                     self.get_logger().info(
@@ -3362,7 +3170,7 @@ class YoloV12MultiCameraDetector(Node):
                 tf_msg.transform.rotation.y = float(stored_q[1])
                 tf_msg.transform.rotation.z = float(stored_q[2])
                 tf_msg.transform.rotation.w = float(stored_q[3])
-                if time.monotonic() - self._sfp_orient_last_log_time < 0.1:
+                if self.ros_now_sec() - self._sfp_orient_last_log_time < 0.1:
                     # Log once per orientation update (throttled by pair computation above)
                     self.get_logger().info(
                         f"YOLO_SFP_PORT_TF child={child_id} "
@@ -3395,7 +3203,7 @@ class YoloV12MultiCameraDetector(Node):
         yolo_tri/sfp_port/* and yolo_tri/sfp_module/*.
         """
         transforms: List[TransformStamped] = []
-        now_mono = time.monotonic()
+        now_mono = self.ros_now_sec()
         for source_frame in GRIPPER_TF_SOURCE_FRAMES:
             try:
                 tf_src = self.tf_buffer.lookup_transform(BASE_FRAME, source_frame, Time())

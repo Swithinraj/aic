@@ -14,32 +14,23 @@ from tf2_ros import TransformException
 from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
 
 
-# ---------------------------------------------------------------------------
-# Quaternion helpers — all in wxyz convention (transforms3d standard)
-# ---------------------------------------------------------------------------
-
 def _msg_to_wxyz(q_msg):
-    """geometry_msgs Quaternion (xyzw storage) -> (w, x, y, z) tuple."""
+    """Convert a geometry_msgs Quaternion to transforms3d wxyz order."""
     return (float(q_msg.w), float(q_msg.x), float(q_msg.y), float(q_msg.z))
 
 
 def _wxyz_to_msg(q):
-    """(w, x, y, z) -> geometry_msgs Quaternion."""
+    """Convert a wxyz quaternion to geometry_msgs Quaternion storage."""
     return Quaternion(w=float(q[0]), x=float(q[1]), y=float(q[2]), z=float(q[3]))
 
 
 def _quat_conjugate_wxyz(q):
-    """True unit-quaternion inverse in wxyz: (w, -x, -y, -z).
-    Used for coordinate-frame transforms (q_grip_to_plug sampling).
-    NOT used for CheatCode pose algebra — see _cheatcode_plug_inverse_wxyz."""
+    """Return the unit-quaternion inverse in wxyz order."""
     return (float(q[0]), -float(q[1]), -float(q[2]), -float(q[3]))
 
 
 def _cheatcode_plug_inverse_wxyz(q_plug):
-    """Exact CheatCode plug-inverse convention: (-w, x, y, z).
-    Reproduces CheatCode.calc_gripper_pose line:
-        q_plug_inv = (-q_plug[0], q_plug[1], q_plug[2], q_plug[3])
-    This must not be replaced with the mathematically correct conjugate."""
+    """Return the plug inverse convention expected by the controller algebra."""
     return (-float(q_plug[0]), float(q_plug[1]), float(q_plug[2]), float(q_plug[3]))
 
 
@@ -68,8 +59,7 @@ def _base_yaw_quat_wxyz(yaw_rad: float):
 
 
 def _quat_avg_wxyz(quats):
-    """Robust average of unit quaternions in wxyz convention.
-    Aligns signs to the first sample, averages, then normalises."""
+    """Average unit quaternions after aligning signs to the first sample."""
     arr = np.array([np.array(q, dtype=np.float64) for q in quats])
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
     arr = arr / np.maximum(norms, 1e-12)
@@ -93,39 +83,14 @@ def _q_delta_deg(q_a, q_b) -> float:
     return float(np.degrees(2.0 * np.arccos(dot)))
 
 
-# ---------------------------------------------------------------------------
-# Policy
-# ---------------------------------------------------------------------------
-#
-# Base structure: run_hybrid_swithin.py — the simple generic single-path
-# policy that reaches every port consistently (no SC choreography that stalls
-# in mid-air). On top of that base this file adds, for SFP *and* SC:
-#   * port-type-specific insertion depth
-#   * descent stall detection (trial-2 stalled ~80 s on the port rim)
-#   * an adaptive seating wiggle (pull-back / push-deeper + yaw + Y dither)
-#     that drives the last cm after the descent stalls
-#   * a stabilize hold at the deepest depth actually achieved
-#   * a live detector seat-distance log for tuning
-#
-# All the numbers grouped in the _*_for_port_type helpers are tuning knobs.
-# ---------------------------------------------------------------------------
-
 class run_hybrid(Policy):
-    # --- closed-loop insertion descent ---
-    # The trajectory executor lags the pose commands. The old fixed-timer
-    # descent + 30-step / 0.6 mm stall window aborted on a false "stall"
-    # before the arm ever moved (every trial, 2026-05-14 run). Each descent
-    # step now waits for the TCP to actually track the commanded depth; a
-    # real stall = the arm neither tracks nor descends for several steps.
     _DESCENT_TRACK_TOL = 0.003        # m; TCP "arrived" within this of the command
     _DESCENT_STEP_TIMEOUT = 0.4       # s; max wait for the TCP to track one step
     _DESCENT_STALL_PROGRESS = 0.0008  # m; min TCP-Z drop/step to count as progress
-    _DESCENT_STALL_STEPS = 12         # consecutive no-progress steps -> real stall
-    # --- closed-loop approach settle ---
+    _DESCENT_STALL_STEPS = 12         # consecutive no-progress steps -> stall
     _SETTLE_MAX_STEPS = 180   # max command repeats waiting to reach the approach pose
     _SETTLE_XY_TOL = 0.005    # m; approach XY considered reached within this
     _SETTLE_Z_TOL = 0.010     # m; approach Z considered reached within this
-    # --- adaptive seating wiggle ---
     _WIGGLE_STEPS = 30      # command repeats per wiggle cycle
     _WIGGLE_SLEEP = 0.1    # s between wiggle commands
     _WIGGLE_MAX_EXTRA = 4   # extra deeper cycles past the base pattern while still improving
@@ -133,26 +98,24 @@ class run_hybrid(Policy):
     _WIGGLE_IMPROVE_TOL = 0.0008  # m; plug-Z must drop more than this to count as progress
     _WIGGLE_PULLBACK_DZ = 0.012   # m to lift above the last cmd to unseat a rim catch
     _WIGGLE_PULLBACK_STEPS = 15   # command repeats for the pull-back lift
-    # --- per-trial home / reset ---
     _HOME_MAX_STEPS = 120        # command repeats while driving back to the captured home pose
     _HOME_SETTLE_STEPS = 15      # extra hold once home is reached
     _HOME_TOL = 0.012            # m; "home" is reached when TCP is within this of the captured pose
-    _HOME_MIN_CAPTURE_Z = 0.25   # m; only capture the trial-1 pose as home if TCP is at least this high
-    _SC_PLUG_TCP_Y_OFFSET_M = 0.00975  # detector is ~1.5 mm behind along gripper/tcp +Y
+    _HOME_MIN_CAPTURE_Z = 0.25   # m; minimum TCP-Z for capturing home pose
+    _SC_PLUG_TCP_Y_OFFSET_M = 0.00975
 
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
         self._max_integrator_windup = 0.05
         self._task = None
-        # Frozen reference — set by _sample_stable_yolo_reference before any motion
         self._frozen_port_pos = None           # (3,) in base_link
         self._frozen_port_quat_wxyz = None     # (4,) wxyz
         self._tcp_to_plug_local = None         # (3,) plug offset in gripper-local frame
-        self._q_gripper_to_plug_wxyz = None    # (4,) wxyz — relative orientation
+        self._q_gripper_to_plug_wxyz = None    # (4,) wxyz relative orientation
         self._frozen_initial_tip_xy_error = None  # (2,) frozen port_xy - plug_xy at sample time
         self._log_cmd_count = 0
-        self._home_pose_wxyz = None  # (pos(3,), quat wxyz(4,)) captured on the first trial
+        self._home_pose_wxyz = None  # (pos(3,), quat wxyz(4,))
         super().__init__(parent_node)
         self.get_logger().info(
             "HYBRID_CONTROL_FRAME command_pose_frame=base_link controlled_frame=gripper/tcp"
@@ -163,10 +126,6 @@ class run_hybrid(Policy):
         self.get_logger().info(
             "HYBRID_VERSION 2026-05-14.closedloop_z_offset_v2_rapid_speed"
         )
-
-    # -----------------------------------------------------------------------
-    # TF helpers
-    # -----------------------------------------------------------------------
 
     def _wait_for_tf(self, target_frame: str, source_frame: str, timeout_sec: float = 10.0) -> bool:
         start = self.time_now()
@@ -191,14 +150,6 @@ class run_hybrid(Policy):
     def _lookup_transform(self, source_frame: str):
         return self._parent_node._tf_buffer.lookup_transform("base_link", source_frame, Time())
 
-    # -----------------------------------------------------------------------
-    # Task -> YOLO frame names  (candidate lists)
-    # -----------------------------------------------------------------------
-    # The detector names the SC port sc_port_0 / sc_port — never the task's
-    # literal port_name (e.g. "sc_port_base"). swithin's literal lookup
-    # therefore tf-timed-out on every SC trial. Resolve against a candidate
-    # list so whatever the detector publishes is found.
-
     def _dedupe_nonempty(self, values) -> list:
         seen = set()
         out = []
@@ -220,9 +171,6 @@ class run_hybrid(Policy):
         )
 
     def _sc_port_frame_candidates(self, task) -> list:
-        # Detector publishes two visible SC sockets as sc_port_0/sc_port_1.
-        # With only one visible SC socket it may publish generic sc_port; use
-        # that only as the single-port fallback after the task-specific target.
         port_name = str(getattr(task, "port_name", "")).strip().lower()
         target = str(getattr(task, "target_module_name", "")).strip().lower()
         if target in {"sc_port_0", "sc_port_1"}:
@@ -294,20 +242,8 @@ class run_hybrid(Policy):
         )
         return ""
 
-    # -----------------------------------------------------------------------
-    # Per-trial home / reset
-    # -----------------------------------------------------------------------
-
     def _go_home(self, move_robot) -> None:
-        """Drive the arm back to the trial-1 home pose before every trial.
-
-        The harness does not reliably reset the arm between trials: in the
-        2026-05-14 run trial 2 started mid-air at the trial-1 stabilize pose,
-        the descent then jammed at tcp_z~0.228 and the seating wiggle could not
-        move it (the plug never descended -> "no insertion"). On the first
-        trial the arm IS at the rig home pose, so capture it; on later trials
-        drive back to it and wait until the arm actually arrives. The lift also
-        clears the cameras' view of the static SC port."""
+        """Capture or return to the initial home pose before sampling."""
         try:
             grip_pos, q_grip = self._current_tcp_pos_quat()
         except TransformException as ex:
@@ -329,7 +265,7 @@ class run_hybrid(Policy):
                     f"HYBRID_HOME not_captured tcp_z={float(grip_pos[2]):.4f} "
                     f"below {self._HOME_MIN_CAPTURE_Z:.2f} — arm may not be at rig home"
                 )
-            return  # first trial: already at home, nothing to drive to
+            return
 
         home_pos, home_q = self._home_pose_wxyz
         dist0 = float(np.linalg.norm(np.asarray(grip_pos, dtype=np.float64) - home_pos))
@@ -363,21 +299,13 @@ class run_hybrid(Policy):
             self.sleep_for(0.05)
         self.get_logger().info("HYBRID_HOME return done")
 
-    # -----------------------------------------------------------------------
-    # Port-type insertion tuning knobs
-    # -----------------------------------------------------------------------
-
     def _insert_end_for_port_type(self, port_type: str) -> float:
-        """Final descent z_offset (plug target relative to frozen port origin)."""
+        """Return final plug z_offset relative to the frozen port origin."""
         return -0.015 if str(port_type).strip().lower() == "sc" else -0.085
 
     def _insert_step_for_port_type(self, port_type: str, z_offset: float) -> float:
         if str(port_type).strip().lower() == "sc":
             return 0.0005
-        # SFP: slow down inside the precision zone. Steps are larger than the
-        # original glacial values because the descent is now closed-loop (it
-        # waits for the arm to track each step) instead of running open-loop
-        # on a fixed timer.
         return 0.0015 if float(z_offset) > 0.06 else 0.0006
 
     def _insert_sleep_for_port_type(self, port_type: str, z_offset: float) -> float:
@@ -386,8 +314,7 @@ class run_hybrid(Policy):
         return 0.10 if float(z_offset) <= 0.06 else 0.05
 
     def _descent_yaw_offset_deg(self, port_type: str, z_offset: float) -> float:
-        """Small clockwise base-yaw twist for SFP once inside the precision zone.
-        SC keeps zero twist (kept simple, position-only)."""
+        """Return the insertion yaw offset in degrees."""
         if str(port_type).strip().lower() == "sc":
             return 0.0
         return -2.0 if float(z_offset) <= 0.045 else 0.0
@@ -396,11 +323,7 @@ class run_hybrid(Policy):
         return 13
 
     def _seating_wiggle_pattern(self, port_type: str):
-        """Base wiggle pattern: list of (z_cmd, yaw_deg, y_dither_m).
-
-        Unlike the old fixed pattern this is *progressively deeper* — it never
-        bounces back shallow after a breakthrough — and adds a small Y dither
-        to rock the plug past a port-edge detent."""
+        """Return progressive (z_cmd, yaw_deg, y_dither_m) seating commands."""
         if str(port_type).strip().lower() == "sc":
             return [
                 (-0.006,  0.0,  0.000),
@@ -408,7 +331,6 @@ class run_hybrid(Policy):
                 (-0.020,  0.0, -0.002),
                 (-0.026,  0.0, +0.002),
             ]
-        # SFP
         return [
             (-0.075,  0.0,  0.000),
             (-0.090, -2.0, +0.002),
@@ -416,10 +338,6 @@ class run_hybrid(Policy):
             (-0.106, +1.0, +0.002),
             (-0.112, -2.0,  0.000),
         ]
-
-    # -----------------------------------------------------------------------
-    # Live gripper / plug state
-    # -----------------------------------------------------------------------
 
     def _current_tcp_pos_quat(self):
         grip_tf = self._lookup_transform("gripper/tcp")
@@ -437,10 +355,6 @@ class run_hybrid(Policy):
         err_xy = np.asarray(self._frozen_port_pos[:2], dtype=np.float64) - plug_pos[:2]
         return err_xy, float(np.linalg.norm(err_xy)), plug_pos
 
-    # -----------------------------------------------------------------------
-    # Stable YOLO snapshot — called once while robot is stationary
-    # -----------------------------------------------------------------------
-
     def _sample_stable_yolo_reference(
         self, port_frame: str, plug_frame: str,
         duration_s: float = 10.0, rate_hz: float = 20.0
@@ -451,7 +365,7 @@ class run_hybrid(Policy):
         port_quat_list = []
         plug_pos_list = []
         tcp_to_plug_list = []
-        q_gtp_list = []   # gripper-to-plug relative quaternions (correct math)
+        q_gtp_list = []
         plug_type = str(getattr(self._task, "plug_type", "")).strip().lower()
         apply_sc_plug_offset = plug_type == "sc"
 
@@ -495,7 +409,6 @@ class run_hybrid(Policy):
                     dtype=np.float64,
                 )
             tcp_to_plug = R_grip.T @ (plug_pos - grip_pos)
-            # Correct conjugate used here — frame-relative transform, not CheatCode pose math
             q_gtp = _quat_normalize(quaternion_multiply(_quat_conjugate_wxyz(q_grip), q_plug))
 
             port_pos_list.append(port_pos)
@@ -515,7 +428,6 @@ class run_hybrid(Policy):
         plug_pos_arr = np.array(plug_pos_list)
         tcp_arr = np.array(tcp_to_plug_list)
 
-        # Outlier rejection: drop samples > 2 cm from their respective medians
         port_median = np.median(port_pos_arr, axis=0)
         tcp_median = np.median(tcp_arr, axis=0)
         port_mask = np.linalg.norm(port_pos_arr - port_median, axis=1) < 0.02
@@ -540,7 +452,6 @@ class run_hybrid(Policy):
         self._tcp_to_plug_local = np.median(tcp_arr[indices], axis=0)
         self._q_gripper_to_plug_wxyz = _quat_avg_wxyz([q_gtp_list[i] for i in indices])
 
-        # Frozen initial XY error used during interpolation to suppress lateral drift
         frozen_plug_xy = np.median(plug_pos_arr[indices], axis=0)[:2]
         self._frozen_initial_tip_xy_error = (
             float(self._frozen_port_pos[0] - frozen_plug_xy[0]),
@@ -581,10 +492,6 @@ class run_hybrid(Policy):
 
         return True
 
-    # -----------------------------------------------------------------------
-    # Motion command — frozen YOLO snapshot + live gripper/tcp only
-    # -----------------------------------------------------------------------
-
     def calc_gripper_pose_from_frozen(
         self,
         slerp_fraction: float = 1.0,
@@ -603,7 +510,6 @@ class run_hybrid(Policy):
             and self._frozen_initial_tip_xy_error is not None
         ), "call _sample_stable_yolo_reference before calc_gripper_pose_from_frozen"
 
-        # --- live gripper state (only TF lookup during motion) ---
         grip_tf = self._lookup_transform("gripper/tcp")
         grip_pos = np.array([
             grip_tf.transform.translation.x,
@@ -612,32 +518,23 @@ class run_hybrid(Policy):
         ])
         q_grip = _msg_to_wxyz(grip_tf.transform.rotation)
 
-        # --- reconstruct plug pose from frozen gripper-relative transform ---
         R_grip = _quat_to_rot(q_grip)
         plug_pos_est = grip_pos + R_grip @ self._tcp_to_plug_local
         q_plug_est = _quat_normalize(
             quaternion_multiply(q_grip, self._q_gripper_to_plug_wxyz)
         )
 
-        # --- orientation: exact CheatCode algebra ---
-        # CheatCode:  q_plug_inv = (-q_plug[0], q_plug[1], q_plug[2], q_plug[3])
-        #             q_diff = quaternion_multiply(q_port, q_plug_inv)
-        #             q_gripper_target = quaternion_multiply(q_diff, q_gripper)
         q_port = self._frozen_port_quat_wxyz
         q_plug_inv = _cheatcode_plug_inverse_wxyz(q_plug_est)
         q_diff = quaternion_multiply(q_port, q_plug_inv)
         q_grip_target = quaternion_multiply(q_diff, q_grip)
         q_grip_slerp = quaternion_slerp(q_grip, q_grip_target, slerp_fraction)
 
-        # Optional small clockwise/counter base-yaw twist (SFP seating).
         if abs(float(yaw_offset_rad)) > 1e-9:
             q_grip_slerp = _quat_normalize(
                 quaternion_multiply(_base_yaw_quat_wxyz(yaw_offset_rad), q_grip_slerp)
             )
 
-        # --- position: CheatCode style ---
-        # During approach rotation the reconstructed plug tip can swing laterally.
-        # freeze_xy_error=True pins XY correction to the pre-motion snapshot.
         if freeze_xy_error:
             tip_x_error = self._frozen_initial_tip_xy_error[0]
             tip_y_error = self._frozen_initial_tip_xy_error[1]
@@ -684,7 +581,6 @@ class run_hybrid(Policy):
         delta_deg = _q_delta_deg(q_grip, q_grip_target)
         yaw_offset_deg = float(np.degrees(yaw_offset_rad))
 
-        # Verbose log for first 5 commands and every 20 thereafter
         if self._log_cmd_count < 5 or self._log_cmd_count % 20 == 0:
             self.get_logger().info(
                 f"HYBRID_CMD #{self._log_cmd_count} "
@@ -710,20 +606,8 @@ class run_hybrid(Policy):
             orientation=_wxyz_to_msg(q_grip_slerp),
         )
 
-    # -----------------------------------------------------------------------
-    # Adaptive seating wiggle — drives the last cm after the descent stalls
-    # -----------------------------------------------------------------------
-
     def _seating_wiggle(self, move_robot, port_type: str, insert_end: float) -> float:
-        """Pull-back / push-deeper cycles with a yaw twist and a small Y dither.
-
-        In the trial-2 log the descent hard-stalled on the SFP port rim; the
-        first deeper+yaw wiggle cycle broke it (plug dropped 3.6 cm) but the
-        old fixed pattern then bounced shallow and never finished the seat.
-        This version only ever goes deeper, and keeps adding deeper cycles
-        while the reconstructed plug-Z is still dropping.
-
-        Returns the deepest z_offset that was commanded — used by stabilize."""
+        """Run progressive seating commands and return the deepest z_offset."""
         pattern = self._seating_wiggle_pattern(port_type)
         self.get_logger().info(
             f"HYBRID_WIGGLE start port_type={port_type} cycles={len(pattern)} "
@@ -736,9 +620,6 @@ class run_hybrid(Policy):
         prev_z_cmd = None
 
         for cycle, (z_cmd, yaw_deg, y_dither) in enumerate(pattern):
-            # If the previous cycle made no progress the plug is caught on the
-            # port rim — a deeper push alone will not free it. Lift a few mm
-            # above the last commanded depth to unseat it, then drive deeper.
             if (
                 prev_z_cmd is not None
                 and prev_cycle_plug_z is not None
@@ -790,9 +671,6 @@ class run_hybrid(Policy):
             except TransformException:
                 pass
 
-        # Adaptive: keep pushing deeper while the plug is still descending.
-        # One no-progress cycle is tolerated (the plug can ratchet past a rim
-        # detent on the *next* push); only stop after two in a row.
         extra_z = deepest_z_cmd
         extra_no_progress = 0
         for extra in range(self._WIGGLE_MAX_EXTRA):
@@ -839,17 +717,12 @@ class run_hybrid(Policy):
         )
         return deepest_z_cmd
 
-    # -----------------------------------------------------------------------
-    # Entrypoint
-    # -----------------------------------------------------------------------
     def _approach_z_offset_for_port_type(self, port_type: str) -> float:
         """Approach height above the frozen port before starting descent."""
         if str(port_type).strip().lower() == "sc":
-            return 0.20   # Match the known-good swithin SC approach height
-        return 0.15  
-        
-        
-             # keep current SFP behavior
+            return 0.20
+        return 0.15
+
     def insert_cable(
         self,
         task: Task,
@@ -882,10 +755,6 @@ class run_hybrid(Policy):
             f"HYBRID_FRAME_CANDIDATES port={port_candidates} plug={plug_candidates}"
         )
 
-        # Reset the arm to the captured home pose before sampling. The harness
-        # does not reliably reset it between trials; starting a trial mid-air
-        # jams the descent (trial 2, 2026-05-14 run). This also clears the
-        # cameras' view of the static SC port.
         if not self._wait_for_tf("base_link", "gripper/tcp", timeout_sec=5.0):
             self.get_logger().error(
                 "HYBRID_RESULT success=False reason=tf_timeout frame=gripper/tcp before_home"
@@ -893,7 +762,6 @@ class run_hybrid(Policy):
             return False
         self._go_home(move_robot)
 
-        # SC port is static -> longer wait, older transform tolerated.
         port_frame = self._resolve_tf_frame(
             f"{port_type}_port", port_candidates,
             timeout_sec=25.0 if port_type == "sc" else 12.0,
@@ -923,14 +791,12 @@ class run_hybrid(Policy):
             f"HYBRID_FRAMES port_frame={port_frame} plug_frame={plug_frame}"
         )
 
-        # Collect stable YOLO snapshot while robot is stationary
         if not self._sample_stable_yolo_reference(port_frame, plug_frame):
             self.get_logger().error(
                 "HYBRID_RESULT success=False reason=sampling_failed"
             )
             return False
 
-        # Log initial rotation delta using CheatCode inverse convention
         try:
             grip_tf = self._lookup_transform("gripper/tcp")
             q_grip_now = _msg_to_wxyz(grip_tf.transform.rotation)
@@ -938,7 +804,7 @@ class run_hybrid(Policy):
                 quaternion_multiply(q_grip_now, self._q_gripper_to_plug_wxyz)
             )
             q_diff_now = quaternion_multiply(
-                self._frozen_port_quat_wxyz, 
+                self._frozen_port_quat_wxyz,
                 _cheatcode_plug_inverse_wxyz(q_plug_now),
             )
             q_target_now = quaternion_multiply(q_diff_now, q_grip_now)
@@ -954,11 +820,7 @@ class run_hybrid(Policy):
         except TransformException:
             pass
 
-        # ---------------------------------------------------------------
-        # Insertion geometry (tuning knobs live in the _*_for_port_type
-        # helpers above).
-        # ---------------------------------------------------------------
-        approach_z_offset = self._approach_z_offset_for_port_type(port_type)    
+        approach_z_offset = self._approach_z_offset_for_port_type(port_type)
         insert_end = self._insert_end_for_port_type(port_type)
         self.get_logger().info(
             f"HYBRID_INSERT_GEOMETRY port_type={port_type} "
@@ -966,9 +828,6 @@ class run_hybrid(Policy):
         )
 
         if port_type == "sc":
-            # SC is known-good with the simple swithin profile: approach high,
-            # descend slowly, and do not run the SFP-oriented stall/wiggle
-            # choreography that can pin the plug against the board.
             z_offset = approach_z_offset
 
             for t in range(100):
@@ -1004,15 +863,6 @@ class run_hybrid(Policy):
             self.get_logger().info("HYBRID_RESULT success=True")
             return True
 
-        # ---------------------------------------------------------------
-        # Interpolation: 100 steps to the approach pose above the port
-        # freeze_xy_error=True keeps the XY target stable while the gripper
-        # rotates into the approach orientation.
-        # ---------------------------------------------------------------
-        # Step count scales with the lateral travel so the approach speed
-        # stays bounded. The old fixed 100 steps was too fast for the SC
-        # port's large lateral move — the executor lagged and the arm was
-        # still traversing when the descent began (trial-3 diagonal jam).
         try:
             grip_pos0, _ = self._current_tcp_pos_quat()
             xy_travel = float(np.linalg.norm(
@@ -1040,10 +890,6 @@ class run_hybrid(Policy):
                 self.get_logger().warn(f"TF lookup failed during interpolation: {ex}")
             self.sleep_for(0.04)
 
-        # ---------------------------------------------------------------
-        # Settle: let the trajectory planner fully resolve the approach
-        # rotation before descent begins.
-        # ---------------------------------------------------------------
         self.get_logger().info("HYBRID_SETTLE start")
         settle_arrived = False
         for i in range(self._SETTLE_MAX_STEPS):
@@ -1081,14 +927,6 @@ class run_hybrid(Policy):
             )
         self.get_logger().info("HYBRID_SETTLE done")
 
-        # ---------------------------------------------------------------
-        # Insertion descent — with stall detection.
-        # The descent walks z_offset from the approach height down to
-        # insert_end. If the TCP stops moving (hard contact on the port
-        # rim — the trial-2 failure mode) we break out early and hand off
-        # to the seating wiggle instead of pushing a dead command for
-        # tens of seconds.
-        # ---------------------------------------------------------------
         z_offset = approach_z_offset
         descent_stalled = True
         no_progress_steps = 0
@@ -1105,10 +943,6 @@ class run_hybrid(Policy):
                 )
                 cmd_z = float(pose.position.z)
 
-                # Command the step, then wait for the arm to actually track it
-                # before stepping further — the executor lags the commands, so
-                # stepping on a fixed timer (the old behaviour) raced ahead and
-                # tripped a false stall before the arm ever moved.
                 poll_sleep = self._insert_sleep_for_port_type(port_type, z_offset)
                 step_timeout = Duration(seconds=self._DESCENT_STEP_TIMEOUT)
                 wait_start = self.time_now()
@@ -1123,8 +957,6 @@ class run_hybrid(Policy):
                         tracked = True
                         break
 
-                # A real stall = the arm could neither track the command nor
-                # keep descending, sustained over several consecutive steps.
                 descended = (
                     prev_tcp_z is None
                     or (prev_tcp_z - cur_tcp_z) >= self._DESCENT_STALL_PROGRESS
@@ -1157,18 +989,11 @@ class run_hybrid(Policy):
         if not descent_stalled:
             self.get_logger().info("HYBRID_DESCENT reached insert_end without stalling")
 
-        # ---------------------------------------------------------------
-        # Adaptive seating wiggle — finishes the last cm.
-        # ---------------------------------------------------------------
         if descent_stalled:
             deepest_z_cmd = self._seating_wiggle(move_robot, port_type, insert_end)
         else:
             deepest_z_cmd = insert_end
 
-        # ---------------------------------------------------------------
-        # Active stabilise — hold the deepest depth actually achieved so
-        # the lagging trajectory planner can catch up and seat the plug.
-        # ---------------------------------------------------------------
         stabilize_steps = self._stabilize_steps_for_port_type(port_type)
         stabilize_yaw_deg = self._descent_yaw_offset_deg(port_type, deepest_z_cmd)
         self.get_logger().info(
@@ -1187,11 +1012,6 @@ class run_hybrid(Policy):
                 pass
             self.sleep_for(0.07)
 
-        # ---------------------------------------------------------------
-        # Live detector seat-distance log (diagnostic only — does not
-        # affect the result). The detector may hold its last valid value
-        # while the robot occludes the port, so treat this as advisory.
-        # ---------------------------------------------------------------
         try:
             port_tf = self._lookup_transform(port_frame)
             plug_tf = self._lookup_transform(plug_frame)
